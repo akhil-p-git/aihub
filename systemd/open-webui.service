@@ -1,0 +1,14 @@
+[Unit]
+Description=Open WebUI (aihub frontend), localhost only
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/aihub/open-webui.env
+ExecStart=%h/.local/bin/open-webui serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
