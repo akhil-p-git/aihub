@@ -146,7 +146,8 @@ async function highlightCode(code) {
 const scrollers = new ResizeObserver((entries) => {
   const scrolls = entries.map(({ target }) => target.scrollWidth > target.clientWidth); // reads, then writes
   entries.forEach(({ target }, i) => {
-    if (scrolls[i]) {
+    if (!target.isConnected) scrollers.unobserve(target);
+    else if (scrolls[i]) {
       target.tabIndex = 0;
       target.setAttribute("role", "group");
       target.setAttribute("aria-label", target.matches("pre") ? "Code, scrolls sideways" : "Table, scrolls sideways");
