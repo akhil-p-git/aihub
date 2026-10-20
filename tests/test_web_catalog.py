@@ -233,6 +233,16 @@ class TestCatalog:
         ]
         assert cloud and not any(m.available for m in cloud)
         assert any("AIHUB_ANTHROPIC_KEY" in (m.reason or "") for m in cloud)
+        assert {(m.provider, m.reason) for m in cloud} == {
+            (
+                "anthropic",
+                "Set AIHUB_ANTHROPIC_KEY in ~/.config/aihub/aihub.env, then restart aihub",
+            ),
+            (
+                "openrouter",
+                "Set AIHUB_OPENROUTER_KEY in ~/.config/aihub/aihub.env, then restart aihub",
+            ),
+        }
         assert all(m.available for m in catalog.models() if m.provider == "ollama")
 
     async def test_default_is_the_first_usable_configured_model(

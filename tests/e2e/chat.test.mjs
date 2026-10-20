@@ -358,9 +358,26 @@ describe("model and intensity", () => {
     await page.getByRole("button", { name: /Change model$/ }).click();
     const opus = page.getByRole("option", { name: /Opus 5.5/ });
     assert.equal(await opus.getAttribute("aria-disabled"), "true");
-    assert.match(await opus.textContent(), /AIHUB_ANTHROPIC_KEY/);
+    assert.match(
+      await opus.textContent(),
+      /Set AIHUB_ANTHROPIC_KEY in ~\/\.config\/aihub\/aihub\.env, then restart aihub/,
+    );
     await context.close();
     keyless.stop();
+  });
+
+  it("says how to get a model when none is usable", async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const none = { models: [], default_model: null, providers: {}, chats: [], settings: { instructions: "" } };
+    await page.route("**/api/bootstrap", (route) => route.fulfill({ json: { ...none, retention_days: 30 } }));
+    await page.goto(app.url);
+    await page.getByRole("heading", { name: "No model available" }).waitFor();
+    assert.equal(
+      await page.locator("#route-text").textContent(),
+      "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
+    );
+    await context.close();
   });
 });
 

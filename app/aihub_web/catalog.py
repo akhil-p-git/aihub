@@ -364,7 +364,7 @@ class Catalog:
                 model = replace(
                     model,
                     available=False,
-                    reason=f"Set {route[0]} in ~/.config/aihub/aihub.env and restart the service",
+                    reason=f"Set {route[0]} in ~/.config/aihub/aihub.env, then restart aihub",
                 )
             out.append(model)
         return out

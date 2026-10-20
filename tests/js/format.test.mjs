@@ -170,7 +170,10 @@ describe("routeFor: where the next prompt goes", () => {
     });
     assert.match(router.text, /don't keep prompts/);
   });
-  it("says what to do when no model is usable", () => {
-    assert.match(routeFor(undefined).text, /Start Ollama/);
+  it("says what to do when no model is usable, in words that are true for the service and the app", () => {
+    assert.equal(
+      routeFor(undefined).text,
+      "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
+    );
   });
 });

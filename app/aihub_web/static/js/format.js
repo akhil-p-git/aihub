@@ -107,7 +107,7 @@ export function routeFor(model) {
   if (!model) {
     return {
       title: "No model available",
-      text: "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env and restart aihub-web.",
+      text: "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
     };
   }
   const title = `New chat on ${shortName(model.name)}`;
