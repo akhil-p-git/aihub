@@ -307,18 +307,20 @@ function localMessage(run, status, error = null) {
   };
 }
 
+/** Retry redoes the newest reply, so every earlier reply loses its Retry buttons. */
 function dropRetryButtons() {
   const replies = els.messages.querySelectorAll(".msg.assistant");
   replies.forEach((reply, i) => {
-    if (i < replies.length - 1) reply.querySelector('[aria-label="Retry reply"]')?.remove();
+    if (i < replies.length - 1) reply.querySelectorAll("[data-last-only]").forEach((el) => el.remove());
   });
 }
 
-async function startRun({ text = "", regenerate = false } = {}) {
+/** Sends a message, or with `regenerateFor` (the id of the user message) answers it again. */
+async function startRun({ text = "", regenerateFor = null, replaced = null } = {}) {
   const model = currentModel();
   if (state.run || !model?.available) return;
   const body = { chat_id: state.chat?.id ?? null, model: model.id, effort: state.draft.effort };
-  if (regenerate) body.regenerate = true;
+  if (regenerateFor) body.regenerate_for = regenerateFor;
   else body.text = text;
 
   const controller = new AbortController();
@@ -328,11 +330,12 @@ async function startRun({ text = "", regenerate = false } = {}) {
     effort: state.draft.effort,
     onFrame: keepPinned,
   });
-  const userEl = regenerate ? null : userMessage({ id: "", content: text });
+  const userEl = regenerateFor ? null : userMessage({ id: "", content: text });
   if (userEl) els.messages.append(userEl);
   els.messages.append(view.el);
+  dropRetryButtons();
   els.route.hidden = true;
-  const run = { controller, view, userEl, text, regenerate, started: false };
+  const run = { controller, view, userEl, text, regenerate: Boolean(regenerateFor), replaced, started: false };
   state.run = run;
   scrollToBottom();
   renderSend();
@@ -407,6 +410,10 @@ function onRunError(run, err) {
     // Refused before anything streamed: undo the optimistic bubbles and give the text back.
     run.view.el.remove();
     run.userEl?.remove();
+    if (run.replaced) {
+      els.messages.append(run.replaced.el);
+      state.messages = run.replaced.messages;
+    }
     if (!run.regenerate && !els.input.value) {
       els.input.value = run.text;
       resizeInput();
@@ -435,10 +442,12 @@ function send() {
 
 function retryLast() {
   const last = els.messages.querySelector(".msg.assistant:last-child");
-  if (!last || state.run || !state.chat) return;
+  const question = state.messages.findLast((m) => m.role === "user");
+  if (!last || !question || state.run || !state.chat || !currentModel()?.available) return;
+  const replaced = { el: last, messages: state.messages };
   last.remove();
   state.messages = state.messages.filter((m, i, all) => !(i === all.length - 1 && m.role === "assistant"));
-  startRun({ regenerate: true });
+  startRun({ regenerateFor: question.id, replaced });
 }
 
 // ---- choosing a model and an intensity

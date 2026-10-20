@@ -27,6 +27,11 @@ after(async () => {
 });
 
 const sentTo = async (path) => (await app.requests()).filter((r) => r.path === path);
+const waitForReplies = (page, count) =>
+  page.waitForFunction(
+    (n) => document.querySelectorAll(".msg.assistant .meta").length === n && !document.querySelector(".working"),
+    count,
+  );
 
 describe("a new chat", () => {
   it("starts on the free default and says where the prompt goes", async () => {
@@ -178,6 +183,56 @@ describe("replying", () => {
     await banner.getByRole("button", { name: "Choose another model" }).click();
     await page.getByRole("combobox", { name: "Search models" }).waitFor();
     await context.close();
+  });
+
+  it("offers Retry on the newest failed reply only, while chatting and after a reload", async () => {
+    // Retry redoes the newest reply. On an older failure it used to delete the reply that came after it.
+    const { page, context } = await open(browser, app);
+    await send(page, "error: the old failure");
+    const old = replies(page).first();
+    await old.getByRole("alert").waitFor();
+    assert.equal(await old.getByRole("button", { name: "Retry" }).count(), 1, "the newest reply can be retried");
+
+    await send(page, "a question that works");
+    await page.waitForFunction(() => document.querySelectorAll(".msg.assistant .meta").length === 2);
+    await page.waitForFunction(() => !document.querySelector(".working"));
+    assert.equal(await old.getByRole("alert").count(), 1, "the old failure is still shown");
+    assert.equal(await old.getByRole("button").count(), 0, "but it no longer offers to redo anything");
+
+    await page.reload();
+    await replies(page).nth(1).waitFor();
+    assert.equal(await replies(page).first().getByRole("button").count(), 0, "also when loaded from storage");
+    assert.equal(await lastReply(page).getByRole("button", { name: "Retry reply" }).count(), 1);
+    await context.close();
+  });
+
+  it("refuses a Retry from a window that is behind, and keeps the newest reply", async () => {
+    const ahead = await open(browser, app);
+    await send(ahead.page, "stale window, first question");
+    await replyDone(ahead.page);
+    const id = ahead.page.url().split("/c/")[1];
+
+    const behind = await open(browser, app, { hash: `#/c/${id}` });
+    await lastReply(behind.page).locator(".meta").waitFor();
+
+    await send(ahead.page, "stale window, second question");
+    await waitForReplies(ahead.page, 2);
+    const providerCalls = (await sentTo("/api/v1/chat/completions")).length;
+
+    await lastReply(behind.page).getByRole("button", { name: "Retry reply" }).click();
+    await behind.page.getByText(/changed in another window/).waitFor();
+    assert.equal(await replies(behind.page).count(), 1, "the reply it tried to redo comes back");
+    assert.equal(await behind.page.locator(".working").count(), 0);
+
+    const stored = await (await fetch(`${app.url}/api/chats/${id}`)).json();
+    assert.deepEqual(
+      stored.messages.map((m) => m.role),
+      ["user", "assistant", "user", "assistant"],
+      "the newest reply is still stored",
+    );
+    assert.equal((await sentTo("/api/v1/chat/completions")).length, providerCalls, "nothing was regenerated");
+    await ahead.context.close();
+    await behind.context.close();
   });
 
   it("refuses an oversized message before streaming and gives the text back", async () => {

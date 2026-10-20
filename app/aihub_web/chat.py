@@ -50,15 +50,17 @@ class ChatRequest(BaseModel):
     text: str | None = None
     model: str | None = Field(None, max_length=200)
     effort: str | None = Field(None, max_length=16)
-    regenerate: bool = False
+    # Answer this user message again. Naming it, not just asking for "again", lets a window that is behind
+    # be refused instead of deleting a newer reply.
+    regenerate_for: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
-        if self.regenerate:
+        if self.regenerate_for:
             if not self.chat_id:
-                raise ValueError("regenerate needs a chat_id")
+                raise ValueError("regenerate_for needs a chat_id")
             if self.text is not None:
-                raise ValueError("regenerate takes no text")
+                raise ValueError("regenerate_for takes no text")
         elif not (self.text or "").strip():
             raise ValueError("text is empty")
         return self
@@ -204,8 +206,8 @@ class ChatService:
             )
 
         user = None
-        if body.regenerate:
-            self._drop_last_reply(chat)
+        if body.regenerate_for:
+            self._drop_last_reply(chat, body.regenerate_for)
         else:
             text = body.text or ""
             if len(text) > self._cfg.limits.max_message_chars:
@@ -262,12 +264,20 @@ class ChatService:
             return None
         return effort if effort in model.efforts.levels else model.efforts.default
 
-    def _drop_last_reply(self, chat: Chat | None) -> None:
+    def _drop_last_reply(self, chat: Chat | None, user_id: str) -> None:
+        """Deletes the reply to the newest user message, which must be the one the caller means."""
         messages = self._store.messages(chat.id) if chat else []
-        if messages and messages[-1].role == "assistant":
-            self._store.delete_message(messages[-1].id)
-        elif not messages:
+        newest = next((m for m in reversed(messages) if m.role == "user"), None)
+        if newest is None:
             raise ApiError(409, "nothing_to_answer", "There is no message to answer.")
+        if newest.id != user_id:
+            raise ApiError(
+                409,
+                "stale_chat",
+                "This chat changed in another window. Reload it, then retry.",
+            )
+        if messages[-1].role == "assistant":
+            self._store.delete_message(messages[-1].id)
 
     def _budget(self, model: ModelInfo) -> int:
         usable = int((model.ctx or 8192) * CONTEXT_SHARE)

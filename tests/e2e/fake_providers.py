@@ -178,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
             ),
             "",
         )
+        # Consecutive user messages are merged into one turn; the newest comes last.
+        last = last.split("\n\n")[-1]
         if "ratelimit" in last.lower() and self.path != "/api/chat":
             self.send_json(
                 429,

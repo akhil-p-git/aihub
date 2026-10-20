@@ -35,19 +35,22 @@ const ERROR_TITLES = {
   interrupted: "The connection dropped",
 };
 
-function errorNotice(message) {
+/** Retry and "Choose another model" redo the newest reply, so only the newest reply offers them (data-last-only). */
+function errorNotice(message, isLast) {
   const { code, message: text } = message.error ?? {};
   return h(
     "div",
     { class: "notice", role: "alert" },
     h("strong", {}, icon("alert"), ERROR_TITLES[code] ?? "The reply failed"),
     h("span", {}, text ?? "The reply did not finish."),
-    h(
-      "div",
-      { class: "row" },
-      h("button", { class: "btn", type: "button", onClick: () => hooks.onRetry() }, icon("retry"), "Retry"),
-      h("button", { class: "btn", type: "button", onClick: () => hooks.onChoose() }, "Choose another model"),
-    ),
+    isLast
+      ? h(
+          "div",
+          { class: "row", "data-last-only": true },
+          h("button", { class: "btn", type: "button", onClick: () => hooks.onRetry() }, icon("retry"), "Retry"),
+          h("button", { class: "btn", type: "button", onClick: () => hooks.onChoose() }, "Choose another model"),
+        )
+      : null,
   );
 }
 
@@ -75,16 +78,24 @@ function meta(message, isLast) {
       : h(
           "span",
           { class: "actions" },
-          h(
-            "button",
-            { class: "btn", type: "button", "data-copy-reply": true, "aria-label": "Copy reply" },
-            icon("copy"),
-            h("span", {}, "Copy"),
-          ),
+          message.content
+            ? h(
+                "button",
+                { class: "btn", type: "button", "data-copy-reply": true, "aria-label": "Copy reply" },
+                icon("copy"),
+                h("span", {}, "Copy"),
+              )
+            : null,
           isLast
             ? h(
                 "button",
-                { class: "btn", type: "button", "aria-label": "Retry reply", onClick: () => hooks.onRetry() },
+                {
+                  class: "btn",
+                  type: "button",
+                  "data-last-only": true,
+                  "aria-label": "Retry reply",
+                  onClick: () => hooks.onRetry(),
+                },
                 icon("retry"),
                 h("span", {}, "Retry"),
               )
@@ -189,9 +200,8 @@ export class ReplyView {
     this.copyText = text;
     this.el.dataset.id = message.id;
     this.el.dataset.status = message.status;
-    if (message.status === "error") this.el.append(errorNotice(message));
-    this.el.append(meta(message, last));
-    if (message.status === "stopped") {
+    if (message.status === "error") this.el.append(errorNotice(message, last));
+    else if (message.status === "stopped") {
       this.el.append(h("p", { class: "notice-inline" }, "Stopped before it finished."));
     } else if (message.status === "done" && message.usage?.finish === "length") {
       this.el.append(
@@ -202,6 +212,7 @@ export class ReplyView {
         ),
       );
     }
+    this.el.append(meta(message, last));
     this.onFrame();
   }
 

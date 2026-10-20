@@ -121,11 +121,32 @@ class TestChatFlow:
         assert events[-1]["message"]["content"] == "half"
 
     def test_regenerate(self, api: TestClient) -> None:
-        chat_id = reply(api, text="q", model=FREE)[0]["chat"]["id"]
+        started = reply(api, text="q", model=FREE)[0]
+        chat_id = started["chat"]["id"]
         api.fakes["openrouter"].script = [Text("Again"), Finish("stop")]
-        reply(api, chat_id=chat_id, regenerate=True)
+        reply(api, chat_id=chat_id, regenerate_for=started["user"]["id"])
         messages = api.get(f"/api/chats/{chat_id}").json()["messages"]
         assert [m["content"] for m in messages] == ["q", "Again"]
+
+    def test_retrying_an_old_exchange_from_a_stale_window_is_a_conflict(
+        self, api: TestClient
+    ) -> None:
+        started = reply(api, text="one", model=FREE)[0]
+        chat_id = started["chat"]["id"]
+        reply(api, chat_id=chat_id, text="two")
+        response = api.post(
+            "/api/chat",
+            json={"chat_id": chat_id, "regenerate_for": started["user"]["id"]},
+        )
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "stale_chat"
+        messages = api.get(f"/api/chats/{chat_id}").json()["messages"]
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
 
     def test_standing_instructions_apply_to_the_next_reply(
         self, api: TestClient
@@ -178,7 +199,7 @@ class TestRefusals:
             ({"text": "hi", "model": "ollama/nope:1b"}, 400, "unknown_model"),
             ({"text": "hi", "chat_id": "0123456789abcdef"}, 404, "no_chat"),
             ({"text": "hi", "chat_id": "../../etc/passwd"}, 422, "invalid"),
-            ({"regenerate": True}, 422, "invalid"),
+            ({"regenerate_for": "0123456789abcdef"}, 422, "invalid"),
         ],
     )
     def test_bad_requests_get_a_json_error_before_any_streaming(

@@ -208,7 +208,9 @@ class TestRetryAndHistory:
         providers["openrouter"].script = [Text("first"), Finish("stop")]
         chat_id = (await run(service, text="q", model=FREE))[0]["chat"]["id"]
         providers["openrouter"].script = [Text("second"), Finish("stop")]
-        events = await run(service, chat_id=chat_id, regenerate=True)
+        events = await run(
+            service, chat_id=chat_id, regenerate_for=store.messages(chat_id)[0].id
+        )
         assert events[0]["user"] is None
         assert [(m.role, m.content) for m in store.messages(chat_id)] == [
             ("user", "q"),
@@ -218,14 +220,36 @@ class TestRetryAndHistory:
             m["content"] for m in providers["openrouter"].requests[-1].messages
         ] == ["q"]
 
+    async def test_retrying_an_old_exchange_is_refused_and_deletes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """A second window that is behind must not delete the newest reply (and spend credits redoing it)."""
+        service, store, providers = await make_service(tmp_path)
+        providers["openrouter"].script = [Text("first answer"), Finish("stop")]
+        chat_id = (await run(service, text="one", model=FREE))[0]["chat"]["id"]
+        first_question = store.messages(chat_id)[0].id
+        providers["openrouter"].script = [Text("second answer"), Finish("stop")]
+        await run(service, chat_id=chat_id, text="two")
+        before = [(m.id, m.content) for m in store.messages(chat_id)]
+        requests_before = len(providers["openrouter"].requests)
+
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(chat_id=chat_id, regenerate_for=first_question))
+
+        assert (err.value.status, err.value.code) == (409, "stale_chat")
+        assert [(m.id, m.content) for m in store.messages(chat_id)] == before
+        assert len(providers["openrouter"].requests) == requests_before
+
     async def test_a_failed_reply_is_not_resent_after_a_retry(
         self, tmp_path: Path
     ) -> None:
-        service, _, providers = await make_service(tmp_path)
+        service, store, providers = await make_service(tmp_path)
         providers["openrouter"].script = [ProviderError("down")]
         chat_id = (await run(service, text="question", model=FREE))[0]["chat"]["id"]
         providers["openrouter"].script = [Text("fine")]
-        await run(service, chat_id=chat_id, regenerate=True)
+        await run(
+            service, chat_id=chat_id, regenerate_for=store.messages(chat_id)[0].id
+        )
         sent = providers["openrouter"].requests[-1].messages
         assert sent == [{"role": "user", "content": "question"}]
 
@@ -439,10 +463,18 @@ class TestRefusals:
 
 class TestRequestShape:
     def test_regenerate_needs_a_chat_and_no_text(self) -> None:
+        message = "fedcba9876543210"
         with pytest.raises(ValidationError):
-            ChatRequest(regenerate=True)
+            ChatRequest(regenerate_for=message)
         with pytest.raises(ValidationError):
-            ChatRequest(regenerate=True, chat_id="0123456789abcdef", text="x")
+            ChatRequest(regenerate_for=message, chat_id="0123456789abcdef", text="x")
+
+    @pytest.mark.parametrize(
+        "bad", ["", "true", "../../etc/hosts", "0123456789abcdef".upper()]
+    )
+    def test_regenerate_names_a_message_id(self, bad) -> None:
+        with pytest.raises(ValidationError):
+            ChatRequest(regenerate_for=bad, chat_id="0123456789abcdef")
 
     @pytest.mark.parametrize("text", [None, "", "   \n"])
     def test_blank_messages_are_refused(self, text) -> None:
