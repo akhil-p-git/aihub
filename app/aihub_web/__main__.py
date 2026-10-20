@@ -31,7 +31,8 @@ class _Server(uvicorn.Server):
         # The lifespan startup (models loaded, database open) and the bind both happen in here.
         await super().startup(sockets=sockets)
         if self.started:
-            # Port 0 is only resolved by the bind, so the line reports what the socket really got.
+            # Port 0 is only resolved by the bind, so read the port from the socket. `servers` is not a
+            # documented uvicorn API; uvicorn is pinned and test_web_launch.py fails if it moves.
             port = self.servers[0].sockets[0].getsockname()[1]
             print(
                 json.dumps({"event": "ready", "port": port}, separators=(",", ":")),
