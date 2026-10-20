@@ -1,0 +1,45 @@
+[Unit]
+Description=aihub web chat (127.0.0.1:8787)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/work/Dev/aihub
+Environment=PYTHONPATH=%h/work/Dev/aihub/app
+Environment=AIHUB_STATE_DIR=%h/work/Dev/aihub/state/web
+# Keys are optional (without them only local models work), so a missing file is not an error.
+EnvironmentFile=-%h/.config/aihub/aihub.env
+ExecStart=%h/work/Dev/aihub/.venv/bin/python -m aihub_web
+Restart=on-failure
+RestartSec=5
+# The chat only needs to write its own state folder and talk to Ollama, OpenRouter and Anthropic.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/work/Dev/aihub/state
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+KeyringMode=private
+UMask=0077
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target
