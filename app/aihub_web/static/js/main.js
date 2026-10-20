@@ -342,7 +342,6 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
   const userEl = regenerateFor ? null : userMessage({ id: "", content: text });
   if (userEl) els.messages.append(userEl);
   els.messages.append(view.el);
-  dropRetryButtons();
   els.route.hidden = true;
   const run = { controller, view, userEl, text, regenerate: Boolean(regenerateFor), replaced, started: false };
   state.run = run;
@@ -352,7 +351,10 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
 
   try {
     for await (const event of streamChat(body, controller.signal)) {
-      run.started = true;
+      if (!run.started) {
+        run.started = true;
+        dropRetryButtons(); // accepted: the older reply is no longer the newest
+      }
       onEvent(run, event);
     }
   } catch (err) {
@@ -429,7 +431,9 @@ function onRunError(run, err) {
       resizeInput();
     }
     els.route.hidden = state.messages.length > 0 || state.chat !== null;
-    toast(err.message);
+    const behind = err.code === "stale_chat" && state.chat;
+    toast(behind ? `${err.message} It has been reloaded.` : err.message);
+    if (behind) go(`#/c/${state.chat.id}`);
     return;
   }
   run.view.finish(localMessage(run, "error", { code: err.code, message: err.message }), { last: true });

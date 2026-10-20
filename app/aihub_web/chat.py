@@ -274,7 +274,7 @@ class ChatService:
             raise ApiError(
                 409,
                 "stale_chat",
-                "This chat changed in another window. Reload it, then retry.",
+                "This chat changed in another window.",
             )
         if messages[-1].role == "assistant":
             self._store.delete_message(messages[-1].id)

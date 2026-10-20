@@ -231,14 +231,12 @@ class TestRetryAndHistory:
         providers["openrouter"].script = [Text("second answer"), Finish("stop")]
         await run(service, chat_id=chat_id, text="two")
         before = [(m.id, m.content) for m in store.messages(chat_id)]
-        requests_before = len(providers["openrouter"].requests)
 
         with pytest.raises(ApiError) as err:
             service.prepare(ChatRequest(chat_id=chat_id, regenerate_for=first_question))
 
         assert (err.value.status, err.value.code) == (409, "stale_chat")
         assert [(m.id, m.content) for m in store.messages(chat_id)] == before
-        assert len(providers["openrouter"].requests) == requests_before
 
     async def test_a_failed_reply_is_not_resent_after_a_retry(
         self, tmp_path: Path

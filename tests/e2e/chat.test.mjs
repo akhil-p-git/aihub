@@ -221,8 +221,9 @@ describe("replying", () => {
 
     await lastReply(behind.page).getByRole("button", { name: "Retry reply" }).click();
     await behind.page.getByText(/changed in another window/).waitFor();
-    assert.equal(await replies(behind.page).count(), 1, "the reply it tried to redo comes back");
-    assert.equal(await behind.page.locator(".working").count(), 0);
+    // The refusal also brings the window up to date, so it now shows the newer exchange.
+    await waitForReplies(behind.page, 2);
+    assert.match(await lastReply(behind.page).locator(".body").textContent(), /stale window, second question/);
 
     const stored = await (await fetch(`${app.url}/api/chats/${id}`)).json();
     assert.deepEqual(
@@ -233,6 +234,27 @@ describe("replying", () => {
     assert.equal((await sentTo("/api/v1/chat/completions")).length, providerCalls, "nothing was regenerated");
     await ahead.context.close();
     await behind.context.close();
+  });
+
+  it("keeps Retry on the failed reply when the next message is refused", async () => {
+    const { page, context } = await open(browser, app);
+    await send(page, "error: before a refusal");
+    const failed = replies(page).first();
+    await failed.getByRole("alert").waitFor();
+    await page.route("**/api/chat", (route) =>
+      route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "model_unavailable", message: "Gemma 4 31B isn't available." } }),
+      }),
+    );
+    await send(page, "this one is refused");
+    await page.getByText(/isn't available/).waitFor();
+    assert.equal(await page.locator(".msg.user").count(), 1, "the refused message was taken back");
+    assert.equal(await composer(page).inputValue(), "this one is refused", "and given back");
+    assert.equal(await failed.getByRole("button", { name: "Retry" }).count(), 1, "Retry is still offered");
+    assert.equal(await failed.getByRole("button", { name: "Choose another model" }).count(), 1);
+    await context.close();
   });
 
   it("refuses an oversized message before streaming and gives the text back", async () => {
