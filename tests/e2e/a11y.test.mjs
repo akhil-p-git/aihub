@@ -162,6 +162,31 @@ describe("keyboard", () => {
     await context.close();
   });
 
+  it("keeps the model the keyboard moves to clear of the sticky group name", async () => {
+    const { page, context } = await open(browser, app, { width: 1280, height: 600 });
+    await page.getByRole("button", { name: /Change model$/ }).click();
+    const state = () =>
+      page.evaluate(() => {
+        const active = document.querySelector("#model-list [data-active]").getBoundingClientRect();
+        const list = document.getElementById("model-list").getBoundingClientRect();
+        const topmost = document.elementFromPoint(active.left + active.width / 2, active.top + active.height / 2);
+        return {
+          withinList: active.top >= list.top - 1 && active.bottom <= list.bottom + 1,
+          visible: Boolean(topmost?.closest("[data-active]")),
+        };
+      });
+    for (const [key, presses] of [
+      ["ArrowUp", 16],
+      ["ArrowDown", 40],
+    ]) {
+      for (let i = 1; i <= presses; i++) {
+        await page.keyboard.press(key);
+        assert.deepEqual(await state(), { withinList: true, visible: true }, `${key} #${i}`);
+      }
+    }
+    await context.close();
+  });
+
   it("shows a visible focus ring on controls", async () => {
     const { page, context } = await open(browser, app);
     await send(page, "hello");
