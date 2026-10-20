@@ -15,6 +15,7 @@ const els = {
   app: $("app"),
   main: $("main"),
   scrim: $("scrim"),
+  sidebar: $("sidebar"),
   nav: $("chat-nav"),
   search: $("search"),
   retention: $("retention"),
@@ -24,6 +25,7 @@ const els = {
   route: $("route"),
   routeTitle: $("route-title"),
   routeText: $("route-text"),
+  routeRetry: $("route-retry"),
   messages: $("messages"),
   jump: $("jump"),
   form: $("composer"),
@@ -95,12 +97,14 @@ function go(hash) {
 
 function setNav(open) {
   const drawer = !wide.matches;
+  const losingFocus = !open && els.sidebar.contains(document.activeElement);
   els.app.dataset.nav = open ? "open" : "closed";
   els.navOpen.setAttribute("aria-expanded", String(open));
   els.main.inert = open && drawer;
   els.scrim.hidden = !(open && drawer);
   if (!drawer) store.set("aihub.nav", open ? "open" : "closed");
   if (open && drawer) $("new-chat").focus();
+  if (losingFocus) els.navOpen.focus(); // the sidebar is hidden now, and focus must not fall to the page
 }
 
 const closeDrawer = () => !wide.matches && els.app.dataset.nav === "open" && setNav(false);
@@ -219,6 +223,7 @@ els.scroller.addEventListener(
   () => {
     state.stick = nearBottom();
     els.jump.hidden = state.stick || !state.run;
+    els.main.toggleAttribute("data-scrolled", els.scroller.scrollTop > 0);
   },
   { passive: true },
 );
@@ -279,9 +284,13 @@ function swapDraftText(key) {
   renderSend();
 }
 
+const CHAT_HASH = /^#\/c\/([0-9a-f]{16})$/;
+// Any other fragment (the skip link's, a typed one) must not replace the chat that is open.
+const isRoute = (hash) => CHAT_HASH.test(hash) || hash === "" || hash === "#/";
+
 function route() {
   closeDrawer();
-  const match = /^#\/c\/([0-9a-f]{16})$/.exec(location.hash);
+  const match = CHAT_HASH.exec(location.hash);
   if (match) openChat(match[1]);
   else newChat();
 }
@@ -360,6 +369,7 @@ function onEvent(run, event) {
     case "chat":
       if (!state.chat) {
         state.chat = event.chat;
+        draftKey = event.chat.id;
         history.replaceState(null, "", `#/c/${event.chat.id}`);
         renderTitle();
       }
@@ -535,7 +545,7 @@ function beginRename(row, chat) {
   input.focus();
   input.select();
   let finished = false;
-  const finish = async (save) => {
+  const finish = async (save, refocus = false) => {
     if (finished) return;
     finished = true;
     const title = input.value.trim();
@@ -552,28 +562,28 @@ function beginRename(row, chat) {
       }
     }
     renderSidebarNow();
+    if (refocus) els.nav.querySelector(`.chat-row[data-id="${chat.id}"] .chat-link`)?.focus();
   };
   input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") finish(true);
-    else if (event.key === "Escape") finish(false);
+    if (event.key === "Enter") finish(true, true);
+    else if (event.key === "Escape") {
+      event.stopPropagation(); // not also "close the drawer"
+      finish(false, true);
+    }
   });
   input.addEventListener("blur", () => finish(true));
 }
 
 function openSettingsDialog() {
-  openSettings({
+  let deleted = false;
+  const dialog = openSettings({
     theme: store.get("aihub.theme") ?? "system",
     instructions: state.settings.instructions,
     retentionDays: state.retentionDays,
     connections: connectionRows(),
     onTheme: applyTheme,
     onSave: async (text) => {
-      try {
-        state.settings = await api.put("/api/settings", { instructions: text });
-        toast("Instructions saved.");
-      } catch (err) {
-        toast(err.message);
-      }
+      state.settings = await api.put("/api/settings", { instructions: text });
     },
     onDeleteAll: async () => {
       const ok = await confirmDialog({
@@ -582,20 +592,17 @@ function openSettingsDialog() {
         confirm: "Delete everything",
       });
       if (!ok) return false;
-      try {
-        await api.del("/api/chats", { confirm: "delete-all" });
-      } catch (err) {
-        toast(err.message);
-        return false;
-      }
+      await api.del("/api/chats", { confirm: "delete-all" });
       state.chats = [];
       state.results = null;
       go("#/");
       renderSidebarNow();
-      toast("All chats deleted.");
+      deleted = true;
       return true;
     },
   });
+  // Said once the dialog is gone: while it is open the rest of the page is inert and nothing outside it is read out.
+  dialog.addEventListener("close", () => deleted && toast("All chats deleted."));
 }
 
 // ---- wiring
@@ -618,7 +625,12 @@ function wire() {
   $("new-chat-top").addEventListener("click", () => go("#/"));
   $("open-settings").addEventListener("click", openSettingsDialog);
   els.jump.addEventListener("click", scrollToBottom);
-  window.addEventListener("hashchange", route);
+  window.addEventListener("hashchange", () => isRoute(location.hash) && route());
+  document.querySelector(".skip").addEventListener("click", (event) => {
+    event.preventDefault(); // a fragment jump would leave the chat
+    closeDrawer(); // the page behind an open drawer is inert and cannot take focus
+    els.input.focus();
+  });
   wide.addEventListener("change", () => setNav(wide.matches ? store.get("aihub.nav") !== "closed" : false));
 
   els.modelChip.addEventListener("click", () => chooseModel());
@@ -727,19 +739,35 @@ function applyBootstrap(data) {
   });
 }
 
-async function boot() {
-  decorate();
-  wire();
-  setNav(wide.matches ? store.get("aihub.nav") !== "closed" : false);
+let loading = false;
+
+async function load() {
+  if (loading) return;
+  loading = true;
+  els.routeTitle.textContent = "";
+  els.routeText.textContent = "Loading models and chats…";
   try {
     applyBootstrap(await api.get("/api/bootstrap"));
   } catch (err) {
     els.nav.setAttribute("aria-busy", "false");
-    els.routeTitle.textContent = "Can't reach the server";
+    els.modelName.textContent = "No models";
+    els.routeTitle.textContent = "Couldn't load aihub";
     els.routeText.textContent = err.message;
+    els.routeRetry.hidden = false; // stays visible, and focused, while a retry is in flight
     return;
+  } finally {
+    loading = false;
   }
+  els.routeRetry.hidden = true;
   route();
+}
+
+function boot() {
+  decorate();
+  wire();
+  els.routeRetry.addEventListener("click", load);
+  setNav(wide.matches ? store.get("aihub.nav") !== "closed" : false);
+  load();
 }
 
 boot();

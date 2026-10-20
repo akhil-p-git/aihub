@@ -7,6 +7,7 @@ does is chosen by a keyword in the user's last message:
     slow       about 4 seconds of steady tokens (for Stop)
     endless    two minutes of steady tokens (for stopping the service mid-reply)
     markdown   a long reply with a code block, a list and a table
+    wide       a short code block, a code line and a table that are wider than a phone
     hostile    markdown full of script, style, remote images and javascript: links
     error      two tokens, then the provider fails mid-stream
     ratelimit  an HTTP 429 before anything streams
@@ -47,6 +48,17 @@ def total(items):
 
 Done.
 """
+
+WIDE = (
+    "One block fits a phone and two do not.\n\n```python\nx = 1\n```\n\n```text\n"
+    + "0123456789" * 16
+    + "\n```\n\n| "
+    # header cells never wrap, so this table scrolls sideways on a phone
+    + " | ".join(f"column_number_{n}" for n in range(6))
+    + " |\n|---|---|---|---|---|---|\n| "
+    + " | ".join(f"cell {n}" for n in range(6))
+    + " |\n"
+)
 
 HOSTILE = """Here is a summary.
 
@@ -92,6 +104,8 @@ def plan(prompt: str, reasoning: bool) -> dict:
         plan["content"] = tokens(HOSTILE)
     elif "markdown" in p:
         plan["content"], plan["delay"] = tokens(MARKDOWN), 0.01
+    elif "wide" in p:
+        plan["content"] = tokens(WIDE)
     elif "slow" in p:
         plan["content"], plan["delay"] = (
             tokens("one two three four five six seven eight nine ten " * 4),

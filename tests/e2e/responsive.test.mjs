@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
 import { startApp } from "./harness.mjs";
-import { composer, open, replyDone, send } from "./helpers.mjs";
+import { chooseIntensity, chooseModel, composer, open, replyDone, send } from "./helpers.mjs";
 
 let app;
 let browser;
@@ -47,6 +47,51 @@ describe("phone, 360 px wide", () => {
       assert.ok(b.height >= 40, `${selector} is ${b.height} tall`);
     }
     await context.close();
+  });
+
+  it("keeps the controls inside a reply, and the theme choice, at least 44 px tall", async () => {
+    const { page, context } = await open(browser, app, phone);
+    await chooseModel(page, "qwen3:8b");
+    await chooseIntensity(page, "On");
+    await send(page, "markdown please");
+    await replyDone(page);
+    for (const selector of [".meta .btn >> nth=0", ".code-head .btn", ".think > summary"]) {
+      const b = await box(page, selector);
+      assert.ok(b.height >= 43.5, `${selector} is ${b.height} tall`);
+    }
+    await page.locator("#nav-open").click();
+    await page.locator("#open-settings").click();
+    assert.ok((await box(page, ".seg span >> nth=0")).height >= 43.5, "the theme buttons");
+    await context.close();
+  });
+
+  it("shows the whole model name by giving it the first row when there is an intensity chip", async () => {
+    const { page, context } = await open(browser, app, phone);
+    await chooseModel(page, "qwen3:8b");
+    const name = page.locator("#model-name");
+    assert.equal(await name.evaluate((el) => el.scrollWidth <= el.clientWidth), true, "the name is not cut off");
+    const [model, effort, send] = await Promise.all([
+      box(page, "#model-chip"),
+      box(page, "#effort-chip"),
+      box(page, "#send"),
+    ]);
+    assert.ok(effort.y >= model.y + model.height - 1, "the intensity chip is on the second row");
+    assert.ok(Math.abs(effort.y - send.y) < 12, "and shares it with Send");
+    assert.ok(send.x + send.width <= 360 && effort.x >= 0, "both are on screen");
+    await context.close();
+  });
+
+  it("makes the model sheet closable with a visible button, and the desktop popover has none", async () => {
+    const { page, context } = await open(browser, app, phone);
+    await page.getByRole("button", { name: /Change model$/ }).click();
+    await page.locator("#model-pop .pop-head").getByRole("button", { name: "Close" }).click();
+    assert.equal(await page.locator("#model-pop").evaluate((el) => el.matches(":popover-open")), false);
+    await context.close();
+
+    const desk = await open(browser, app, { width: 1280, height: 800 });
+    await desk.page.getByRole("button", { name: /Change model$/ }).click();
+    assert.equal(await desk.page.locator("#model-pop .pop-head").isVisible(), false);
+    await desk.context.close();
   });
 
   it("opens the chat list as a drawer and closes it with Escape, returning focus", async () => {
@@ -106,7 +151,58 @@ describe("phone, 360 px wide", () => {
   });
 });
 
+describe("toasts", () => {
+  const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+  for (const [name, options] of [
+    ["phone", { width: 360, height: 740, mobile: true }],
+    ["desktop", { width: 1440, height: 900 }],
+  ]) {
+    it(`${name}: a toast covers neither the composer nor its controls`, async () => {
+      const { page, context } = await open(browser, app, options);
+      await page.route("**/api/chat", (route) =>
+        route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "internal", message: "Something broke inside aihub." } }),
+        }),
+      );
+      await send(page, "toast please");
+      const toast = page.locator("#toasts .toast");
+      await toast.waitFor();
+      const shown = await toast.boundingBox();
+      for (const selector of [".composer-box", "#model-chip", "#send"]) {
+        assert.equal(overlaps(shown, await box(page, selector)), false, `the toast covers ${selector}`);
+      }
+      assert.ok(shown.y >= 0 && shown.x >= 0 && shown.x + shown.width <= options.width, "and it is on screen");
+      await context.close();
+    });
+  }
+});
+
 describe("tablet and desktop", () => {
+  it("draws a divider under the topbar only while the conversation is scrolled under it", async () => {
+    const { page, context } = await open(browser, app, { width: 1280, height: 500 });
+    await send(page, "long please");
+    await replyDone(page);
+    const edge = () => page.locator(".topbar").evaluate((el) => getComputedStyle(el).borderBlockEndColor);
+    const scrolledTo = (top) => page.locator("#scroller").evaluate((el, y) => (el.scrollTop = y), top);
+    const marked = (on) =>
+      page.waitForFunction((want) => document.getElementById("main").hasAttribute("data-scrolled") === want, on);
+
+    await scrolledTo(0);
+    await marked(false);
+    const plain = await edge();
+    await scrolledTo(400);
+    await marked(true);
+    const divided = await edge();
+    assert.notEqual(divided, plain, "the divider appears");
+    await scrolledTo(0);
+    await marked(false);
+    assert.equal(await edge(), plain, "and goes again at the top");
+    await context.close();
+  });
+
   it("tablet: the list is a drawer, content uses the width", async () => {
     const { page, context } = await open(browser, app, { width: 820, height: 1100 });
     assert.equal(await page.locator("#sidebar").isVisible(), false);

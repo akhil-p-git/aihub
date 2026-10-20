@@ -185,7 +185,7 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 
 ## Colors
 - Cool slate neutrals at hue 250 carry about 95% of the surface. Ink and paper are tinted toward that hue; secondary text is `muted`, never a plain gray.
-- Primary, a mulberry, is the only accent. It marks Send, the focus ring, text selection and the filled signal bars. Nothing else is mulberry.
+- Primary, a mulberry, is the only accent. It marks the primary button (Send, Save), the focus ring, text selection, the filled signal bars, links inside a reply and keywords in code. Nothing else is mulberry.
 - Amber marks the paid tier so spend is never a surprise. Danger is for failed requests and the delete confirmation only. State is always paired with text or an icon, never color alone.
 - The dark theme is a separate palette on the same hue: a deep slate canvas, raised surfaces lighter instead of shadowed, and a lighter, less saturated mulberry.
 
@@ -196,11 +196,11 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 
 ## Layout
 - 4 px base. Spacing tokens only: 4, 8, 12, 16, 24, 32. Comfortable density in the conversation, compact density in the sidebar.
-- 280 px sidebar plus a conversation column of 44 rem, left-aligned. Under 1024 px the sidebar is a drawer; at 360 px the composer controls wrap to a second row with 44 px touch targets.
+- 280 px sidebar plus a conversation column of 44 rem, centered in the pane, with left-aligned text. Under 1024 px the sidebar is a drawer; on a narrow phone the model chip takes the first row of the composer and the intensity chip and Send share the second, with 44 px touch targets.
 - The composer is docked, and the page uses `dvh` and safe-area insets so the on-screen keyboard never covers it.
 
 ## Elevation & Depth
-- Panes are separated by background tone and spacing. The composer and popovers carry one soft shadow token each; nothing else casts a shadow. A surface uses a border or a shadow, not both.
+- Panes are separated by background tone and spacing. The composer has one soft shadow; layers that float above the page (popovers, dialogs, the drawer, toasts, the jump button) share another; nothing else casts a shadow. A surface uses a border or a shadow, not both.
 
 ## Shapes
 - Radius scale 6 (chips), 10 (buttons, message blocks), 16 (popovers, dialogs), 22 (composer). Nested radius is the outer radius minus the padding. Nothing is pill-shaped.
@@ -210,7 +210,7 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 - **Composer:** one rounded surface holding the text area, the model chip and the intensity chip, and the Send button, which becomes Stop while a reply streams.
 - **Model picker:** a searchable list grouped as Free (cloud), On this PC, and Paid. Each row states tier, context size and price in words. Unavailable rows say what is missing.
 - **Reply:** no container, serif text. Reasoning sits above it in a collapsed "Thought for 8 s" disclosure.
-- **Empty state:** one sentence about where the next prompt goes. No greeting, no suggestion chips.
+- **Empty state:** a short title naming the model, then one sentence about where the next prompt goes. No greeting, no suggestion chips.
 
 ## Do's and Don'ts
 - Do say where a prompt goes: stays on this PC, may be logged by a free host, or billed to the API credits.

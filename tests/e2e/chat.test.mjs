@@ -400,6 +400,65 @@ describe("the chat list", () => {
   });
 });
 
+describe("drafts", () => {
+  it("keeps an unsent draft with the chat it was typed in, also when typed while the first reply streams", async () => {
+    const { page, context } = await open(browser, app);
+    await composer(page).fill("ember lantern question");
+    await sendButton(page).click();
+    await page.waitForFunction(() => location.hash.startsWith("#/c/"));
+    await composer(page).fill("a thought typed while it answers");
+    await replyDone(page);
+
+    await page.getByRole("button", { name: "New chat" }).click();
+    await page.waitForFunction(() => document.getElementById("title").textContent === "New chat");
+    assert.equal(await composer(page).inputValue(), "", "a new chat does not inherit the draft");
+
+    await page.getByRole("link", { name: "ember lantern question" }).click();
+    await page.waitForFunction(() => document.getElementById("title").textContent === "ember lantern question");
+    assert.equal(await composer(page).inputValue(), "a thought typed while it answers");
+    await context.close();
+  });
+});
+
+describe("when the server cannot be reached", () => {
+  it("says so once, offers Try again, and recovers without a reload", async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    let reachable = false;
+    await page.route("**/api/bootstrap", (route) => (reachable ? route.continue() : route.abort("connectionrefused")));
+    await page.goto(app.url);
+
+    const retry = page.getByRole("button", { name: "Try again" });
+    await retry.waitFor();
+    assert.equal(await page.getByText(/Can't reach the aihub server/).count(), 1, "the sentence appears once");
+    assert.equal(await page.locator("#model-name").textContent(), "No models");
+
+    reachable = true;
+    await retry.click();
+    await page.waitForFunction(() => !document.getElementById("model-chip").disabled);
+    assert.equal(await retry.isHidden(), true);
+    assert.equal(await page.locator("#model-name").textContent(), "Gemma 4 31B");
+    await context.close();
+  });
+
+  it("names what it is doing while the models load", async () => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    await page.route("**/api/bootstrap", async (route) => {
+      await gate;
+      await route.continue();
+    });
+    await page.goto(app.url, { waitUntil: "domcontentloaded" });
+    assert.match(await page.locator("#route-text").textContent(), /Loading models and chats/);
+    release();
+    await page.waitForFunction(() => !document.getElementById("model-chip").disabled);
+    assert.doesNotMatch(await page.locator("#route-text").textContent(), /Loading/);
+    await context.close();
+  });
+});
+
 describe("settings", () => {
   it("applies the theme at once and remembers it across a reload", async () => {
     const { page, context } = await open(browser, app, { scheme: "light" });
@@ -413,12 +472,32 @@ describe("settings", () => {
     await context.close();
   });
 
+  it("reports a failed save beside the button, not in a toast behind the dialog", async () => {
+    const { page, context } = await open(browser, app);
+    await page.route("**/api/settings", (route) =>
+      route.request().method() === "PUT"
+        ? route.fulfill({
+            status: 500,
+            contentType: "application/json",
+            body: JSON.stringify({ error: { code: "internal", message: "The disk is full." } }),
+          })
+        : route.continue(),
+    );
+    await page.getByRole("button", { name: "Settings" }).click();
+    const save = page.getByRole("button", { name: "Save instructions" });
+    await save.click();
+    await page.getByRole("dialog").getByText("The disk is full.").waitFor();
+    assert.equal(await page.locator("#toasts .toast").count(), 0);
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Save instructions", "focus stays");
+    await context.close();
+  });
+
   it("saves standing instructions that reach the model", async () => {
     const { page, context } = await open(browser, app);
     await page.getByRole("button", { name: "Settings" }).click();
     await page.getByRole("textbox", { name: "Standing instructions" }).fill("Always answer in French.");
     await page.getByRole("button", { name: "Save instructions" }).click();
-    await page.getByText("Instructions saved.").waitFor();
+    await page.getByRole("dialog").getByText("Saved.").waitFor();
     await page.keyboard.press("Escape");
     await send(page, "bonjour");
     await replyDone(page);

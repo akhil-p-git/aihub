@@ -178,6 +178,16 @@ class TestSearch:
         assert found[by_text].snippet.startswith("…")
         assert {c.id for c in store.list_chats("PASTA")} == {by_title}
 
+    def test_a_snippet_shows_the_words_without_their_code_markup(
+        self, store: Store
+    ) -> None:
+        chat = make_chat(
+            store, "Chat", "Use `asyncio`:\n```python\nimport asyncio\n```"
+        )
+        [found] = store.list_chats("asyncio")
+        assert found.id == chat
+        assert found.snippet == "Use asyncio: import asyncio"
+
     @pytest.mark.parametrize(
         ("term", "decoy"),
         [("100%", "1000 reasons"), ("a_b", "axb"), ("back\\slash", "backslash")],

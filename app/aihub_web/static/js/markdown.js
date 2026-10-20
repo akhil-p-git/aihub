@@ -141,6 +141,21 @@ async function highlightCode(code) {
   }
 }
 
+// A code block or table that scrolls sideways has to be reachable by keyboard, or its overflow can't be read.
+// A ResizeObserver also fires once when it starts watching, which is the first check.
+const scrollers = new ResizeObserver((entries) => {
+  const scrolls = entries.map(({ target }) => target.scrollWidth > target.clientWidth); // reads, then writes
+  entries.forEach(({ target }, i) => {
+    if (scrolls[i]) {
+      target.tabIndex = 0;
+      target.setAttribute("role", "group");
+      target.setAttribute("aria-label", target.matches("pre") ? "Code, scrolls sideways" : "Table, scrolls sideways");
+    } else {
+      for (const name of ["tabindex", "role", "aria-label"]) target.removeAttribute(name);
+    }
+  });
+});
+
 function decorate(fragment) {
   for (const input of fragment.querySelectorAll("input")) {
     if (input.getAttribute("type") === "checkbox") input.disabled = true;
@@ -185,6 +200,7 @@ export function createRenderer(container) {
         if (el) container.append(el);
         blocks.push({ raw: tokens[i].raw, el });
       }
+      if (final) container.querySelectorAll(".code pre, .table-wrap").forEach((el) => scrollers.observe(el));
       // Highlight only code that is finished: a half-streamed block would be tokenised wrongly.
       blocks.forEach((block, i) => {
         const finished = final || i < blocks.length - 1 || hasClosingFence(block.raw);

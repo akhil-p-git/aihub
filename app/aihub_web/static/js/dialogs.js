@@ -46,6 +46,18 @@ export function confirmDialog({ title, text, confirm, kind = "danger" }) {
   });
 }
 
+/** A button with a line beside it that says what happened. The line exists before it speaks, so it is read out. */
+function withStatus(button) {
+  const status = h("span", { class: "action-status", role: "status" });
+  return {
+    row: h("div", { class: "action" }, button, status),
+    say(text, failed = false) {
+      status.textContent = text;
+      status.toggleAttribute("data-error", failed);
+    },
+  };
+}
+
 const THEMES = [
   ["system", "System"],
   ["light", "Light"],
@@ -80,19 +92,34 @@ export function openSettings({ theme, instructions, retentionDays, connections, 
   );
   themeField.addEventListener("change", (event) => onTheme(event.target.value));
 
+  // Not disabled while it works: a focused button that turns disabled drops the keyboard out of the dialog.
   const save = h("button", { class: "btn", type: "button", "data-kind": "primary" }, "Save instructions");
+  const saved = withStatus(save);
+  let saving = false;
   save.addEventListener("click", async () => {
-    save.disabled = true;
+    if (saving) return;
+    saving = true;
+    saved.say("");
     try {
       await onSave(area.value);
+      saved.say("Saved.");
+    } catch (err) {
+      saved.say(err.message, true);
     } finally {
-      save.disabled = false;
+      saving = false;
     }
   });
+  area.addEventListener("input", () => saved.say(""));
 
   const wipe = h("button", { class: "btn", type: "button", "data-kind": "danger" }, "Delete all chats…");
+  const wiped = withStatus(wipe);
   wipe.addEventListener("click", async () => {
-    if (await onDeleteAll()) dialog.close();
+    wiped.say("");
+    try {
+      if (await onDeleteAll()) dialog.close();
+    } catch (err) {
+      wiped.say(err.message, true);
+    }
   });
 
   const dialog = modal(
@@ -107,7 +134,7 @@ export function openSettings({ theme, instructions, retentionDays, connections, 
         h("label", { for: "instructions" }, "Standing instructions"),
         area,
         h("span", { class: "hint" }, "Added to the start of every chat. Up to 4,000 characters."),
-        h("div", {}, save),
+        saved.row,
       ),
       h(
         "div",
@@ -128,7 +155,7 @@ export function openSettings({ theme, instructions, retentionDays, connections, 
           { class: "hint" },
           `Stored only on this PC. Each chat is deleted ${retentionDays} days after its last message.`,
         ),
-        h("div", {}, wipe),
+        wiped.row,
       ),
     ),
     h("div", { class: "dlg-foot" }),

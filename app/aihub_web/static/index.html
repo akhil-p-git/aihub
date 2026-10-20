@@ -54,7 +54,8 @@
       <div class="thread" id="thread">
         <section class="route" id="route" aria-live="polite">
           <h2 class="route-title" id="route-title"></h2>
-          <p class="route-text" id="route-text"></p>
+          <p class="route-text" id="route-text">Loading models and chats…</p>
+          <button class="btn" id="route-retry" type="button" hidden>Try again</button>
         </section>
         <div class="messages" id="messages" role="log" aria-label="Conversation"></div>
       </div>
@@ -83,6 +84,6 @@
 </div>
 
 <div class="sr-only" id="status" role="status" aria-live="polite"></div>
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>

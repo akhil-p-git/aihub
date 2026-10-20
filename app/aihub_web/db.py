@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -97,7 +98,7 @@ def _snippet(text: str, term: str, width: int = 60) -> str:
     if at < 0:
         return " ".join(text[: 2 * width].split())
     start, end = max(0, at - width), at + len(term) + width
-    body = " ".join(text[start:end].split())
+    body = " ".join(re.sub(r"`{3,}[\w+#.-]*|`", "", text[start:end]).split())
     return ("…" if start else "") + body + ("…" if end < len(text) else "")
 
 

@@ -128,9 +128,12 @@ function build() {
     "aria-expanded": "true",
   });
   list = h("div", { class: "pop-list", id: "model-list", role: "listbox", "aria-label": "Models" });
+  const close = h("button", { class: "icon-btn", type: "button", "aria-label": "Close" }, icon("x"));
+  close.addEventListener("click", () => pop.hidePopover());
   pop = h(
     "div",
     { class: "pop", id: "model-pop", popover: "auto", role: "dialog", "aria-label": "Choose a model" },
+    h("div", { class: "pop-head" }, h("p", { class: "pop-title", "aria-hidden": "true" }, "Choose a model"), close),
     h("div", { class: "pop-search" }, search),
     list,
   );

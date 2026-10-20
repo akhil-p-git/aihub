@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { chromium } from "playwright";
 import { startApp } from "./harness.mjs";
-import { axe, composer, lastReply, open, replyDone, send } from "./helpers.mjs";
+import { axe, composer, lastReply, open, replies, replyDone, send } from "./helpers.mjs";
 
 let app;
 let browser;
@@ -56,6 +56,12 @@ describe("axe (WCAG 2.2 AA), no violations", () => {
       await send(page, "markdown please");
       await replyDone(page);
     }));
+  it("a phone showing a code line, a table and a short block that all overflow or not", () =>
+    scan("wide content", { width: 360, height: 740, mobile: true }, async (page) => {
+      await send(page, "wide please");
+      await replyDone(page);
+      await page.locator(".code pre[tabindex='0']").waitFor();
+    }));
   it("the phone drawer", () =>
     scan("drawer", { width: 360, height: 740, mobile: true }, (page) => page.locator("#nav-open").click()));
 });
@@ -69,6 +75,90 @@ describe("keyboard", () => {
     assert.equal(await skip.boundingBox().then((b) => b.y >= 0), true, "visible once focused");
     await page.keyboard.press("Enter");
     assert.equal(await focused(page), "composer-input");
+    await context.close();
+  });
+
+  it("the skip link and a stray fragment leave the open chat and its draft alone", async () => {
+    const { page, context } = await open(browser, app);
+    await send(page, "skip link scenario");
+    await replyDone(page);
+    const where = () =>
+      page.evaluate(() => ({ hash: location.hash, title: document.getElementById("title").textContent }));
+    const before = await where();
+    await composer(page).fill("half-written thought");
+
+    await page.getByRole("link", { name: "Skip to the message box" }).focus();
+    await page.keyboard.press("Enter");
+    assert.equal(await focused(page), "composer-input");
+    assert.deepEqual(await where(), before);
+    assert.equal(await composer(page).inputValue(), "half-written thought");
+    assert.equal(await replies(page).count(), 1);
+
+    // main.js listens first, so by the time this resolves it has seen the change.
+    await page.evaluate(
+      () =>
+        new Promise((resolve) => {
+          addEventListener("hashchange", resolve, { once: true });
+          location.hash = "#somewhere-else";
+        }),
+    );
+    assert.equal(await page.locator("#title").textContent(), before.title);
+    assert.equal(await replies(page).count(), 1);
+    await context.close();
+  });
+
+  it("keeps focus on the chat row after a rename, and Escape cancels without closing the drawer", async () => {
+    const { page, context } = await open(browser, app, { width: 820, height: 1000 });
+    await send(page, "rename focus scenario");
+    await replyDone(page);
+    await page.locator("#nav-open").click();
+    const rename = async (text, key) => {
+      const title = await page.locator("#title").textContent();
+      await page
+        .locator(".chat-row", { has: page.getByRole("link", { name: title }) })
+        .getByRole("button", { name: /^Options for/ })
+        .click();
+      await page.getByRole("menuitem", { name: "Rename…" }).click();
+      await page.getByRole("textbox", { name: "Chat title" }).fill(text);
+      await page.keyboard.press(key);
+    };
+
+    await rename("Renamed with Enter", "Enter");
+    await page.getByRole("link", { name: "Renamed with Enter" }).waitFor();
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), "Renamed with Enter");
+
+    await rename("Never saved", "Escape");
+    assert.equal(await page.getByRole("link", { name: "Renamed with Enter" }).count(), 1, "the old title stays");
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), "Renamed with Enter");
+    assert.equal(await page.locator("#sidebar").isVisible(), true, "Escape only cancelled the rename");
+    await context.close();
+  });
+
+  it("moves focus to Show chats when the chat list is hidden from the keyboard", async () => {
+    const { page, context } = await open(browser, app, { width: 1440, height: 900 });
+    await page.locator("#nav-close").focus();
+    await page.keyboard.press("Enter");
+    assert.equal(await page.locator("#sidebar").isVisible(), false);
+    assert.equal(await focused(page), "nav-open");
+    await page.keyboard.press("Enter");
+    assert.equal(await page.locator("#sidebar").isVisible(), true);
+    await context.close();
+  });
+
+  it("lets a keyboard user scroll a code block or table that overflows, and only those", async () => {
+    const { page, context } = await open(browser, app, { width: 360, height: 740, mobile: true });
+    await send(page, "wide please");
+    await replyDone(page);
+    const stops = page.locator(".code pre[tabindex='0'], .table-wrap[tabindex='0']");
+    await stops.nth(1).waitFor();
+    assert.equal(await stops.count(), 2, "the long code line and the wide table");
+    assert.equal(await page.locator(".code pre:not([tabindex])").count(), 1, "the short block is not a tab stop");
+    assert.match((await stops.first().getAttribute("aria-label")) ?? "", /Code/);
+
+    await stops.first().focus();
+    await page.keyboard.press("ArrowRight");
+    // Keyboard scrolling animates, so wait for it instead of reading the position at once.
+    await page.waitForFunction(() => document.activeElement.scrollLeft > 0);
     await context.close();
   });
 
@@ -167,6 +257,14 @@ describe("assistive technology", () => {
     await page.getByRole("button", { name: /Change model$/ }).click();
     await page.getByRole("option", { name: /Haiku 5.5/ }).click();
     assert.match(await page.locator("#effort-chip").getAttribute("aria-label"), /Intensity: Low/);
+    await context.close();
+  });
+
+  it("has a live region for toasts before the first toast needs it", async () => {
+    const { page, context } = await open(browser, app);
+    const region = page.locator("#toasts");
+    assert.equal(await region.getAttribute("role"), "status");
+    assert.equal(await region.getAttribute("aria-live"), "polite");
     await context.close();
   });
 
