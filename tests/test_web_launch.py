@@ -1,6 +1,7 @@
 """Starting `python -m aihub_web` the way a launcher does: a ready line, a stop on stdin EOF, and exit status 3."""
 
 import contextlib
+import functools
 import json
 import os
 import re
@@ -125,6 +126,18 @@ def launch(tmp_path: Path, fake_url: str):
                 pipe.close()
 
 
+@pytest.fixture(params=["service", "desktop"])
+def start(request, launch):
+    """`launch` the way systemd starts the app, then the way the desktop shell does.
+
+    systemd gives the unit stdin on /dev/null and sets no new variable. The shell holds a pipe open on
+    the child's stdin for as long as it lives and sets AIHUB_EXIT_ON_STDIN_EOF=1.
+    """
+    if request.param == "service":
+        return launch
+    return functools.partial(launch, stdin=subprocess.PIPE, AIHUB_EXIT_ON_STDIN_EOF="1")
+
+
 def test_port_zero_prints_one_ready_line_naming_a_port_that_serves(
     launch, occupied_port: int
 ) -> None:
@@ -218,26 +231,26 @@ def test_a_signal_still_stops_a_server_that_is_watching_stdin(
     assert "Traceback" not in log and "Fatal Python error" not in log, log
 
 
-def test_a_taken_port_exits_3_without_a_ready_line(launch, occupied_port: int) -> None:
-    app = launch(AIHUB_PORT=str(occupied_port))
+def test_a_taken_port_exits_3_without_a_ready_line(start, occupied_port: int) -> None:
+    app = start(AIHUB_PORT=str(occupied_port))
     assert app.process.wait(timeout=10) == 3, app.log()
     assert app.stdout_rest() == ""
     assert "address already in use" in app.log()
 
 
-def test_a_startup_failure_exits_3_without_a_ready_line(launch, tmp_path: Path) -> None:
+def test_a_startup_failure_exits_3_without_a_ready_line(start, tmp_path: Path) -> None:
     (tmp_path / "state").mkdir()
     newer = sqlite3.connect(tmp_path / "state" / "chats.db")
     newer.execute("PRAGMA user_version = 99")  # a database from a newer version
     newer.close()
-    app = launch(AIHUB_PORT="0")
+    app = start(AIHUB_PORT="0")
     assert app.process.wait(timeout=10) == 3, app.log()
     assert app.stdout_rest() == ""
     assert "newer than this app" in app.log()
 
 
-def test_a_bad_port_variable_exits_1_with_a_message(launch) -> None:
-    app = launch(AIHUB_PORT="not-a-port")
+def test_a_bad_port_variable_exits_1_with_a_message(start) -> None:
+    app = start(AIHUB_PORT="not-a-port")
     assert app.process.wait(timeout=10) == 1, app.log()
     assert app.stdout_rest() == ""
     assert "aihub-web: " in app.log() and "port: Input should be" in app.log()

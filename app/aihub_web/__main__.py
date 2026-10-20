@@ -46,9 +46,11 @@ def _stop_when_stdin_closes() -> None:
     SIGTERM is the signal `systemctl stop` sends, so a streaming reply is stored as stopped
     through the shutdown that already exists.
     """
-    # A stdin that can't be read counts as closed.
-    with contextlib.suppress(AttributeError, OSError, ValueError):
-        while sys.stdin.buffer.read(4096):
+    # Read the descriptor, not sys.stdin.buffer: a thread blocked inside BufferedReader.read holds that
+    # object's lock, and the interpreter then aborts (SIGABRT, status -6) at exit because it can't take
+    # the lock. A start that failed would end that way instead of with status 3.
+    with contextlib.suppress(OSError):  # a stdin that can't be read counts as closed
+        while os.read(0, 4096):
             pass
     log.info("stdin closed, stopping")
     os.kill(os.getpid(), signal.SIGTERM)
