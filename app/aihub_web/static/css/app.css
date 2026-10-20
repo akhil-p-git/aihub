@@ -306,8 +306,9 @@
 
   /* Messages */
   .messages { display: grid; gap: var(--s-8); }
-  .msg { content-visibility: auto; contain-intrinsic-size: auto 6rem; min-inline-size: 0; }
-  .msg:last-child { content-visibility: visible; }
+  /* No content-visibility: on a 4x-throttled phone it saved about 20 ms of a 110 ms task and left the scroll height
+     half of the real one, so the scrollbar and the position drifted while reading back through a chat. */
+  .msg { min-inline-size: 0; }
   .msg.user .bubble {
     inline-size: fit-content; max-inline-size: 100%;
     padding: var(--s-3) var(--s-4); border-radius: var(--r-md);
