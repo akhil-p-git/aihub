@@ -1,0 +1,18 @@
+{
+  "name": "aihub",
+  "short_name": "aihub",
+  "description": "Private chat with local, free and paid models.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0c151d",
+  "theme_color": "#0c151d",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

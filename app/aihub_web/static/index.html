@@ -2,9 +2,87 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>aihub</title>
+<meta name="description" content="Private chat with local, free and paid models.">
+<meta name="theme-color" content="#f8fafd" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0c151d" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="manifest" href="/manifest.webmanifest">
+<script src="/js/theme.js"></script>
+<link rel="preload" href="/lib/fonts/instrument-sans-5.3.0/latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/main.js"></script>
 </head>
 <body>
-<p>aihub is starting.</p>
+<a class="skip" href="#composer-input">Skip to the message box</a>
+
+<div class="app" id="app" data-nav="auto">
+  <aside class="sidebar" id="sidebar" aria-label="Chats">
+    <div class="sidebar-head">
+      <a class="brand" href="#/" aria-label="aihub, start a new chat">
+        <svg class="mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="2" y="12" width="3" height="6" rx="1"/><rect x="6.5" y="9" width="3" height="9" rx="1"/><rect x="11" y="6" width="3" height="12" rx="1"/><rect x="15.5" y="3" width="3" height="15" rx="1"/></svg>
+        <span>aihub</span>
+      </a>
+      <button class="icon-btn" id="nav-close" type="button" aria-label="Hide chats"></button>
+    </div>
+    <button class="new-chat" id="new-chat" type="button"></button>
+    <div class="search">
+      <label class="sr-only" for="search">Search chats</label>
+      <input id="search" type="search" placeholder="Search chats…" autocomplete="off" spellcheck="false" enterkeyhint="search">
+    </div>
+    <nav class="chat-nav" id="chat-nav" aria-label="Recent chats" aria-busy="true"></nav>
+    <div class="sidebar-foot">
+      <button class="foot-btn" id="open-settings" type="button"></button>
+      <p class="retention" id="retention">Chats are deleted 30 days after their last message.</p>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main" id="main">
+    <header class="topbar">
+      <button class="icon-btn" id="nav-open" type="button" aria-label="Show chats" aria-controls="sidebar" aria-expanded="false"></button>
+      <div class="title-wrap">
+        <h1 class="title" id="title">New chat</h1>
+        <p class="title-sub" id="title-sub" hidden></p>
+      </div>
+      <button class="icon-btn top-new" id="new-chat-top" type="button" aria-label="New chat"></button>
+    </header>
+
+    <div class="pane">
+    <div class="scroller" id="scroller">
+      <div class="thread" id="thread">
+        <section class="route" id="route" aria-live="polite">
+          <h2 class="route-title" id="route-title"></h2>
+          <p class="route-text" id="route-text"></p>
+        </section>
+        <div class="messages" id="messages" role="log" aria-label="Conversation"></div>
+      </div>
+    </div>
+    <button class="jump" id="jump" type="button" hidden></button>
+    </div>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="composer-box">
+        <label class="sr-only" for="composer-input">Message</label>
+        <textarea id="composer-input" name="message" rows="1" placeholder="Message…" enterkeyhint="send" autocapitalize="sentences"></textarea>
+        <div class="composer-bar">
+          <button class="chip" id="model-chip" type="button" aria-haspopup="listbox" aria-expanded="false" disabled>
+            <span class="tier" id="model-tier" hidden></span>
+            <span class="chip-name" id="model-name">Loading models…</span>
+          </button>
+          <button class="chip" id="effort-chip" type="button" aria-haspopup="true" aria-expanded="false" hidden>
+            <span class="chip-bars" id="effort-bars"></span>
+            <span class="chip-name" id="effort-name"></span>
+          </button>
+          <button class="send" id="send" type="submit" aria-label="Send" disabled></button>
+        </div>
+      </div>
+    </form>
+  </main>
+</div>
+
+<div class="sr-only" id="status" role="status" aria-live="polite"></div>
+<div class="toasts" id="toasts"></div>
 </body>
 </html>

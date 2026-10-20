@@ -89,7 +89,7 @@ class TestChatFlow:
             "POST", "/api/chat", json={"text": "Hi there", "model": FREE}
         ) as response:
             assert response.headers["content-type"].startswith("application/x-ndjson")
-            assert response.headers["cache-control"] == "no-store"
+            assert response.headers["cache-control"] == "no-cache, no-transform"
             events = [json.loads(line) for line in response.iter_lines() if line]
         assert [e["t"] for e in events] == ["chat", "think", "text", "text", "done"]
 
@@ -410,3 +410,63 @@ async def test_ending_the_body_closes_the_stream_that_feeds_it(tmp_path: Path) -
     await body.aclose()
     reply_message = store.messages(turn.chat.id)[-1]
     assert (reply_message.status, reply_message.content) == ("stopped", "par")
+
+
+class TestStaticFiles:
+    def test_text_assets_are_compressed_and_the_stream_is_not(
+        self, api: TestClient
+    ) -> None:
+        asset = api.get("/css/app.css", headers={"accept-encoding": "gzip"})
+        assert asset.status_code == 200 and asset.headers["content-encoding"] == "gzip"
+        assert "text/css" in asset.headers["content-type"]
+        with api.stream(
+            "POST",
+            "/api/chat",
+            json={"text": "hi", "model": FREE},
+            headers={"accept-encoding": "gzip"},
+        ) as response:
+            assert "content-encoding" not in response.headers, (
+                "gzip would hold back streamed tokens"
+            )
+
+    def test_fonts_are_not_compressed_twice(self, api: TestClient) -> None:
+        font = api.get(
+            "/lib/fonts/instrument-sans-5.3.0/latin-wght-normal.woff2",
+            headers={"accept-encoding": "gzip"},
+        )
+        assert font.status_code == 200 and "content-encoding" not in font.headers
+        assert font.headers["content-type"] == "font/woff2"
+
+    def test_app_files_revalidate_and_versioned_libraries_never_do(
+        self, api: TestClient
+    ) -> None:
+        assert api.get("/css/app.css").headers["cache-control"] == "no-cache"
+        assert api.get("/js/main.js").headers["cache-control"] == "no-cache"
+        lib = api.get("/lib/marked-18.1.0/marked.esm.js")
+        assert lib.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+    def test_a_conditional_request_gets_a_304_with_no_body(
+        self, api: TestClient
+    ) -> None:
+        first = api.get("/js/main.js")
+        again = api.get("/js/main.js", headers={"if-none-match": first.headers["etag"]})
+        assert again.status_code == 304 and again.content == b""
+        assert again.headers["cache-control"] == "no-cache"
+
+    def test_javascript_and_manifest_have_the_right_types(
+        self, api: TestClient
+    ) -> None:
+        assert "javascript" in api.get("/js/main.js").headers["content-type"]
+        assert (
+            api.get("/manifest.webmanifest")
+            .headers["content-type"]
+            .startswith("application/manifest+json")
+        )
+        assert api.get("/icon.svg").headers["content-type"].startswith("image/svg+xml")
+
+    def test_every_file_the_page_loads_exists(self, api: TestClient) -> None:
+        import re
+
+        html = api.get("/").text
+        for path in re.findall(r'(?:href|src)="(/[^"]+)"', html):
+            assert api.get(path).status_code == 200, path

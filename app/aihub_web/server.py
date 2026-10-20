@@ -18,6 +18,7 @@ import httpx2
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
@@ -212,7 +213,8 @@ async def post_chat(request: Request) -> Response:
     return StreamingResponse(
         ndjson(ctx.service.stream(turn)),
         media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        # Not "no-store": on a streamed response Chromium reports the finished fetch as cancelled.
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
 
 
@@ -293,7 +295,16 @@ def create_app(
                 api_not_found,
                 methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             ),
-            Mount("/", app=Static(directory=STATIC_DIR, html=True), name="ui"),
+            # Only the static files are compressed: a gzip buffer would hold back streamed tokens.
+            Mount(
+                "/",
+                app=GZipMiddleware(
+                    Static(directory=STATIC_DIR, html=True),
+                    minimum_size=1024,
+                    compresslevel=6,
+                ),
+                name="ui",
+            ),
         ],
         middleware=[Middleware(SecurityMiddleware, allowed_hosts=cfg.allowed_hosts)],
         exception_handlers={ApiError: api_error},

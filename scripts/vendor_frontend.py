@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Vendor the browser libraries and fonts into app/aihub_web/static/lib from pinned npm releases.
+
+The UI loads everything from its own origin (the CSP forbids anything else), so the files are copied
+here rather than fetched from a CDN. Each tarball is checked against the registry's integrity hash
+before anything is copied, and lib/VENDOR.md records the versions and the SHA-256 of every file.
+
+    python3 scripts/vendor_frontend.py
+
+Bump a version below, run it, and commit the diff. Needs `npm` on PATH.
+"""
+
+import base64
+import hashlib
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "app" / "aihub_web" / "static" / "lib"
+
+# Highlighted lazily, one file per language, so a long list costs nothing until a block needs it.
+LANGUAGES = [
+    "bash",
+    "c",
+    "cpp",
+    "csharp",
+    "css",
+    "diff",
+    "dockerfile",
+    "go",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "lua",
+    "makefile",
+    "markdown",
+    "php",
+    "plaintext",
+    "powershell",
+    "python",
+    "ruby",
+    "rust",
+    "scss",
+    "shell",
+    "sql",
+    "swift",
+    "typescript",
+    "xml",
+    "yaml",
+]
+
+# package, version, destination folder, {path inside the tarball: file name written}
+PACKAGES = [
+    (
+        "marked",
+        "18.1.0",
+        "marked-18.1.0",
+        {"lib/marked.esm.js": "marked.esm.js", "LICENSE": "LICENSE"},
+    ),
+    (
+        "dompurify",
+        "3.4.16",
+        "dompurify-3.4.16",
+        {
+            "dist/purify.es.mjs": "purify.es.mjs",
+            "LICENSE": "LICENSE",
+            "LICENSE-MPL": "LICENSE-MPL",
+        },
+    ),
+    (
+        "@highlightjs/cdn-assets",
+        "11.12.0",
+        "highlight-11.12.0",
+        {
+            "es/core.min.js": "core.min.js",
+            "LICENSE": "LICENSE",
+            **{f"es/languages/{n}.min.js": f"languages/{n}.min.js" for n in LANGUAGES},
+        },
+    ),
+    (
+        "@fontsource-variable/instrument-sans",
+        "5.3.0",
+        "fonts/instrument-sans-5.3.0",
+        {
+            "files/instrument-sans-latin-wght-normal.woff2": "latin-wght-normal.woff2",
+            "files/instrument-sans-latin-ext-wght-normal.woff2": "latin-ext-wght-normal.woff2",
+            "LICENSE": "LICENSE",
+        },
+    ),
+    (
+        "@fontsource-variable/literata",
+        "5.3.0",
+        "fonts/literata-5.3.0",
+        {
+            "files/literata-latin-wght-normal.woff2": "latin-wght-normal.woff2",
+            "files/literata-latin-wght-italic.woff2": "latin-wght-italic.woff2",
+            "files/literata-latin-ext-wght-normal.woff2": "latin-ext-wght-normal.woff2",
+            "files/literata-latin-ext-wght-italic.woff2": "latin-ext-wght-italic.woff2",
+            "LICENSE": "LICENSE",
+        },
+    ),
+]
+
+
+def npm(*args: str, cwd: Path | None = None) -> str:
+    done = subprocess.run(
+        ["npm", *args], cwd=cwd, capture_output=True, text=True, check=True
+    )
+    return done.stdout.strip()
+
+
+def sha512_integrity(path: Path) -> str:
+    return (
+        "sha512-"
+        + base64.b64encode(hashlib.sha512(path.read_bytes()).digest()).decode()
+    )
+
+
+def main() -> int:
+    notes = []
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        for name, version, folder, files in PACKAGES:
+            spec = f"{name}@{version}"
+            expected = npm("view", spec, "dist.integrity")
+            tarball = work / npm(
+                "pack", spec, "--silent", "--pack-destination", ".", cwd=work
+            )
+            if sha512_integrity(tarball) != expected:
+                print(
+                    f"{spec}: tarball does not match the registry's integrity hash",
+                    file=sys.stderr,
+                )
+                return 1
+            destination = LIB / folder
+            written = []
+            with tarfile.open(tarball) as archive:
+                for source, target in files.items():
+                    member = archive.extractfile(f"package/{source}")
+                    if member is None:
+                        print(f"{spec}: {source} is missing", file=sys.stderr)
+                        return 1
+                    out = destination / target
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    data = member.read()
+                    out.write_bytes(data)
+                    written.append(
+                        (
+                            f"{folder}/{target}",
+                            hashlib.sha256(data).hexdigest(),
+                            len(data),
+                        )
+                    )
+            notes.append((spec, expected, written))
+            print(f"{spec}: {len(written)} files")
+
+    lines = [
+        "# Vendored browser files",
+        "",
+        "Generated by `scripts/vendor_frontend.py`; edit the pins there, not here. Each tarball's SHA-512",
+        "matched the npm registry's `dist.integrity` when it was copied. The server serves this folder with",
+        "a one-year immutable cache, so a new version gets a new folder name.",
+        "",
+    ]
+    for spec, integrity, written in notes:
+        lines += [
+            f"## {spec}",
+            "",
+            f"Tarball integrity: `{integrity}`",
+            "",
+            "| File | SHA-256 | Bytes |",
+            "|---|---|---|",
+        ]
+        lines += [
+            f"| `{path}` | `{digest[:16]}…` | {size:,} |"
+            for path, digest, size in written
+        ]
+        lines.append("")
+    (LIB / "VENDOR.md").write_text("\n".join(lines), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
