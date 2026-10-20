@@ -189,6 +189,22 @@ class TestSearch:
         assert found.snippet == "Use asyncio: import asyncio"
 
     @pytest.mark.parametrize(
+        ("text", "term", "snippet"),
+        [
+            ("Run ```npm-install``` first", "npm-install", "Run npm-install first"),
+            ("use ````md fences```` here", "fences", "use md fences here"),
+            ("```js\nconst a = 1\n```", "const", "const a = 1"),
+        ],
+    )
+    def test_triple_backticks_inside_a_line_keep_their_words(
+        self, store: Store, text: str, term: str, snippet: str
+    ) -> None:
+        """Only a fence on a line of its own carries a language tag; inline code is just text."""
+        make_chat(store, "Chat", text)
+        [found] = store.list_chats(term)
+        assert found.snippet == snippet
+
+    @pytest.mark.parametrize(
         ("term", "decoy"),
         [("100%", "1000 reasons"), ("a_b", "axb"), ("back\\slash", "backslash")],
     )

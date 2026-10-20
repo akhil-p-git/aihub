@@ -98,7 +98,8 @@ def _snippet(text: str, term: str, width: int = 60) -> str:
     if at < 0:
         return " ".join(text[: 2 * width].split())
     start, end = max(0, at - width), at + len(term) + width
-    body = " ".join(re.sub(r"`{3,}[\w+#.-]*|`", "", text[start:end]).split())
+    fenceless = re.sub(r"(?m)^ {0,3}`{3,}[\w+#.-]*[ \t]*$", "", text[start:end])
+    body = " ".join(fenceless.replace("`", "").split())
     return ("…" if start else "") + body + ("…" if end < len(text) else "")
 
 
