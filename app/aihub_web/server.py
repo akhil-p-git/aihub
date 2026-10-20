@@ -27,7 +27,7 @@ from starlette.types import Scope
 
 from .catalog import Catalog
 from .chat import ApiError, ChatRequest, ChatService
-from .config import Config
+from .config import Config, secret
 from .db import Store
 from .providers import Provider, build_providers
 from .security import SecurityMiddleware
@@ -253,6 +253,9 @@ def create_app(
 ) -> Starlette:
     """`transport` and `providers` exist so tests can swap the network and the models out."""
 
+    # Set by the desktop shell, which gives only its own window the matching cookie; the service sets none.
+    launch_token = secret("AIHUB_LAUNCH_TOKEN", environ)
+
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         client = httpx2.AsyncClient(transport=transport)
@@ -306,7 +309,13 @@ def create_app(
                 name="ui",
             ),
         ],
-        middleware=[Middleware(SecurityMiddleware, allowed_hosts=cfg.allowed_hosts)],
+        middleware=[
+            Middleware(
+                SecurityMiddleware,
+                allowed_hosts=cfg.allowed_hosts,
+                token=launch_token.encode() if launch_token else None,
+            )
+        ],
         exception_handlers={ApiError: api_error},
         lifespan=lifespan,
         max_body_size=BODY_LIMIT,

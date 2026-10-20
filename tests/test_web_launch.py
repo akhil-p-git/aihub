@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import select
 import signal
 import socket
@@ -240,3 +241,31 @@ def test_a_bad_port_variable_exits_1_with_a_message(launch) -> None:
     assert app.process.wait(timeout=10) == 1, app.log()
     assert app.stdout_rest() == ""
     assert "aihub-web: " in app.log() and "port: Input should be" in app.log()
+
+
+def test_a_launch_token_in_the_environment_guards_the_api(
+    launch, occupied_port: int
+) -> None:
+    token = secrets.token_urlsafe(32)
+    app = launch(config_port=occupied_port, AIHUB_PORT="0", AIHUB_LAUNCH_TOKEN=token)
+    base = f"http://127.0.0.1:{app.port()}"
+    assert httpx2.get(f"{base}/api/health", timeout=5).status_code == 401
+    own = {"cookie": f"aihub_t={token}"}
+    assert httpx2.get(f"{base}/api/health", headers=own, timeout=5).status_code == 200
+    assert httpx2.get(f"{base}/", timeout=5).status_code == 200
+    app.stop()
+
+
+def test_a_cookie_that_is_not_text_is_refused_not_a_server_error(
+    launch, occupied_port: int
+) -> None:
+    app = launch(config_port=occupied_port, AIHUB_PORT="0", AIHUB_LAUNCH_TOKEN="secret")
+    request = (
+        b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        b"Cookie: aihub_t=\xff\xfe\r\n\r\n"
+    )
+    with socket.create_connection(("127.0.0.1", app.port()), timeout=5) as conn:
+        conn.sendall(request)
+        status_line = conn.recv(64).split(b"\r\n", 1)[0]
+    assert status_line == b"HTTP/1.1 401 Unauthorized", app.log()
+    app.stop()

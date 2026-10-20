@@ -1,4 +1,6 @@
+import hmac
 import json
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -10,7 +12,7 @@ from aihub_web.chat import ChatRequest
 from aihub_web.config import Config
 from aihub_web.db import Store
 from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
-from aihub_web.security import CSP
+from aihub_web.security import CSP, SecurityMiddleware
 from aihub_web.server import create_app, ndjson
 from helpers import HANG, KEYS, TODAY, Clock, FakeProvider, handler_for, make_service
 from starlette.testclient import TestClient
@@ -19,6 +21,8 @@ BASE = "http://127.0.0.1:8787"
 FREE = "openrouter/google/gemma-4-31b-it:free"
 LOCAL = "ollama/qwen3:8b"
 HAIKU = "anthropic/claude-haiku-5-5"
+# Shaped like the desktop shell's token: 32 random bytes as 43 base64url characters.
+TOKEN = secrets.token_urlsafe(32)
 
 
 def build(tmp_path: Path, environ=KEYS, **config):
@@ -326,6 +330,155 @@ class TestGuards:
     )
     def test_static_files_cannot_escape(self, api: TestClient, path: str) -> None:
         assert api.get(path).status_code in (404, 400)
+
+
+def cookie(value: str | bytes) -> dict[str, bytes]:
+    """A Cookie header carrying `value` as the launch token; bytes lets a test send what isn't text."""
+    raw = value.encode() if isinstance(value, str) else value
+    return {"cookie": b"aihub_t=" + raw}
+
+
+@pytest.fixture
+def guarded(tmp_path: Path):
+    """The app as the desktop shell starts it: a per-launch token guards /api."""
+    app, fakes = build(tmp_path, environ={**KEYS, "AIHUB_LAUNCH_TOKEN": TOKEN})
+    with TestClient(app, base_url=BASE) as client:
+        client.fakes = fakes
+        yield client
+
+
+class TestLaunchToken:
+    @pytest.mark.parametrize("path", ["/api/bootstrap", "/api/health"])
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param(cookie("wrong"), id="wrong"),
+            pytest.param(cookie(""), id="empty"),
+            pytest.param(cookie(TOKEN + "x"), id="too long"),
+            pytest.param(cookie(TOKEN[:-1]), id="too short"),
+            pytest.param({"cookie": f"other={TOKEN}"}, id="under another name"),
+            pytest.param(cookie("t\u00f6ken".encode()), id="non-ascii utf-8"),
+            pytest.param(cookie(b"\xff\xfe"), id="not utf-8"),
+        ],
+    )
+    def test_a_request_without_the_token_is_refused(
+        self, guarded: TestClient, path: str, headers: dict
+    ) -> None:
+        response = guarded.get(path, headers=headers)
+        assert response.status_code == 401
+        assert response.json() == {
+            "error": {"code": "not_authorised", "message": "Not authorised."}
+        }
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["content-security-policy"] == CSP
+
+    @pytest.mark.parametrize("path", ["/api/bootstrap", "/api/health"])
+    def test_the_right_cookie_gets_through(
+        self, guarded: TestClient, path: str
+    ) -> None:
+        assert guarded.get(path, headers=cookie(TOKEN)).status_code == 200
+
+    def test_the_token_may_sit_among_other_cookies(self, guarded: TestClient) -> None:
+        headers = {"cookie": f"theme=dark; aihub_t={TOKEN}; sidebar=open"}
+        assert guarded.get("/api/health", headers=headers).status_code == 200
+
+    def test_every_api_path_and_method_needs_it(self, guarded: TestClient) -> None:
+        for method, path in [
+            ("POST", "/api/chat"),
+            ("GET", "/api/chats"),
+            ("PUT", "/api/settings"),
+            ("DELETE", "/api/chats"),
+            ("GET", "/api/nope"),
+            ("GET", "/api/"),
+        ]:
+            assert guarded.request(method, path).status_code == 401, (method, path)
+        assert guarded.get("/api/nope", headers=cookie(TOKEN)).status_code == 404
+        assert guarded.get("/api/chats", headers=cookie(TOKEN)).json() == {"chats": []}
+
+    def test_the_token_is_compared_with_compare_digest_on_bytes(
+        self, guarded: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A test can't observe timing, so pin the call that makes the comparison constant-time."""
+        seen = []
+        real = hmac.compare_digest
+
+        def spy(a, b):
+            seen.append((a, b))
+            return real(a, b)
+
+        monkeypatch.setattr(hmac, "compare_digest", spy)
+        guarded.get("/api/health", headers=cookie(TOKEN))
+        assert seen == [(TOKEN.encode(), TOKEN.encode())]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/",
+            "/index.html",
+            "/js/main.js",
+            "/css/app.css",
+            "/manifest.webmanifest",
+            "/icon.svg",
+        ],
+    )
+    def test_the_page_and_its_files_stay_public(
+        self, guarded: TestClient, path: str
+    ) -> None:
+        assert guarded.get(path).status_code == 200
+
+    def test_the_host_check_still_comes_first(self, guarded: TestClient) -> None:
+        foreign = {"host": "evil.example:8787"}
+        without = guarded.get("/api/bootstrap", headers=foreign)
+        assert without.status_code == 400 and "allowed_hosts" in without.text
+        with_cookie = guarded.get(
+            "/api/bootstrap", headers={**foreign, **cookie(TOKEN)}
+        )
+        assert with_cookie.status_code == 400
+
+    def test_the_token_is_checked_before_the_cross_site_rules(
+        self, guarded: TestClient
+    ) -> None:
+        cross_site = {"origin": "https://evil.example", "sec-fetch-site": "cross-site"}
+        body = {"text": "hi"}
+        assert (
+            guarded.post("/api/chat", json=body, headers=cross_site).status_code == 401
+        )
+        both = {**cross_site, **cookie(TOKEN)}
+        assert guarded.post("/api/chat", json=body, headers=both).status_code == 403
+        assert guarded.get("/api/chats", headers=cookie(TOKEN)).json() == {"chats": []}
+
+    def test_a_same_origin_write_with_the_cookie_passes(
+        self, guarded: TestClient
+    ) -> None:
+        headers = {"origin": BASE, "sec-fetch-site": "same-origin", **cookie(TOKEN)}
+        response = guarded.post(
+            "/api/chat", json={"text": "hi", "model": FREE}, headers=headers
+        )
+        assert response.status_code == 200
+
+    @pytest.mark.parametrize("token", [None, "", "   "])
+    def test_without_a_token_nothing_is_checked(
+        self, tmp_path: Path, token: str | None
+    ) -> None:
+        environ = KEYS if token is None else {**KEYS, "AIHUB_LAUNCH_TOKEN": token}
+        app, _ = build(tmp_path, environ=environ)
+        with TestClient(app, base_url=BASE) as client:
+            assert client.get("/api/health").status_code == 200
+            stray = client.get("/api/health", headers=cookie("anything"))
+            assert stray.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_other_scopes_pass_through_untouched(self) -> None:
+        seen = []
+
+        async def inner(scope, receive, send) -> None:
+            seen.append(scope["type"])
+
+        guard = SecurityMiddleware(inner, ("127.0.0.1",), token=b"secret")
+        for kind in ("websocket", "lifespan"):
+            await guard({"type": kind, "path": "/api/x", "headers": []}, None, None)
+        assert seen == ["websocket", "lifespan"]
 
 
 def test_expired_chats_are_deleted_when_the_app_starts(tmp_path: Path) -> None:
