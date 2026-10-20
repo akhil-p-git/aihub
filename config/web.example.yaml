@@ -1,0 +1,64 @@
+# Settings for the aihub web chat. Copy to ~/.config/aihub/web.yaml (scripts/install.sh does this).
+# No secrets here: each provider names the environment variable holding its key, which the systemd unit
+# loads from ~/.config/aihub/aihub.env. Every value below is the built-in default.
+
+host: 127.0.0.1                         # loopback only; reach it from other devices with `tailscale serve`
+port: 8787
+allowed_hosts: [127.0.0.1, localhost]   # add your tailnet name (machine.tailnet.ts.net) once you serve it
+retention_days: 30                      # a chat is deleted this many days after its last message
+
+# New chats start on the first available model in this list. Free cloud or local models only,
+# so a forgotten chat can never spend the API credits.
+default_models:
+  - openrouter/google/gemma-4-31b-it:free
+  - ollama/qwen3:8b
+
+ollama:
+  url: http://127.0.0.1:11434
+  num_ctx: 8192        # context sent with every request; changing it makes Ollama reload the model
+  num_predict: 8192    # longest reply, so a looping model cannot run forever
+  keep_alive: 10m
+
+openrouter:
+  url: https://openrouter.ai/api/v1
+  key_env: AIHUB_OPENROUTER_KEY
+  max_tokens: 8192
+  # Paid OpenRouter models listed in the picker. Free (:free) models are discovered automatically.
+  paid_models:
+    - deepseek/deepseek-v4.1-flash-1017
+    - deepseek/deepseek-v4-pro-0813
+  # Routing for paid models: skip hosts that store or train on prompts, and China-headquartered hosts.
+  # Best effort (OpenRouter's data-policy tags are self-reported). Free models cannot meet this policy.
+  paid_provider:
+    data_collection: deny
+    ignore: [deepseek, baidu, streamlake, siliconflow, alibaba]
+
+anthropic:
+  url: https://api.anthropic.com
+  key_env: AIHUB_ANTHROPIC_KEY
+  max_tokens: 16000         # includes thinking tokens
+  max_tokens_deep: 64000    # used at xhigh and max effort
+  # Prices are USD per million tokens (https://platform.claude.com/docs/en/about-claude/pricing), used
+  # for the cost shown under each reply. thinking_off is how "Off" is sent for that model: Haiku 5.5
+  # accepts `disabled`, Sonnet 5.5 accepts `between_tools`, and Opus 5.5 and Fable 5.1 cannot turn
+  # thinking off (omit the field). Add claude-fable-5-1 ($10 / $50) here if you want it in the picker.
+  models:
+    - id: claude-haiku-5-5
+      name: Haiku 5.5
+      input_per_mtok: "0.10"
+      output_per_mtok: "0.50"
+      thinking_off: disabled
+    - id: claude-sonnet-5-5
+      name: Sonnet 5.5
+      input_per_mtok: "2"
+      output_per_mtok: "10"
+      thinking_off: between_tools
+    - id: claude-opus-5-5
+      name: Opus 5.5
+      input_per_mtok: "4"
+      output_per_mtok: "20"
+
+limits:
+  max_message_chars: 100000
+  cloud_context_tokens: 60000   # earlier messages are left out beyond this, to bound the cost of a turn
+  max_concurrent: 3             # replies streaming at once

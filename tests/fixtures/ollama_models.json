@@ -1,0 +1,185 @@
+{
+ "tags": [
+  {
+   "name": "lfm2.5:8b",
+   "digest": "9cf756159fc2f3b9128c6a3f544ec90c5e9b8afdbb4179a57b8aea9de589cfb2",
+   "size": 5156075525
+  },
+  {
+   "name": "gemma4:e4b",
+   "digest": "dc35e8d9c6061baa6f0fa870975ab6932e2542b579b13ea0f199fa4bb7300c9c",
+   "size": 6583656505
+  },
+  {
+   "name": "qwen3-embedding:0.6b",
+   "digest": "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d",
+   "size": 639150858
+  },
+  {
+   "name": "bge-m3:latest",
+   "digest": "7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab",
+   "size": 1157672605
+  },
+  {
+   "name": "gemma3:4b",
+   "digest": "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a",
+   "size": 3338801804
+  },
+  {
+   "name": "deepseek-r1:8b",
+   "digest": "6995872bfe4c521a67b32da386cd21d5c6e819b6e0d62f79f64ec83be99f5763",
+   "size": 5225376047
+  },
+  {
+   "name": "qwen3:4b",
+   "digest": "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7",
+   "size": 2497293931
+  },
+  {
+   "name": "qwen3:8b",
+   "digest": "500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+   "size": 5225388164
+  },
+  {
+   "name": "qwen2.5:3b",
+   "digest": "357c53fb659c5076de1d65ccb0b397446227b71a42be9d1603d46168015c9e4b",
+   "size": 1929912432
+  },
+  {
+   "name": "llama3.2:1b",
+   "digest": "baf6a787fdffd633537aa2eb51cfd54cb93ff08e28040095462bb63daf552878",
+   "size": 1321098329
+  }
+ ],
+ "show": {
+  "lfm2.5:8b": {
+   "capabilities": [
+    "completion",
+    "tools",
+    "thinking"
+   ],
+   "model_info": {
+    "lfm2moe.context_length": 128000
+   },
+   "thinking": {
+    "values": [
+     false
+    ],
+    "default": false
+   }
+  },
+  "gemma4:e4b": {
+   "capabilities": [
+    "completion",
+    "vision",
+    "audio",
+    "tools",
+    "thinking"
+   ],
+   "model_info": {
+    "gemma4.context_length": 131072
+   },
+   "thinking": {
+    "values": [
+     false,
+     true
+    ],
+    "default": true
+   }
+  },
+  "qwen3-embedding:0.6b": {
+   "capabilities": [
+    "tools",
+    "thinking",
+    "embedding"
+   ],
+   "model_info": {
+    "qwen3.context_length": 32768
+   }
+  },
+  "bge-m3:latest": {
+   "capabilities": [
+    "embedding"
+   ],
+   "model_info": {
+    "bert.context_length": 8192
+   }
+  },
+  "gemma3:4b": {
+   "capabilities": [
+    "completion",
+    "vision"
+   ],
+   "model_info": {
+    "gemma3.context_length": 131072
+   }
+  },
+  "deepseek-r1:8b": {
+   "capabilities": [
+    "tools",
+    "thinking",
+    "completion"
+   ],
+   "model_info": {
+    "qwen3.context_length": 131072
+   }
+  },
+  "qwen3:4b": {
+   "capabilities": [
+    "completion",
+    "tools",
+    "thinking"
+   ],
+   "model_info": {
+    "qwen3.context_length": 262144
+   },
+   "thinking": {
+    "values": [
+     true
+    ],
+    "default": true
+   }
+  },
+  "qwen3:8b": {
+   "capabilities": [
+    "completion",
+    "tools",
+    "thinking"
+   ],
+   "model_info": {
+    "qwen3.context_length": 40960
+   },
+   "thinking": {
+    "values": [
+     false,
+     true
+    ],
+    "default": true
+   }
+  },
+  "qwen2.5:3b": {
+   "capabilities": [
+    "completion",
+    "tools"
+   ],
+   "model_info": {
+    "qwen2.context_length": 32768
+   }
+  },
+  "llama3.2:1b": {
+   "capabilities": [
+    "completion",
+    "tools"
+   ],
+   "model_info": {
+    "llama.context_length": 131072
+   },
+   "thinking": {
+    "values": [
+     false
+    ],
+    "default": false
+   }
+  }
+ }
+}

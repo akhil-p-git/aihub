@@ -1,0 +1,412 @@
+import json
+import threading
+import time
+from pathlib import Path
+
+import httpx2
+import pytest
+import uvicorn
+from aihub_web.chat import ChatRequest
+from aihub_web.config import Config
+from aihub_web.db import Store
+from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
+from aihub_web.security import CSP
+from aihub_web.server import create_app, ndjson
+from helpers import HANG, KEYS, TODAY, Clock, FakeProvider, handler_for, make_service
+from starlette.testclient import TestClient
+
+BASE = "http://127.0.0.1:8787"
+FREE = "openrouter/google/gemma-4-31b-it:free"
+LOCAL = "ollama/qwen3:8b"
+HAIKU = "anthropic/claude-haiku-5-5"
+
+
+def build(tmp_path: Path, environ=KEYS, **config):
+    fakes = {
+        "openrouter": FakeProvider(Text("Hello"), Finish("stop")),
+        "ollama": FakeProvider(Text("Hi"), Finish("stop")),
+        "anthropic": FakeProvider(Text("Hey"), Usage(1000, 500), Finish("end_turn")),
+    }
+    app = create_app(
+        Config(state_dir=tmp_path, **config),
+        environ=environ,
+        transport=httpx2.MockTransport(handler_for()),
+        providers=fakes,
+        today=lambda: TODAY,
+    )
+    return app, fakes
+
+
+@pytest.fixture
+def api(tmp_path: Path):
+    app, fakes = build(tmp_path)
+    with TestClient(app, base_url=BASE) as client:
+        client.fakes = fakes
+        yield client
+
+
+def reply(client: TestClient, **body) -> list[dict]:
+    with client.stream("POST", "/api/chat", json=body) as response:
+        assert response.status_code == 200, response.read()
+        return [json.loads(line) for line in response.iter_lines() if line]
+
+
+class TestBootstrap:
+    def test_everything_the_ui_needs_in_one_call(self, api: TestClient) -> None:
+        data = api.get("/api/bootstrap").json()
+        assert data["default_model"] == FREE
+        assert data["retention_days"] == 30 and data["chats"] == []
+        assert data["settings"] == {"instructions": ""}
+        tiers = {m["tier"] for m in data["models"]}
+        assert tiers == {"free", "local", "paid"}
+        assert data["providers"]["ollama"]["ok"] is True
+
+    def test_the_default_is_free_even_when_claude_is_listed_first_alphabetically(
+        self, tmp_path: Path
+    ) -> None:
+        app, _ = build(tmp_path, environ={"AIHUB_ANTHROPIC_KEY": "k"})
+        with TestClient(app, base_url=BASE) as client:
+            assert client.get("/api/bootstrap").json()["default_model"] == LOCAL
+
+    def test_models_endpoint(self, api: TestClient) -> None:
+        data = api.get("/api/models?refresh=1").json()
+        ids = {m["id"] for m in data["models"]}
+        assert {FREE, LOCAL, HAIKU} <= ids
+
+    def test_health(self, api: TestClient) -> None:
+        assert api.get("/api/health").json() == {"ok": True}
+
+
+class TestChatFlow:
+    def test_stream_then_history(self, api: TestClient) -> None:
+        api.fakes["openrouter"].script = [
+            Thinking("hm"),
+            Text("Hel"),
+            Text("lo"),
+            Finish("stop"),
+        ]
+        with api.stream(
+            "POST", "/api/chat", json={"text": "Hi there", "model": FREE}
+        ) as response:
+            assert response.headers["content-type"].startswith("application/x-ndjson")
+            assert response.headers["cache-control"] == "no-store"
+            events = [json.loads(line) for line in response.iter_lines() if line]
+        assert [e["t"] for e in events] == ["chat", "think", "text", "text", "done"]
+
+        chat_id = events[0]["chat"]["id"]
+        listed = api.get("/api/chats").json()["chats"]
+        assert [c["id"] for c in listed] == [chat_id]
+        detail = api.get(f"/api/chats/{chat_id}").json()
+        assert [(m["role"], m["content"]) for m in detail["messages"]] == [
+            ("user", "Hi there"),
+            ("assistant", "Hello"),
+        ]
+        assert detail["messages"][1]["thinking"] == "hm"
+
+    def test_paid_replies_carry_their_cost(self, api: TestClient) -> None:
+        events = reply(api, text="q", model=HAIKU, effort="off")
+        assert events[-1]["message"]["usage"]["cost"] == "0.00035"
+        assert api.fakes["anthropic"].requests[-1].effort == "off"
+
+    def test_a_provider_error_arrives_as_an_event_with_the_partial_reply(
+        self, api: TestClient
+    ) -> None:
+        api.fakes["openrouter"].script = [
+            Text("half"),
+            ProviderError("Free limit reached", "rate_limit"),
+        ]
+        events = reply(api, text="q", model=FREE)
+        assert events[-1]["t"] == "error"
+        assert events[-1]["message"]["error"]["code"] == "rate_limit"
+        assert events[-1]["message"]["content"] == "half"
+
+    def test_regenerate(self, api: TestClient) -> None:
+        chat_id = reply(api, text="q", model=FREE)[0]["chat"]["id"]
+        api.fakes["openrouter"].script = [Text("Again"), Finish("stop")]
+        reply(api, chat_id=chat_id, regenerate=True)
+        messages = api.get(f"/api/chats/{chat_id}").json()["messages"]
+        assert [m["content"] for m in messages] == ["q", "Again"]
+
+    def test_standing_instructions_apply_to_the_next_reply(
+        self, api: TestClient
+    ) -> None:
+        assert api.put(
+            "/api/settings", json={"instructions": "  Be terse.  "}
+        ).json() == {"instructions": "Be terse."}
+        reply(api, text="q", model=FREE)
+        assert "Be terse." in api.fakes["openrouter"].requests[-1].system
+
+    def test_search(self, api: TestClient) -> None:
+        reply(api, text="remember the zebra crossing", model=FREE)
+        reply(api, text="something else entirely", model=FREE)
+        found = api.get("/api/chats", params={"q": "zebra"}).json()["chats"]
+        assert len(found) == 1 and "zebra" in found[0]["snippet"]
+
+    def test_rename_and_delete(self, api: TestClient) -> None:
+        chat_id = reply(api, text="q", model=FREE)[0]["chat"]["id"]
+        renamed = api.patch(
+            f"/api/chats/{chat_id}", json={"title": "  A   better\ttitle "}
+        )
+        assert renamed.json()["title"] == "A better title"
+        assert api.delete(f"/api/chats/{chat_id}").status_code == 204
+        assert api.get(f"/api/chats/{chat_id}").status_code == 404
+        assert api.delete(f"/api/chats/{chat_id}").status_code == 404
+
+    def test_deleting_everything_needs_the_confirmation_word(
+        self, api: TestClient
+    ) -> None:
+        reply(api, text="a", model=FREE)
+        reply(api, text="b", model=FREE)
+        assert api.request("DELETE", "/api/chats", json={}).status_code == 422
+        assert (
+            api.request("DELETE", "/api/chats", json={"confirm": "yes"}).status_code
+            == 422
+        )
+        assert len(api.get("/api/chats").json()["chats"]) == 2
+        assert api.request(
+            "DELETE", "/api/chats", json={"confirm": "delete-all"}
+        ).json() == {"deleted": 2}
+        assert api.get("/api/chats").json()["chats"] == []
+
+
+class TestRefusals:
+    @pytest.mark.parametrize(
+        ("body", "status", "code"),
+        [
+            ({"text": ""}, 422, "invalid"),
+            ({"text": "hi", "bogus": 1}, 422, "invalid"),
+            ({"text": "hi", "model": "ollama/nope:1b"}, 400, "unknown_model"),
+            ({"text": "hi", "chat_id": "0123456789abcdef"}, 404, "no_chat"),
+            ({"text": "hi", "chat_id": "../../etc/passwd"}, 422, "invalid"),
+            ({"regenerate": True}, 422, "invalid"),
+        ],
+    )
+    def test_bad_requests_get_a_json_error_before_any_streaming(
+        self, api: TestClient, body: dict, status: int, code: str
+    ) -> None:
+        response = api.post("/api/chat", json=body)
+        assert response.status_code == status
+        assert response.json()["error"]["code"] == code
+        assert api.get("/api/chats").json()["chats"] == []
+
+    def test_malformed_json(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat", content=b"{nope", headers={"content-type": "application/json"}
+        )
+        assert (response.status_code, response.json()["error"]["code"]) == (
+            400,
+            "bad_json",
+        )
+
+    def test_model_without_a_key(self, tmp_path: Path) -> None:
+        app, _ = build(tmp_path, environ={})
+        with TestClient(app, base_url=BASE) as client:
+            response = client.post("/api/chat", json={"text": "hi", "model": HAIKU})
+            assert response.status_code == 409
+            assert "AIHUB_ANTHROPIC_KEY" in response.json()["error"]["message"]
+
+    def test_unknown_endpoints_and_chat_ids(self, api: TestClient) -> None:
+        assert api.get("/api/nope").json()["error"]["code"] == "not_found"
+        assert api.get("/api/chats/not-an-id").status_code == 404
+
+    def test_settings_are_bounded(self, api: TestClient) -> None:
+        assert (
+            api.put("/api/settings", json={"instructions": "x" * 4001}).status_code
+            == 422
+        )
+
+
+class TestGuards:
+    def test_foreign_hosts_are_refused_to_stop_dns_rebinding(
+        self, api: TestClient
+    ) -> None:
+        refused = api.get("/api/bootstrap", headers={"host": "evil.example:8787"})
+        assert refused.status_code == 400 and "allowed_hosts" in refused.text
+        assert (
+            api.get("/api/health", headers={"host": "localhost:8787"}).status_code
+            == 200
+        )
+
+    @pytest.mark.parametrize(
+        "origin", ["https://evil.example", "null", "http://127.0.0.1.evil.example"]
+    )
+    def test_cross_site_writes_are_refused(self, api: TestClient, origin: str) -> None:
+        response = api.post(
+            "/api/chat", json={"text": "hi"}, headers={"origin": origin}
+        )
+        assert response.status_code == 403
+        assert api.get("/api/chats").json()["chats"] == []
+
+    def test_same_origin_writes_pass(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat",
+            json={"text": "hi", "model": FREE},
+            headers={"origin": BASE, "sec-fetch-site": "same-origin"},
+        )
+        assert response.status_code == 200
+
+    def test_fetch_metadata_cross_site_is_refused(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat", json={"text": "hi"}, headers={"sec-fetch-site": "cross-site"}
+        )
+        assert response.status_code == 403
+
+    def test_a_write_must_be_json(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat", content='{"text":"hi"}', headers={"content-type": "text/plain"}
+        )
+        assert response.status_code == 415
+
+    def test_oversized_bodies_are_cut_off(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413
+
+    def test_a_tailnet_name_works_once_it_is_allowed(self, tmp_path: Path) -> None:
+        app, _ = build(tmp_path, allowed_hosts=("127.0.0.1", "box.tail1234.ts.net"))
+        with TestClient(app, base_url="https://box.tail1234.ts.net") as client:
+            assert client.get("/api/health").status_code == 200
+            posted = client.post(
+                "/api/chat",
+                json={"text": "hi"},
+                headers={"origin": "https://box.tail1234.ts.net"},
+            )
+            assert posted.status_code == 200
+
+    def test_headers_on_api_and_pages(self, api: TestClient) -> None:
+        for path in ("/api/health", "/"):
+            headers = api.get(path).headers
+            assert headers["content-security-policy"] == CSP
+            assert headers["x-content-type-options"] == "nosniff"
+            assert headers["referrer-policy"] == "no-referrer"
+            assert "access-control-allow-origin" not in headers
+        assert api.get("/api/health").headers["cache-control"] == "no-store"
+        assert api.get("/").headers["cache-control"] == "no-cache"
+
+    def test_the_policy_blocks_inline_script_and_remote_content(self) -> None:
+        assert (
+            "script-src 'self'" in CSP
+            and "unsafe-inline" not in CSP
+            and "unsafe-eval" not in CSP
+        )
+        assert "img-src 'self'" in CSP and "connect-src 'self'" in CSP
+        assert "frame-ancestors 'none'" in CSP and "default-src 'none'" in CSP
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/..%2f..%2f..%2fetc/passwd",
+            "/%2e%2e/%2e%2e/etc/passwd",
+            "/lib/../../../etc/passwd",
+        ],
+    )
+    def test_static_files_cannot_escape(self, api: TestClient, path: str) -> None:
+        assert api.get(path).status_code in (404, 400)
+
+
+def test_expired_chats_are_deleted_when_the_app_starts(tmp_path: Path) -> None:
+    clock = Clock(time.time() - 45 * 86_400)
+    seed = Store(tmp_path / "chats.db", clock)
+    old = seed.create_chat("ancient", FREE, None)
+    seed.add_message(old.id, "user", "from 45 days ago")
+    clock.advance(days=44)
+    recent = seed.create_chat("recent", FREE, None)
+    seed.add_message(recent.id, "user", "from yesterday")
+    seed.close()
+
+    app, _ = build(tmp_path)
+    with TestClient(app, base_url=BASE) as client:
+        ids = [c["id"] for c in client.get("/api/bootstrap").json()["chats"]]
+    assert ids == [recent.id]
+
+
+@pytest.fixture
+def live(tmp_path: Path):
+    """The real app on a real socket, because a browser dropping the connection can't be simulated in-process."""
+    app, fakes = build(tmp_path)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app, host="127.0.0.1", port=0, log_level="warning", lifespan="on"
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started, "server did not start"
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield f"http://127.0.0.1:{port}", fakes
+    server.should_exit = True
+    thread.join(timeout=10)
+
+
+def wait_for(check, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if result := check():
+            return result
+        time.sleep(0.02)
+    raise AssertionError("condition never became true")
+
+
+class TestLiveServer:
+    def test_dropping_the_connection_keeps_the_partial_reply(self, live) -> None:
+        base, fakes = live
+        fakes["openrouter"].script = [Text("par"), Text("tial"), HANG]
+        with httpx2.Client(base_url=base, timeout=10) as client:
+            with client.stream(
+                "POST", "/api/chat", json={"text": "q", "model": FREE}
+            ) as response:
+                lines = response.iter_lines()
+                chat_id = json.loads(next(lines))["chat"]["id"]
+                seen = ""
+                for line in lines:
+                    event = json.loads(line)
+                    seen += event.get("d", "") if event["t"] == "text" else ""
+                    if seen == "partial":
+                        break  # leaving the block closes the connection mid-reply
+
+            def stored():
+                messages = client.get(f"/api/chats/{chat_id}").json()["messages"]
+                return messages if len(messages) == 2 else None
+
+            reply_message = wait_for(stored)[1]
+            assert (reply_message["status"], reply_message["content"]) == (
+                "stopped",
+                "partial",
+            )
+
+            fakes["openrouter"].script = [Text("fine")]
+            again = client.post("/api/chat", json={"chat_id": chat_id, "text": "next"})
+            assert again.status_code == 200 and '"t":"done"' in again.text
+
+    def test_text_arrives_while_the_model_is_still_working(self, live) -> None:
+        base, fakes = live
+        fakes["openrouter"].script = [Text("first"), HANG]
+        with (
+            httpx2.Client(base_url=base, timeout=10) as client,
+            client.stream(
+                "POST", "/api/chat", json={"text": "q", "model": FREE}
+            ) as response,
+        ):
+            lines = response.iter_lines()
+            next(lines)
+            assert json.loads(next(lines)) == {"t": "text", "d": "first"}
+
+
+@pytest.mark.anyio
+async def test_ending_the_body_closes_the_stream_that_feeds_it(tmp_path: Path) -> None:
+    """Without an explicit close, the reply would only be stored whenever the garbage collector got to it."""
+    service, store, providers = await make_service(tmp_path)
+    providers["openrouter"].script = [Text("par"), HANG]
+    turn = service.prepare(ChatRequest(text="q", model=FREE))
+    body = ndjson(service.stream(turn))
+    await anext(body)  # the chat line
+    assert b'"par"' in await anext(body)
+    await body.aclose()
+    reply_message = store.messages(turn.chat.id)[-1]
+    assert (reply_message.status, reply_message.content) == ("stopped", "par")

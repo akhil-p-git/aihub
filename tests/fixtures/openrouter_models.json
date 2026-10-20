@@ -1,0 +1,236 @@
+[
+ {
+  "id": "minimax/minimax-m3.1-flash:free",
+  "name": "MiniMax: MiniMax M3.1 Flash (free)",
+  "context_length": 1000000,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text",
+    "image",
+    "video"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": true,
+   "supported_efforts": [
+    "max",
+    "xhigh",
+    "high",
+    "medium",
+    "low"
+   ],
+   "default_effort": "max"
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "deepseek/deepseek-v4.1-flash-1017",
+  "name": "DeepSeek: DeepSeek V4.1 Flash 1017",
+  "context_length": 1048576,
+  "pricing": {
+   "prompt": "0.00000015",
+   "completion": "0.0000006"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": true,
+   "supported_efforts": [
+    "max",
+    "high",
+    "low",
+    "none"
+   ],
+   "default_effort": "high"
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "deepseek/deepseek-v4-pro-0813",
+  "name": "DeepSeek: DeepSeek V4 Pro 0813",
+  "context_length": 1048576,
+  "pricing": {
+   "prompt": "0.00000066",
+   "completion": "0.00000198"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "supported_efforts": [
+    "max",
+    "high",
+    "low",
+    "none"
+   ],
+   "default_effort": "high"
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "liquid/lfm-2.5-2.6b:free",
+  "name": "LiquidAI: LFM2.5-2.6B (free)",
+  "context_length": 65536,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": true
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "poolside/laguna-xs-2.1:free",
+  "name": "Poolside: Laguna XS 2.1 (free)",
+  "context_length": 262144,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": true
+  },
+  "expiration_date": "2026-10-31"
+ },
+ {
+  "id": "nvidia/nemotron-3.5-content-safety:free",
+  "name": "NVIDIA: Nemotron 3.5 Content Safety (free)",
+  "context_length": 128000,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": true
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+  "name": "NVIDIA: Nemotron 3 Nano Omni (free)",
+  "context_length": 256000,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text",
+    "audio",
+    "image",
+    "video"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": true,
+   "supports_max_tokens": true
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "google/gemma-4-31b-it:free",
+  "name": "Google: Gemma 4 31B (free)",
+  "context_length": 262144,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "image",
+    "text",
+    "video"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": false
+  },
+  "expiration_date": null
+ },
+ {
+  "id": "nvidia/nemotron-3-super-120b-a12b:free",
+  "name": "NVIDIA: Nemotron 3 Super (free)",
+  "context_length": 262144,
+  "pricing": {
+   "prompt": "0",
+   "completion": "0"
+  },
+  "architecture": {
+   "input_modalities": [
+    "text"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "reasoning": {
+   "mandatory": false,
+   "default_enabled": true,
+   "supports_max_tokens": true,
+   "supported_efforts": [
+    "medium",
+    "low",
+    "none"
+   ],
+   "default_effort": "medium"
+  },
+  "expiration_date": null
+ }
+]

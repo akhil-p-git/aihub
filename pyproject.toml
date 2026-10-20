@@ -1,0 +1,23 @@
+[project]
+name = "aihub"
+version = "0.1.0"
+description = "Self-hosted multi-model chat for one person: web backend with local-first storage"
+requires-python = ">=3.12"
+dependencies = [
+    "starlette==1.7.0",
+    "uvicorn==0.54.0",
+    "httpx2==2.13.1",
+    "pydantic==2.13.5",
+    "pyyaml==6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]
+
+[tool.uv]
+# The app is run from source (PYTHONPATH=app), not installed as a package.
+package = false
+# Resolve only releases that were at least two weeks old on 2026-10-20.
+exclude-newer = "2026-10-06T00:00:00Z"
