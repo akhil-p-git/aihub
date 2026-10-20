@@ -1,9 +1,13 @@
+import contextlib
 import hmac
 import json
 import secrets
+import socket
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx2
 import pytest
@@ -16,6 +20,7 @@ from aihub_web.security import CSP, SecurityMiddleware
 from aihub_web.server import create_app, ndjson
 from helpers import HANG, KEYS, TODAY, Clock, FakeProvider, handler_for, make_service
 from starlette.testclient import TestClient
+from test_web_shutdown import free_port
 
 BASE = "http://127.0.0.1:8787"
 FREE = "openrouter/google/gemma-4-31b-it:free"
@@ -479,6 +484,109 @@ class TestLaunchToken:
         for kind in ("websocket", "lifespan"):
             await guard({"type": kind, "path": "/api/x", "headers": []}, None, None)
         assert seen == ["websocket", "lifespan"]
+
+
+@contextlib.contextmanager
+def recording_server(bind: str = "127.0.0.1"):
+    """A loopback server that answers the model lists and records what each request asked for.
+
+    Used as an origin it sees paths ("/api/tags"); used as a forward proxy it sees absolute URLs.
+    """
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.path)
+            listing = (
+                {"models": []}
+                if urlsplit(self.path).path.endswith("/api/tags")
+                else {"data": []}
+            )
+            body = json.dumps(listing).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    class Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+
+    server = Server((bind, 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def set_system_proxy(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    for name in ("http_proxy", "HTTP_PROXY"):
+        monkeypatch.setenv(name, url)
+    # Anything else in the developer's shell would change which hosts the proxy is used for.
+    for name in (
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def provider_status(tmp_path: Path, *, ollama: str, openrouter: str) -> dict:
+    """What the catalog reports after refreshing from these URLs through the app's real HTTP client."""
+    cfg = Config(
+        state_dir=tmp_path, ollama={"url": ollama}, openrouter={"url": openrouter}
+    )
+    with TestClient(create_app(cfg, environ=KEYS), base_url=BASE) as client:
+        return client.get("/api/models?refresh=1").json()["providers"]
+
+
+class TestProviderProxy:
+    @pytest.mark.parametrize(
+        ("bind", "host"),
+        [
+            ("127.0.0.1", "127.0.0.1"),
+            ("127.0.0.1", "localhost"),
+            ("::1", "[::1]"),
+        ],
+    )
+    def test_loopback_calls_ignore_a_system_proxy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bind: str, host: str
+    ) -> None:
+        set_system_proxy(
+            monkeypatch, f"http://127.0.0.1:{free_port()}"
+        )  # nothing listens
+        with recording_server(bind) as (port, seen):
+            origin = f"http://{host}:{port}"
+            status = provider_status(
+                tmp_path, ollama=origin, openrouter=f"{origin}/api/v1"
+            )
+        assert status["ollama"]["ok"] and status["openrouter"]["ok"], status
+        assert "/api/tags" in seen and "/api/v1/models" in seen
+
+    def test_other_hosts_still_go_through_the_proxy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with recording_server() as (proxy_port, via_proxy):
+            set_system_proxy(monkeypatch, f"http://127.0.0.1:{proxy_port}")
+            with recording_server() as (origin_port, direct):
+                status = provider_status(
+                    tmp_path,
+                    ollama=f"http://127.0.0.1:{origin_port}",
+                    openrouter="http://openrouter.example.test/api/v1",
+                )
+        assert status["ollama"]["ok"] and status["openrouter"]["ok"], status
+        assert set(direct) == {"/api/tags"}
+        assert set(via_proxy) == {"http://openrouter.example.test/api/v1/models"}
 
 
 def test_expired_chats_are_deleted_when_the_app_starts(tmp_path: Path) -> None:

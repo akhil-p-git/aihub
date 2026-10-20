@@ -40,6 +40,13 @@ CHAT_ID = re.compile(r"[0-9a-f]{16}")
 BODY_LIMIT = 1024 * 1024
 MAINTENANCE_INTERVAL = 60.0
 PURGE_INTERVAL = 3600.0
+# A system or environment proxy (httpx2 also reads the macOS one) must never capture calls to a local
+# Ollama. A mount mapped to None sends matching URLs straight out; every other host keeps its proxy.
+LOOPBACK_DIRECT = {
+    "all://127.0.0.1": None,
+    "all://localhost": None,
+    "all://[::1]": None,
+}
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 mimetypes.add_type("font/woff2", ".woff2")
@@ -258,7 +265,7 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        client = httpx2.AsyncClient(transport=transport)
+        client = httpx2.AsyncClient(transport=transport, mounts=LOOPBACK_DIRECT)
         store = Store(cfg.state_dir / "chats.db")
         catalog = Catalog(cfg, client, environ=environ, today=today)
         service = ChatService(
