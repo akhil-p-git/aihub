@@ -21,6 +21,9 @@ from .base import (
 API_VERSION = "2023-06-01"
 TIMEOUT = httpx2.Timeout(connect=5.0, read=120.0, write=30.0, pool=10.0)
 
+# stop_reason values that mean the reply was cut short; the UI knows them as finish "length".
+CUT_OFF = frozenset({"max_tokens", "model_context_window_exceeded"})
+
 IN_STREAM_ERRORS = {
     "authentication_error": 401,
     "permission_error": 403,
@@ -78,7 +81,7 @@ class StreamParser:
         elif kind == "message_delta":
             self._merge(data.get("usage"))
             reason = (data.get("delta") or {}).get("stop_reason")
-            return [Finish(reason)] if reason else []
+            return [Finish("length" if reason in CUT_OFF else reason)] if reason else []
         elif kind == "message_stop":
             billed_in = sum(
                 self._usage.get(key, 0)

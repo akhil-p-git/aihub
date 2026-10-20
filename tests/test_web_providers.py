@@ -507,6 +507,27 @@ class TestAnthropic:
             and seen["headers"]["anthropic-version"] == "2023-06-01"
         )
 
+    @pytest.mark.parametrize(
+        ("stop_reason", "finish"),
+        [
+            ("end_turn", "end_turn"),
+            ("stop_sequence", "stop_sequence"),
+            ("max_tokens", "length"),
+            ("model_context_window_exceeded", "length"),
+            ("refusal", "refusal"),
+        ],
+    )
+    def test_a_length_cut_off_is_reported_the_way_the_ui_expects(
+        self, stop_reason: str, finish: str
+    ) -> None:
+        parser = anthropic_mod.StreamParser()
+        event = {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {"output_tokens": 5},
+        }
+        assert parser.feed(event) == [Finish(finish)]
+
     def test_omitted_thinking_streams_nothing(self) -> None:
         parser = anthropic_mod.StreamParser()
         event = {

@@ -68,6 +68,26 @@ class TestEfforts:
         effort = openrouter_efforts(record(model_id)["reasoning"])
         assert (effort.levels if effort else None) == levels
 
+    def test_null_means_every_level_and_absent_means_none(self) -> None:
+        """OpenRouter documents `supported_efforts: null` as "all effort values are accepted" and an omitted key as "no effort selection"."""
+        assert openrouter_efforts(
+            {"mandatory": False, "supported_efforts": None}
+        ).levels == (
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        )
+        assert (
+            openrouter_efforts({"mandatory": True, "supported_efforts": None}).levels[0]
+            == "minimal"
+        )
+        assert openrouter_efforts({"mandatory": False}) is None
+        assert openrouter_efforts({"mandatory": False, "supported_efforts": []}) is None
+
     def test_mandatory_reasoning_never_offers_off(self) -> None:
         reasoning = {"mandatory": True, "supported_efforts": ["none", "low", "high"]}
         assert openrouter_efforts(reasoning).levels == ("low", "high")

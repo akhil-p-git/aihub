@@ -5,6 +5,7 @@ Browser tests run the real app against this, so they are fast, free and repeatab
 does is chosen by a keyword in the user's last message:
 
     slow       about 4 seconds of steady tokens (for Stop)
+    endless    two minutes of steady tokens (for stopping the service mid-reply)
     markdown   a long reply with a code block, a list and a table
     hostile    markdown full of script, style, remote images and javascript: links
     error      two tokens, then the provider fails mid-stream
@@ -96,6 +97,8 @@ def plan(prompt: str, reasoning: bool) -> dict:
             tokens("one two three four five six seven eight nine ten " * 4),
             0.1,
         )
+    elif "endless" in p:
+        plan["content"], plan["delay"] = tokens("word " * 2000), 0.1
     elif "long" in p:
         plan["content"], plan["delay"] = (
             tokens("This sentence repeats to make a long reply. " * 400),

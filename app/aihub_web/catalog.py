@@ -111,7 +111,13 @@ def openrouter_efforts(reasoning: Mapping[str, object] | None) -> Effort | None:
     """Reasoning control from the model's `reasoning` object; "none" is OpenRouter's name for off."""
     if not reasoning:
         return None
-    supported = reasoning.get("supported_efforts") or []
+    if "supported_efforts" not in reasoning:
+        return None  # the model does not expose effort selection
+    supported = reasoning["supported_efforts"]
+    if (
+        supported is None
+    ):  # documented as: every effort level the gateway knows is accepted
+        supported = [("none" if level == "off" else level) for level in LEVELS]
     levels = {"off" if e == "none" else e for e in supported}
     if reasoning.get("mandatory"):
         levels.discard("off")
