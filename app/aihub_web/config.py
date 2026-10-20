@@ -106,7 +106,8 @@ class Limits(_Section):
 
 class Config(_Section):
     host: str = "127.0.0.1"
-    port: int = Field(8787, ge=1, le=65535)
+    # 0 lets the system pick a free port.
+    port: int = Field(8787, ge=0, le=65535)
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     state_dir: Path = REPO_ROOT / "state" / "web"
     retention_days: int = Field(30, ge=1)
@@ -149,7 +150,10 @@ class Config(_Section):
 def load_config(
     path: Path | None = None, environ: Mapping[str, str] = os.environ
 ) -> Config:
-    """Read the YAML settings (defaults when the file is absent); AIHUB_STATE_DIR overrides state_dir."""
+    """Read the YAML settings (defaults when the file is absent).
+
+    AIHUB_STATE_DIR overrides state_dir and AIHUB_PORT overrides port.
+    """
     path = path or Path(environ.get("AIHUB_WEB_CONFIG") or DEFAULT_CONFIG_PATH)
     path = path.expanduser()
     raw: dict[str, object] = {}
@@ -160,6 +164,8 @@ def load_config(
         raw = loaded
     if state_dir := environ.get("AIHUB_STATE_DIR"):
         raw["state_dir"] = state_dir
+    if port := environ.get("AIHUB_PORT"):
+        raw["port"] = port
     try:
         return Config.model_validate(raw)
     except ValidationError as err:

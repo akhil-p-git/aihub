@@ -36,6 +36,48 @@ def test_state_dir_comes_from_the_environment(tmp_path: Path) -> None:
     assert config.state_dir == Path("~/somewhere").expanduser()
 
 
+def test_port_zero_asks_the_system_for_a_free_port(tmp_path: Path) -> None:
+    assert load_config(write(tmp_path, {"port": 0}), {}).port == 0
+
+
+def test_the_port_comes_from_the_environment_when_it_is_set(tmp_path: Path) -> None:
+    path = write(tmp_path, {"port": 9000})
+    assert load_config(path, {}).port == 9000
+    assert load_config(path, {"AIHUB_PORT": "9100"}).port == 9100
+    assert load_config(path, {"AIHUB_PORT": "0"}).port == 0
+    assert load_config(tmp_path / "absent.yaml", {"AIHUB_PORT": "9100"}).port == 9100
+
+
+def test_a_blank_port_variable_changes_nothing(tmp_path: Path) -> None:
+    assert load_config(write(tmp_path, {"port": 9000}), {"AIHUB_PORT": ""}).port == 9000
+
+
+@pytest.mark.parametrize("value", ["abc", "80.5", "8080x", "0x1f90", "1e3"])
+def test_a_port_variable_that_is_not_an_integer_is_a_config_error(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(
+        ConfigError, match=r"\.yaml: port: Input should be a valid integer"
+    ):
+        load_config(tmp_path / "absent.yaml", {"AIHUB_PORT": value})
+
+
+@pytest.mark.parametrize("value", ["-1", "65536", "99999"])
+def test_a_port_variable_outside_the_range_is_a_config_error(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(ConfigError, match=r"\.yaml: port: Input should be"):
+        load_config(tmp_path / "absent.yaml", {"AIHUB_PORT": value})
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_a_port_outside_the_range_in_the_file_is_a_config_error(
+    tmp_path: Path, port: int
+) -> None:
+    with pytest.raises(ConfigError, match=r"\.yaml: port: Input should be"):
+        load_config(write(tmp_path, {"port": port}), {})
+
+
 @pytest.mark.parametrize(
     "default_models",
     [
