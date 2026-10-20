@@ -18,6 +18,20 @@ No secrets live here: they are in `~/.secrets.env` and `~/.config/aihub/`.
 - Health: `curl -sf http://127.0.0.1:8080/health` returns `{"status":true}`.
 - First visitor creates the admin account. Then set `ENABLE_SIGNUP=false` in the env file and restart the unit.
 
+## Discord bot (llmcord, installed, not started)
+- Pinned: llmcord `a99de6d` cloned into `vendor/` with a locked venv (`config/llmcord-requirements.lock.txt`,
+  `pip-audit` clean). `scripts/install.sh` reproduces both installs.
+- Config: copy `config/llmcord.example.yaml` to `~/.config/aihub/llmcord/config.yaml` and set your Discord user ID in
+  `admin_ids` and `allowed_ids`. llmcord treats an empty `allowed_ids` as "everyone", so the unit runs
+  `scripts/check_llmcord_config.py` first and refuses to start with an empty allowlist, a Claude default model
+  (the first entry under `models` is the default after every restart) or a missing key.
+- Secrets: `~/.config/aihub/aihub.env` (chmod 600, template `config/aihub.env.example`), read only by this unit.
+  The three names are `AIHUB_DISCORD_TOKEN`, `AIHUB_OPENROUTER_KEY`, `AIHUB_ANTHROPIC_KEY`.
+- Start: `systemctl --user enable --now llmcord`; logs: `journalctl --user -u llmcord -f`.
+- Claude through Anthropic's OpenAI-compatible endpoint has no prompt caching and bills Claude 5 thinking that it
+  does not return. Use a key created inside the capped Console workspace and check the Console usage page.
+- Tests: `uv run --no-project --with pytest --with pyyaml pytest -q`.
+
 ## Not done yet
-Connections for OpenRouter and Anthropic (need keys), Tailscale access from phone and Mac, the Discord bot
-(llmcord), and the model benchmark in `docs/models.md`.
+Connections for OpenRouter and Anthropic in Open WebUI (need keys), Tailscale access from phone and Mac, and the
+model benchmark in `docs/models.md`.

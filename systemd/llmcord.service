@@ -1,0 +1,21 @@
+[Unit]
+Description=llmcord Discord bot (aihub)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/aihub/llmcord
+EnvironmentFile=%h/.config/aihub/aihub.env
+# Fail closed: refuses to start with an empty allowlist, a Claude default model or a missing key.
+ExecStartPre=%h/work/Dev/aihub/vendor/.venv-llmcord/bin/python %h/work/Dev/aihub/scripts/check_llmcord_config.py %h/.config/aihub/llmcord/config.yaml
+ExecStart=%h/work/Dev/aihub/vendor/.venv-llmcord/bin/python %h/work/Dev/aihub/vendor/llmcord/llmcord.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

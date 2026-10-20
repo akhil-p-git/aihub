@@ -1,0 +1,80 @@
+# llmcord config for aihub. Copy to ~/.config/aihub/llmcord/config.yaml and fill in your Discord user ID.
+# No secrets here: keys ending in "_env" name an environment variable, which the systemd unit loads from
+# ~/.config/aihub/aihub.env (see config/aihub.env.example).
+
+bot_token_env: AIHUB_DISCORD_TOKEN
+
+status_message: aihub
+
+# Bound the cost of one turn: a reply chain resends up to max_messages messages at full price.
+max_text: 30000
+max_images: 3
+max_messages: 15
+
+use_plain_responses: false
+allow_dms: true
+
+permissions:
+  users:
+    # REQUIRED. llmcord treats an empty allowed_ids as "everyone". scripts/check_llmcord_config.py
+    # refuses to start the bot while either list is empty.
+    admin_ids: []    # may switch models with /model (and bypasses the allowlist)
+    allowed_ids: []
+    blocked_ids: []
+  roles:
+    allowed_ids: []
+    blocked_ids: []
+  channels:
+    allowed_ids: []
+    blocked_ids: []
+
+providers:
+  # Paid OpenRouter models. Providers that store or may train on prompts are excluded, and so are
+  # DeepSeek's own endpoint and other China-headquartered hosts. OpenRouter calls its data-policy tags
+  # "best knowledge", so treat this as best effort. If no allowed provider can serve a request it fails.
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: AIHUB_OPENROUTER_KEY
+    extra_body:
+      provider:
+        data_collection: deny
+        ignore: [deepseek, baidu, streamlake, siliconflow, alibaba]
+
+  # ':free' models: hosts may log or train on prompts. Non-sensitive chat only.
+  openrouter-free:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: AIHUB_OPENROUTER_KEY
+
+  # Anthropic's OpenAI-compatible endpoint: no prompt caching, and Claude 5 thinking (on by default) is
+  # billed even though it is not returned. Use a key created inside the capped workspace. If the key
+  # can access several workspaces, also set: extra_headers: {anthropic-workspace-id: <workspace id>}
+  anthropic:
+    base_url: https://api.anthropic.com/v1/
+    api_key_env: AIHUB_ANTHROPIC_KEY
+
+  ollama:
+    base_url: http://127.0.0.1:11434/v1
+
+# The FIRST model is the default, and what the bot returns to after every restart. Keep it cheap.
+# Names are <provider>/<model id>; /model autocompletes the first 25.
+models:
+  openrouter/deepseek/deepseek-v4.1-flash-1017:
+  openrouter/deepseek/deepseek-v4-pro-0813:
+  anthropic/claude-haiku-5-5:
+  anthropic/claude-sonnet-5-5:
+  anthropic/claude-opus-5-5:
+  openrouter-free/nvidia/nemotron-3.5-lightning:free:
+  openrouter-free/nvidia/nemotron-3-super-120b-a12b:free:
+  openrouter-free/google/gemma-4-31b-it:free:
+  openrouter-free/poolside/laguna-s-2.1:free:
+  openrouter-free/cohere/north-mini-code:free:
+  openrouter-free/minimax/minimax-m3.1-flash:free:
+  ollama/qwen3:8b:
+  ollama/gemma4:e4b:
+
+system_prompt: |
+  You are a concise, accurate assistant in a private Discord server. Answer directly and ask a question only when blocked.
+
+  Today's date is {date}. The current time is {time}.
+
+  User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
