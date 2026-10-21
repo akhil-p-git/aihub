@@ -23,8 +23,10 @@ engine_failed_to_start (with last_error), 410 engine_gone (with last_error), 502
 engine_unreachable, 504 engine_timeout.
 
 The engine's [E] and [W] lines are kept (the last 20 are last_error) and the first 200 per start go to this
-process's stderr, which systemd sends to the journal. Everything else it prints is dropped, because sd-server
-logs prompts at [I]. It prints [E] on stderr and the rest on stdout, so both are read.
+process's stderr, which systemd sends to the journal. Everything else it prints is dropped. At the pin
+sd-server logs prompts only at verbose level (-v, which models.json may not ask for), in messages of several
+lines: the tag comes first and " --- file:line" last, so the lines of such an [I], [D] or [V] message go with
+it. It prints [E] on stderr and the rest on stdout, so both are read.
 
 A start that fails (the engine exits or does not listen) leaves the launcher running in state "failed" and
 refuses any new start for 30 seconds, so one click costs one CUDA initialisation. Exit status 78 means the
@@ -67,6 +69,11 @@ STREAM_LIMIT = 1024 * 1024
 RING = 20
 # Characters kept of an engine line.
 LINE_MAX = 1000
+# Bytes read of an engine line. The rest of a longer line is dropped, so that the middle of a line is never
+# taken for the start of one.
+LINE_CAP = 64 * 1024
+# A message of several lines that is not seen to end is dropped for this many lines.
+CONTINUATION_MAX = 50
 # Engine lines copied to the journal per start.
 LOG_LINES_MAX = 200
 # How long to wait for a SIGKILLed engine to be gone.
@@ -93,6 +100,8 @@ JOB_STATUS = re.compile(rf"/e/({MODEL})/sdcpp/v1/jobs/({JOB})")
 JOB_CANCEL = re.compile(rf"/e/({MODEL})/sdcpp/v1/jobs/({JOB})/cancel")
 REQUEST_LINE = re.compile(r"([A-Z]+) (/[^ ]*) HTTP/1\.[01]")
 STATUS_LINE = re.compile(r"HTTP/1\.[01] ([0-9]{3})(?: .*)?")
+# What closes an engine message: sd-server ends each with " --- file:line" (examples/common/log.cpp).
+FILE_LINE = re.compile(r"[A-Za-z0-9_.+-]+:[0-9]+")
 HEADER = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*(.*?)[ \t]*")
 # Control characters. A lone CR or LF is one, and only CRLF may end a line.
 NOT_TEXT = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
@@ -415,7 +424,36 @@ def die_with_the_launcher() -> None:
 
 def printable(raw: bytes) -> str:
     text = raw.decode("utf-8", "replace").rstrip("\r\n")
-    return "".join(c if c.isprintable() else "?" for c in text)[:LINE_MAX]
+    return "".join(c if c.isprintable() else "?" for c in text[:LINE_MAX])
+
+
+async def read_lines(stream: asyncio.StreamReader):
+    """The lines of `stream` as bytes, each at most LINE_CAP long. A longer line is cut, and what follows the cut
+    is skipped up to the next newline."""
+    pending = bytearray()
+    skipping = False
+    while chunk := await stream.read(65536):
+        pending += chunk
+        start = 0
+        while (end := pending.find(b"\n", start)) >= 0:
+            if not skipping:
+                yield bytes(pending[start : min(end, start + LINE_CAP)])
+            skipping = False
+            start = end + 1
+        del pending[:start]
+        if len(pending) > LINE_CAP:
+            if not skipping:
+                yield bytes(pending[:LINE_CAP])
+            skipping = True
+            pending.clear()
+    if pending and not skipping:
+        yield bytes(pending)
+
+
+def closes(text: str) -> bool:
+    """Whether a line ends a message: sd-server ends each one with " --- file:line"."""
+    _, found, tail = text.rpartition(" --- ")
+    return bool(found) and FILE_LINE.fullmatch(tail) is not None
 
 
 def describe_exit(status: int) -> str:
@@ -490,16 +528,24 @@ class Host:
 
     # Reading what the engine prints
     async def read_output(self, engine: Engine) -> None:
-        while True:
-            try:
-                raw = await engine.proc.stdout.readline()
-            except ValueError:
-                # A line longer than the stream limit. Its start was dropped.
+        """Keep the [E] and [W] lines and drop the rest: sd-server logs prompts at verbose level (which
+        models.json may not ask for), in messages of several lines, and a library may print anything."""
+        # Lines of the [I], [D] or [V] message that is going on over several lines, 0 when there is none.
+        inside = 0
+        async for raw in read_lines(engine.proc.stdout):
+            text = raw.decode("utf-8", "replace").rstrip("\r")
+            if inside:
+                # A line of that message, whatever it looks like. A message that is never seen to end is
+                # dropped for CONTINUATION_MAX lines, so that a missing end cannot hide errors for long.
+                last = closes(text) or inside >= CONTINUATION_MAX
+                inside = 0 if last else inside + 1
                 continue
-            if not raw:
-                return
-            # [I], [D] and [V] lines carry prompts and progress. They stay out of the journal.
-            if not raw.startswith((b"[E] ", b"[W] ")):
+            if text.startswith(("[I] ", "[D] ", "[V] ")):
+                # ggml's lines come through the same callback, and end without a file and line.
+                one_line = closes(text) or text[4:].startswith("ggml: ")
+                inside = 0 if one_line else 1
+                continue
+            if not text.startswith(("[E] ", "[W] ")):
                 continue
             line = printable(raw)
             self.errors.append(line)

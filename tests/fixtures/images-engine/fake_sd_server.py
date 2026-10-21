@@ -20,12 +20,21 @@ A keyword in the prompt of a job chooses how the job goes (the same style as tes
     imagefail    fail at step 2 with the lab's out-of-memory lines
     crashimage   abort (SIGABRT) at step 2, like the VAE crash seen in the lab
     noisyimage   flood stdout and stderr at step 1
+    longimage    write one [I] line of 100,000 characters in two halves 0.3 s apart, the second half starting
+                 like an error line (the middle of a line is not the start of one)
+    logshapes    print every shape of engine line the lab's logs show, and two that only a hostile prompt
+                 makes: a message of several lines (tag first, " --- file:line" last, here with an error
+                 look-alike inside), ggml's lines without a file and line, a stray line, and a message that
+                 never ends
+    sentinel-X   log "[E] sentinel X" when the job starts, so that a test can wait until the launcher has
+                 read everything printed before it
     fault-KIND   break the reply to the img_gen request: nolength, chunked, chunkedlength, twolengths,
                  hugehead, hugebody, truncated, stall, badstatus or garbage
 
 The log lines have sd-server's shape: "[E] text --- file:line" on stderr, and [W], [I] and the rest on
-stdout (examples/common/log.cpp at the pinned commit prints only errors to stderr). Like sd-server it
-logs the prompt of every job at [I], so a test can check that the launcher keeps it out of its own log.
+stdout (examples/common/log.cpp at the pinned commit prints only errors to stderr). It logs the prompt of
+every job at [I], as sd-server does at verbose level (which the launcher refuses, and where sd-server
+escapes newlines; this does not), so a test can check that the launcher keeps it out of its own log.
 The images are real WebP files (flat colour) of the sizes aihub asks for, and 64x64 when a request has no
 size. Python 3.12 or newer, standard library only.
 """
@@ -123,6 +132,13 @@ def log(level: str, text: str) -> None:
     stream.flush()
 
 
+def ggml_log(level: str, text: str) -> None:
+    """ggml's own messages reach the log through the same callback, tagged but without " --- file:line"."""
+    stream = sys.stderr if level == "E" else sys.stdout
+    stream.write(f"[{level}] ggml: {text}\n")
+    stream.flush()
+
+
 def record(name: str, entry: dict) -> None:
     if RECORD_DIR is not None:
         with LOCK, (RECORD_DIR / name).open("a") as out:
@@ -144,6 +160,36 @@ def flood() -> None:
     sys.stderr.write("y" * 300_000 + "\n")
     log("E", "z" * 5000)  # long, but inside what the launcher reads of a line
     log("E", "last error line")
+
+
+def long_line() -> None:
+    sys.stdout.write("[I] " + "a" * 100_000)
+    sys.stdout.flush()
+    time.sleep(0.3)
+    sys.stdout.write("[E] LEAKMARK-02 second half of a long line\n")
+    sys.stdout.flush()
+
+
+def log_shapes() -> None:
+    def raw(text: str) -> None:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
+    # A message of several lines, as sd-server prints a multi-line string: the tag on the first line and
+    # " --- file:line" at the end of the last.
+    raw("[I] a message that goes on")
+    raw("[E] a line that only looks like an error")
+    raw("and a last line --- fake_sd_server.py:1")
+    # ggml's lines come through the same callback, without the file and line.
+    ggml_log("W", "a warning from ggml")
+    ggml_log("I", "an info line from ggml")
+    log("E", "kept after a ggml line")
+    ggml_log("E", "an error from ggml")
+    raw("a stray line from a library")
+    raw("[I] a message that never ends")
+    for number in range(60):
+        raw(f"[E] line {number} of a message that never ends")
+    log("E", "kept after the long message")
 
 
 def start_mode(mode: str) -> None:
@@ -360,6 +406,10 @@ def work() -> None:
         prompt = request["prompt"]
         words = prompt.lower()
         log("I", f"prompt: {prompt}")
+        if mark := re.search(r"sentinel-([a-z0-9]+)", words):
+            log(
+                "E", f"sentinel {mark[1]}"
+            )  # a line a test waits for: all before it have been read
         steps = int((request.get("sample_params") or {}).get("sample_steps") or 4)
         for step in range(1, steps + 1):
             time.sleep(1.0 if "slowimage" in words else 0.05)
@@ -373,6 +423,10 @@ def work() -> None:
                     }
             if "noisyimage" in words and step == 1:
                 flood()
+            if "longimage" in words and step == 1:
+                long_line()
+            if "logshapes" in words and step == 1:
+                log_shapes()
             if "crashimage" in words and step == 2:
                 log("E", "VAE decode failed")
                 crash()
@@ -380,6 +434,10 @@ def work() -> None:
                 log(
                     "W",
                     "model manager cannot make enough memory available on CUDA0: need 2129.16 MB device / 1617.16 MB budget, available 950.31 MB device / unlimited budget",
+                )
+                ggml_log(
+                    "E",
+                    "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1021.54 MiB on device 0: cudaMalloc failed: CUDA-capable device(s) is/are busy or unavailable",
                 )
                 log("E", "generate failed")
                 with LOCK:

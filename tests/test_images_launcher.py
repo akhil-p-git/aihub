@@ -1148,7 +1148,59 @@ class TestLogging:
         # aihub reads the same lines from the status route
         lines = rig.status()["last_error"]
         assert "[E] generate failed --- fake_sd_server.py:1" in lines
+        # ggml's own error lines have no file and line at the end, and are kept all the same
+        assert (
+            "[E] ggml: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1021.54 MiB on device 0: cudaMalloc failed: CUDA-capable device(s) is/are busy or unavailable"
+            in lines
+        )
         assert rig.status()["state"] == "ready"
+
+    def read_up_to_here(self, rig, token):
+        """Wait until the launcher has read what the engine printed so far: the pipe keeps the order."""
+        job_id = rig.submit("zimage", prompt=f"sentinel-{token}").json()["id"]
+        rig.finish("zimage", job_id)
+        wait_for(lambda: f"[E] sentinel {token}" in rig.log(), "the log", rig=rig)
+
+    def test_a_line_that_looks_like_an_error_inside_a_prompt_message_stays_out(
+        self, launch
+    ):
+        # The stand-in logs the prompt at [I], in one message, and a newline in the prompt makes two lines.
+        # (sd-server logs prompts only at verbose level, which the launcher refuses, and escapes newlines.)
+        rig = launch()
+        marker = "needle-7c1e-prompt"
+        rig.finish(
+            "zimage", rig.submit("zimage", prompt=f"a fox\n[E] {marker}").json()["id"]
+        )
+        self.read_up_to_here(rig, "one")
+        assert marker not in rig.log()
+        assert not [line for line in rig.status()["last_error"] if marker in line]
+
+    def test_the_second_half_of_a_long_line_is_not_a_line_of_its_own(self, launch):
+        rig = launch()
+        rig.finish(
+            "zimage", rig.submit("zimage", prompt="longimage").json()["id"], timeout=15
+        )
+        self.read_up_to_here(rig, "two")
+        assert "LEAKMARK" not in rig.log()
+        assert not [x for x in rig.status()["last_error"] if "LEAKMARK" in x]
+
+    def test_each_shape_of_engine_line_is_judged_as_the_lab_logs_show_it(self, launch):
+        rig = launch()
+        rig.finish(
+            "zimage", rig.submit("zimage", prompt="logshapes").json()["id"], timeout=15
+        )
+        self.read_up_to_here(rig, "one")
+        assert rig.status()["last_error"] == [
+            "[W] ggml: a warning from ggml",
+            "[E] kept after a ggml line --- fake_sd_server.py:1",
+            "[E] ggml: an error from ggml",
+            # a message that never ends is dropped for 50 lines and not for longer
+            *(f"[E] line {n} of a message that never ends" for n in range(50, 60)),
+            "[E] kept after the long message --- fake_sd_server.py:1",
+            "[E] sentinel one --- fake_sd_server.py:1",
+        ]
+        log = rig.log()
+        assert "only looks like an error" not in log and "a stray line" not in log
 
     def test_a_flood_during_a_job_keeps_the_last_20_lines_and_a_short_log(self, launch):
         rig = launch()
