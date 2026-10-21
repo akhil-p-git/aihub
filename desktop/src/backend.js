@@ -1,8 +1,8 @@
 // Runs the aihub_web backend as a child process and tells when it is ready.
 //
-// Nothing here imports Electron. What depends on the machine (data directory, packaging, the keys file, the
-// parent environment, the timeouts) is a constructor option whose default is the real value, so tests can
-// inject their own.
+// Nothing here imports Electron. What depends on the machine (packaging, the keys file, the parent
+// environment, the timeouts) is a constructor option whose default is the real value, so tests can inject
+// their own. The data directory has no Electron-free real value: main.js passes app.getPath("userData").
 //
 // The backend's side of the contract is in app/aihub_web/__main__.py:
 // - it prints one line on stdout, {"event":"ready","port":N}, once it accepts connections;
@@ -35,6 +35,8 @@ const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 /** "exit code 3" or "signal SIGKILL". */
 const describeExit = (code, signal) => (signal ? `signal ${signal}` : `exit code ${code}`);
 
+const isPort = (value) => Number.isInteger(value) && value >= 1 && value <= 65535;
+
 /** The port of a ready line, or null for any other line. */
 function readyPort(line) {
   let message;
@@ -43,11 +45,8 @@ function readyPort(line) {
   } catch {
     return null;
   }
-  const port = message?.port;
-  return message?.event === "ready" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+  return message?.event === "ready" && isPort(message.port) ? message.port : null;
 }
-
-const isPort = (value) => Number.isInteger(value) && value >= 1 && value <= 65535;
 
 export class Backend extends EventEmitter {
   #userData;
@@ -268,7 +267,7 @@ export class Backend extends EventEmitter {
     return Object.assign(new Error(message), { exitCode: code, signal });
   }
 
-  /** The two provider keys of the keys file, and every other name in it as well: policy.js lets two through. */
+  /** The parsed keys file. It holds names that must not reach the backend too; buildChildEnv takes only the two keys. */
   #readKeys() {
     let text;
     try {
