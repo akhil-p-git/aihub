@@ -238,6 +238,14 @@ function counterFile(t) {
 }
 const attempts = (counter) => (existsSync(counter) ? lines(counter) : []);
 
+/**
+ * Shell lines for a stub that has just written its attempt to `counter`. From the attempt after the first `limit` it
+ * reports ready instead of going on, so that a start() which retries without end gets a backend, and the test fails
+ * on its assertions at once instead of looping until it times out.
+ */
+const readyAfter = (counter, limit) =>
+  `[ "$(wc -l < ${quote(counter)})" -le ${limit} ] || { ${READY_LINE}; exec sleep 1000; }`;
+
 /** The first line a child process prints on stdout. */
 function firstLine(child, ms = 30_000) {
   return new Promise((resolve, reject) => {
@@ -390,6 +398,11 @@ describe("the real backend", () => {
     r.rememberPort(await freePort());
 
     const { backend } = r.make();
+    // A start() that tried without end would be stopped at the third attempt, and the count below says so.
+    const watchdog = setInterval(() => {
+      if (count(r.log(), /newer than this app/g) > 2) backend.stop();
+    }, 20);
+    t.after(() => clearInterval(watchdog));
     const error = await rejection(backend.start());
     assert.equal(error.exitCode, 3);
     assert.equal(count(r.log(), /newer than this app/g), 2, "one start on the remembered port, one on port 0");
@@ -735,7 +748,12 @@ describe("a stand-in interpreter", () => {
     it("3 on a first run is reported at once, without a retry", async (t) => {
       const counter = counterFile(t);
       const r = rig(t, {
-        stub: `echo "$AIHUB_PORT" >> ${quote(counter)}\necho 'ERROR: address already in use' >&2\nexit 3`,
+        stub: [
+          `echo "$AIHUB_PORT" >> ${quote(counter)}`,
+          readyAfter(counter, 1),
+          "echo 'ERROR: address already in use' >&2",
+          "exit 3",
+        ].join("\n"),
       });
       const { backend } = r.make();
       const error = await rejection(backend.start());
@@ -746,7 +764,9 @@ describe("a stand-in interpreter", () => {
 
     it("3 with a remembered port is retried once with port 0, then reported", async (t) => {
       const counter = counterFile(t);
-      const r = rig(t, { stub: `echo "$AIHUB_PORT" >> ${quote(counter)}\nexit 3` });
+      const r = rig(t, {
+        stub: [`echo "$AIHUB_PORT" >> ${quote(counter)}`, readyAfter(counter, 2), "exit 3"].join("\n"),
+      });
       r.rememberPort(4999);
       const { backend } = r.make();
       const exits = [];
@@ -827,7 +847,9 @@ describe("a stand-in interpreter", () => {
       ];
       for (const content of notPorts) {
         const counter = counterFile(t);
-        const r = rig(t, { stub: `echo "$AIHUB_PORT" >> ${quote(counter)}\nexit 3` });
+        const r = rig(t, {
+          stub: [`echo "$AIHUB_PORT" >> ${quote(counter)}`, readyAfter(counter, 1), "exit 3"].join("\n"),
+        });
         r.rememberPort(content);
         const { backend } = r.make();
         await rejection(backend.start());
