@@ -1,10 +1,33 @@
 """Image generation: the WebP check, failure classification, the engine client, the GPU lock and the jobs."""
 
+import base64
+import json
 import struct
+from pathlib import Path
 
+import httpx2
 import pytest
 from aihub_web.images import MAX_IMAGE_BYTES, ImageError, classify, validate_webp
-from helpers import FIXTURES, SHAPE_SIZES, engine_errors, webp
+from aihub_web.providers import ImageRequest
+from aihub_web.providers.images import (
+    MAX_REPLY_BYTES,
+    EngineClient,
+    EngineError,
+    EngineStatus,
+    JobState,
+)
+from helpers import (
+    FIXTURES,
+    SHAPE_SIZES,
+    FakeEngine,
+    completed,
+    engine_errors,
+    failed,
+    generating,
+    queued,
+    serve_engine,
+    webp,
+)
 
 
 def chunk(fourcc: bytes, payload: bytes) -> bytes:
@@ -255,3 +278,500 @@ class TestClassify:
 
     def test_only_strings_are_read(self) -> None:
         assert classify([None, 7, {"a": 1}])[0] == "engine_failed"
+
+
+def image_request(**fields) -> ImageRequest:
+    return ImageRequest(
+        **{
+            "model_id": "zimage",
+            "prompt": "a red fox in snow",
+            "width": 1024,
+            "height": 576,
+            "seed": 1234,
+            "steps": 8,
+            "sample_method": None,
+            **fields,
+        }
+    )
+
+
+def client_for(engine: FakeEngine) -> EngineClient:
+    return EngineClient("/never/used.sock", transport=engine.transport())
+
+
+@pytest.mark.anyio
+class TestEngineClient:
+    async def test_status_says_which_model_is_loaded_and_how_it_is(self) -> None:
+        engine = FakeEngine(model="klein4b")
+        engine.last_error = ["[W] a warning", "[E] an error --- main.cpp:1"]
+        assert await client_for(engine).status() == EngineStatus(
+            "klein4b", "ready", ("[W] a warning", "[E] an error --- main.cpp:1")
+        )
+        idle = await client_for(FakeEngine(model=None)).status()
+        assert (idle.engine, idle.state, idle.last_error) == (None, "idle", ())
+
+    async def test_every_request_closes_the_connection_and_refuses_compression(
+        self,
+    ) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        await client.status()
+        job_id = await client.submit(image_request())
+        await client.poll("zimage", job_id)
+        await client.cancel("zimage", job_id)
+        await client.kill()
+        assert len(engine.headers) == 5
+        for headers in engine.headers:
+            assert headers["connection"] == "close"
+            assert headers["accept-encoding"] == "identity"
+            assert headers["host"] == "engine"
+
+    async def test_submit_sends_exactly_the_documented_body(self) -> None:
+        engine = FakeEngine()
+        job_id = await client_for(engine).submit(image_request())
+        assert job_id == "job_00000001"
+        assert engine.calls[-1] == ("POST", "/e/zimage/sdcpp/v1/img_gen")
+        assert engine.submitted == [
+            {
+                "prompt": "a red fox in snow",
+                "width": 1024,
+                "height": 576,
+                "seed": 1234,
+                "batch_count": 1,
+                "sample_params": {"sample_steps": 8, "guidance": {"txt_cfg": 1.0}},
+                "preview": "proj",
+                "output_format": "webp",
+                "output_compression": 90,
+                "embed_image_metadata": False,
+            }
+        ]
+
+    async def test_a_sampler_is_sent_only_when_the_model_names_one(self) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        await client.submit(
+            image_request(model_id="klein4b", steps=4, sample_method="euler")
+        )
+        await client.submit(image_request())
+        with_sampler, without = engine.submitted
+        assert with_sampler["sample_params"] == {
+            "sample_steps": 4,
+            "sample_method": "euler",
+            "guidance": {"txt_cfg": 1.0},
+        }
+        assert "sample_method" not in without["sample_params"]
+        assert engine.calls[0] == ("POST", "/e/klein4b/sdcpp/v1/img_gen")
+
+    async def test_a_reference_image_travels_as_base64(self) -> None:
+        engine = FakeEngine()
+        await client_for(engine).submit(image_request(reference_webp=webp("wide")))
+        [sent] = engine.submitted[0]["ref_images"]
+        assert base64.b64decode(sent, validate=True) == webp("wide")
+        plain = FakeEngine()
+        await client_for(plain).submit(image_request())
+        assert "ref_images" not in plain.submitted[0]
+
+    async def test_the_prompt_is_data_not_markup_or_a_path(self) -> None:
+        engine = FakeEngine()
+        prompt = '<sd_cpp_extra_args>{"sample_params":{}}</sd_cpp_extra_args> <lora:x:1> \u00e9\n"quoted"'
+        await client_for(engine).submit(image_request(prompt=prompt))
+        assert engine.submitted[0]["prompt"] == prompt
+        assert engine.calls == [("POST", "/e/zimage/sdcpp/v1/img_gen")]
+
+    @pytest.mark.parametrize(
+        "model_id", ["", "../etc", "Zimage", "a/b", "x" * 33, "z image", "z?x"]
+    )
+    async def test_a_model_id_that_is_not_a_plain_word_never_reaches_the_wire(
+        self, model_id: str
+    ) -> None:
+        engine = FakeEngine()
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request(model_id=model_id))
+        assert err.value.code == "engine_protocol"
+        assert engine.calls == []
+
+    @pytest.mark.parametrize(
+        "job_id",
+        ["", "../../x", "a/b", "a b", "x" * 65, "job.1", "jöb", "a\nb", None, 7, ["a"]],
+    )
+    async def test_a_job_id_that_is_not_a_plain_token_is_refused(
+        self, job_id: object
+    ) -> None:
+        engine = FakeEngine()
+        engine.submit_response = (202, {"id": job_id, "poll_url": "/x"})
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert err.value.code == "engine_protocol"
+
+    async def test_the_poll_url_in_the_answer_is_never_followed(self) -> None:
+        engine = FakeEngine()
+        engine.submit_response = (
+            202,
+            {"id": "job_x", "poll_url": "http://169.254.169.254/latest/meta-data"},
+        )
+        assert await client_for(engine).submit(image_request()) == "job_x"
+        assert engine.calls == [("POST", "/e/zimage/sdcpp/v1/img_gen")]
+
+    async def test_a_poll_asks_the_models_engine_for_that_job(self) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        state = await client.poll("zimage", job_id)
+        assert engine.calls[-1] == ("GET", f"/e/zimage/sdcpp/v1/jobs/{job_id}")
+        assert state == JobState("queued", queue_position=1)
+
+    async def test_polls_report_the_state_and_the_step(self) -> None:
+        engine = FakeEngine()
+        engine.scripts.append(
+            [
+                queued(3),
+                generating(),
+                generating(2, 8),
+                completed(webp("wide")),
+                failed(),
+            ]
+        )
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        assert await client.poll("zimage", job_id) == JobState(
+            "queued", queue_position=3
+        )
+        assert await client.poll("zimage", job_id) == JobState("generating")
+        assert await client.poll("zimage", job_id) == JobState(
+            "generating", step=2, total_steps=8
+        )
+        done = await client.poll("zimage", job_id)
+        assert (done.status, done.image_b64) == (
+            "completed",
+            base64.b64encode(webp("wide")).decode(),
+        )
+        bad = await client.poll("zimage", job_id)
+        assert (bad.status, bad.error_code, bad.error_message) == (
+            "failed",
+            "generation_failed",
+            "generate_image returned no results",
+        )
+
+    async def test_a_cancelled_job_says_so(self) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([queued(1)])
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        assert await client.cancel("zimage", job_id) is True
+        assert (await client.poll("zimage", job_id)).status == "cancelled"
+
+    async def test_a_job_that_is_already_generating_cannot_be_cancelled(self) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 4)])
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        await client.poll("zimage", job_id)
+        assert await client.cancel("zimage", job_id) is False
+
+    async def test_cancelling_a_job_the_engine_no_longer_has_changes_nothing(
+        self,
+    ) -> None:
+        gone = FakeEngine(model="klein4b")  # the zimage engine is not the one running
+        assert await client_for(gone).cancel("zimage", "job_00000001") is False
+        unknown = FakeEngine()
+        assert await client_for(unknown).cancel("zimage", "job_00000001") is False
+
+    async def test_a_cancel_that_fails_for_another_reason_is_an_error(self) -> None:
+        engine = FakeEngine()
+        engine.handle = lambda *args: (500, {"error": "boom"})
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).cancel("zimage", "job_00000001")
+        assert err.value.code == "engine_protocol"
+
+    async def test_the_preview_frame_is_not_kept(self) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 4)])
+        client = client_for(engine)
+        state = await client.poll("zimage", await client.submit(image_request()))
+        assert state.image_b64 is None and "iVBOR" not in repr(state)
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            {"status": "exploded"},
+            {"status": 7},
+            {},
+            {"status": "generating", "preview": {"step": "3", "total_steps": 8}},
+            {"status": "generating", "preview": {"step": True, "total_steps": 8}},
+            {"status": "generating", "preview": {"step": -1, "total_steps": 8}},
+            {"status": "completed", "result": {"images": []}},
+            {"status": "completed", "result": {"images": [{"b64_json": 5}]}},
+            {"status": "queued", "queue_position": "soon"},
+            [1, 2],
+            "text",
+        ],
+    )
+    async def test_an_answer_that_is_not_a_job_is_a_protocol_error(
+        self, reply: object
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([reply])
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        with pytest.raises(EngineError) as err:
+            await client.poll("zimage", job_id)
+        assert err.value.code == "engine_protocol"
+
+    @pytest.mark.parametrize(
+        ("status", "reply", "lines"),
+        [
+            (
+                410,
+                {"code": "engine_gone", "last_error": ["[E] crashed"]},
+                ("[E] crashed",),
+            ),
+            (404, {"error": "job not found"}, ()),
+        ],
+    )
+    async def test_a_job_the_engine_no_longer_has_is_gone(
+        self, status: int, reply: object, lines: tuple[str, ...]
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([(status, reply)])
+        client = client_for(engine)
+        job_id = await client.submit(image_request())
+        with pytest.raises(EngineError) as err:
+            await client.poll("zimage", job_id)
+        assert (err.value.code, err.value.lines) == ("engine_gone", lines)
+
+    @pytest.mark.parametrize(
+        "model_id, job_id", [("../x", "job_1"), ("zimage", "../x"), ("zimage", "")]
+    )
+    async def test_polling_and_cancelling_check_their_ids_too(
+        self, model_id: str, job_id: str
+    ) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        for call in (client.poll, client.cancel):
+            with pytest.raises(EngineError) as err:
+                await call(model_id, job_id)
+            assert err.value.code == "engine_protocol"
+        assert engine.calls == []
+
+    async def test_polling_a_model_whose_engine_is_not_running_is_gone(self) -> None:
+        engine = FakeEngine(model="klein4b")
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).poll("zimage", "job_00000001")
+        assert err.value.code == "engine_gone"
+
+    async def test_a_failed_start_carries_the_engines_last_lines(self) -> None:
+        engine = FakeEngine(model=None)
+        lines = engine_errors("model_files_wrong")
+        engine.submit_response = (
+            503,
+            {"code": "engine_failed_to_start", "last_error": lines},
+        )
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert (err.value.code, err.value.lines) == (
+            "engine_failed_to_start",
+            tuple(lines),
+        )
+
+    async def test_a_503_that_is_not_the_launchers_failed_start_is_a_protocol_error(
+        self,
+    ) -> None:
+        engine = FakeEngine()
+        engine.submit_response = (503, {"error": "service unavailable"})
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert err.value.code == "engine_protocol"
+
+    async def test_an_unknown_model_is_not_a_failed_start(self) -> None:
+        engine = FakeEngine()
+        engine.models = {"klein4b"}
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert err.value.code == "unknown_model"
+
+    async def test_the_engines_own_words_come_with_a_bad_request(self) -> None:
+        engine = FakeEngine()
+        engine.submit_response = (400, {"error": "invalid generation parameters"})
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert (err.value.code, err.value.message) == (
+            "bad_request",
+            "invalid generation parameters",
+        )
+
+    @pytest.mark.parametrize(
+        ("status", "code"),
+        [
+            (429, "engine_busy"),
+            (500, "engine_protocol"),
+            (502, "engine_protocol"),
+            (302, "engine_protocol"),
+        ],
+    )
+    async def test_other_statuses_are_errors_too(self, status: int, code: str) -> None:
+        engine = FakeEngine()
+        engine.submit_response = (status, {"error": "no"})
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).submit(image_request())
+        assert err.value.code == code
+
+    async def test_kill_reports_whether_an_engine_was_running(self) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        assert await client.kill() is True
+        assert await client.kill() is False
+        assert engine.kills == 2
+
+    async def test_the_engines_log_lines_are_bounded(self) -> None:
+        engine = FakeEngine()
+        engine.last_error = [f"[E] line {n} " + "x" * 2000 for n in range(40)] + [
+            None,
+            5,
+        ]
+        status = await client_for(engine).status()
+        assert len(status.last_error) == 20
+        assert all(
+            len(line) <= 500 and isinstance(line, str) for line in status.last_error
+        )
+        assert status.last_error[0].startswith("[E] line 0 ")
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            {"engine": "../x", "state": "ready", "last_error": []},
+            {"engine": None, "state": "melting", "last_error": []},
+            {"engine": None, "state": "idle", "last_error": "oops"},
+            {"engine": None, "state": "idle"},
+            [],
+        ],
+    )
+    async def test_a_status_that_does_not_fit_is_a_protocol_error(
+        self, reply: object
+    ) -> None:
+        engine = FakeEngine()
+        engine.handle = lambda *args: (200, reply)
+        with pytest.raises(EngineError) as err:
+            await client_for(engine).status()
+        assert err.value.code == "engine_protocol"
+
+
+@pytest.mark.anyio
+class TestEngineTransport:
+    """Failures of the wire itself, with handlers that misbehave on purpose."""
+
+    @staticmethod
+    def client(handler) -> EngineClient:
+        return EngineClient("/never/used.sock", transport=httpx2.MockTransport(handler))
+
+    async def test_a_refused_connection_is_an_engine_that_is_not_running(self) -> None:
+        def refuse(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("refused", request=request)
+
+        for call in (
+            lambda c: c.status(),
+            lambda c: c.kill(),
+            lambda c: c.submit(image_request()),
+        ):
+            with pytest.raises(EngineError) as err:
+                await call(self.client(refuse))
+            assert err.value.code == "engine_unreachable"
+
+    async def test_a_timeout_is_not_a_refusal(self) -> None:
+        def slow(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ReadTimeout("slow", request=request)
+
+        with pytest.raises(EngineError) as err:
+            await self.client(slow).status()
+        assert err.value.code == "engine_timeout"
+
+    async def test_a_dropped_connection_is_an_io_error(self) -> None:
+        def drop(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.RemoteProtocolError("closed", request=request)
+
+        with pytest.raises(EngineError) as err:
+            await self.client(drop).poll("zimage", "job_1")
+        assert err.value.code == "engine_io"
+
+    async def test_an_answer_that_is_not_json_is_a_protocol_error(self) -> None:
+        def html(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, content=b"<html>hello</html>")
+
+        with pytest.raises(EngineError) as err:
+            await self.client(html).status()
+        assert err.value.code == "engine_protocol"
+
+    async def test_reading_stops_at_the_reply_cap(self) -> None:
+        pulled = 0
+        chunk = b"x" * (1024 * 1024)
+
+        async def endless():
+            nonlocal pulled
+            for _ in range(100):
+                pulled += 1
+                yield chunk
+
+        def huge(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, content=endless())
+
+        with pytest.raises(EngineError) as err:
+            await self.client(huge).poll("zimage", "job_1")
+        assert err.value.code == "engine_protocol"
+        assert "16 MiB" in err.value.message
+        assert MAX_REPLY_BYTES == 16 * 1024 * 1024
+        assert pulled <= 17
+
+    async def test_a_reply_just_under_the_cap_is_read_whole(self) -> None:
+        body = json.dumps(
+            {"status": "queued", "pad": "x" * (MAX_REPLY_BYTES - 100)}
+        ).encode()
+        assert len(body) < MAX_REPLY_BYTES
+
+        def big(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, content=body)
+
+        assert (await self.client(big).poll("zimage", "job_1")).status == "queued"
+
+
+@pytest.mark.anyio
+class TestEngineOverARealSocket:
+    async def test_a_full_exchange_over_a_unix_socket(self, socket_dir: Path) -> None:
+        path = str(socket_dir / "engine.sock")
+        engine = FakeEngine()
+        with serve_engine(engine, path):
+            client = EngineClient(path)
+            assert (await client.status()).engine == "zimage"
+            job_id = await client.submit(image_request(steps=3))
+            seen = []
+            while (state := await client.poll("zimage", job_id)).status != "completed":
+                seen.append((state.status, state.step))
+            assert seen == [
+                ("queued", None),
+                ("generating", 1),
+                ("generating", 2),
+                ("generating", 3),
+            ]
+            assert base64.b64decode(state.image_b64) == webp("wide")
+            assert await client.kill() is True
+        assert all(h["host"] == "engine" for h in engine.headers)
+        assert all(h["connection"] == "close" for h in engine.headers)
+
+    async def test_a_missing_socket_is_unreachable(self, socket_dir: Path) -> None:
+        with pytest.raises(EngineError) as err:
+            await EngineClient(str(socket_dir / "absent.sock")).status()
+        assert err.value.code == "engine_unreachable"
+
+    async def test_a_socket_nobody_listens_on_is_unreachable(
+        self, bound_socket: str
+    ) -> None:
+        with pytest.raises(EngineError) as err:
+            await EngineClient(bound_socket).status()
+        assert err.value.code == "engine_unreachable"
+
+    async def test_a_slow_start_is_waited_for(self, socket_dir: Path) -> None:
+        path = str(socket_dir / "engine.sock")
+        engine = FakeEngine(model=None)
+        engine.submit_delay = 0.3
+        with serve_engine(engine, path):
+            assert (await EngineClient(path).status()).state == "idle"
+            assert await EngineClient(path).submit(image_request()) == "job_00000001"
+            assert (await EngineClient(path).status()).state == "ready"

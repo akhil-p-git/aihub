@@ -62,6 +62,29 @@ class Provider(Protocol):
     def stream(self, req: GenRequest) -> AsyncIterator[Event]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ImageRequest:
+    """One image for the engine. The seed is always explicit: the engine's own default is a fixed 42."""
+
+    model_id: str  # the engine's name for the model, e.g. "zimage"
+    prompt: str
+    width: int
+    height: int
+    seed: int
+    steps: int
+    sample_method: str | None
+    reference_webp: bytes | None = None  # an image to edit
+
+
+@dataclass(frozen=True, slots=True)
+class Progress:
+    """Where an image job is: waiting, starting, queued, sampling or finishing (step and steps only while sampling)."""
+
+    phase: str
+    step: int | None = None
+    steps: int | None = None
+
+
 STATUS_CODES = {
     400: "bad_request",
     401: "auth",
