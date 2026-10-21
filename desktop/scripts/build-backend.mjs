@@ -568,11 +568,18 @@ export async function extract(archive, work) {
 }
 
 /** The CPython version the archive holds, from its headers (read before include/ is pruned). */
-function readPythonVersion(work) {
-  const header = readFileSync(join(work, "include", `python${PYTHON_MINOR}`, "patchlevel.h"), "utf8");
-  const version = /^#define\s+PY_VERSION\s+"([^"]+)"/m.exec(header)?.[1];
-  if (version !== PYTHON_VERSION)
-    throw new BuildError(`the archive holds CPython ${version}, expected ${PYTHON_VERSION}`);
+export function readPythonVersion(work) {
+  const header = join("include", `python${PYTHON_MINOR}`, "patchlevel.h");
+  let text;
+  try {
+    text = readFileSync(join(work, header), "utf8");
+  } catch {
+    throw new BuildError(`the archive has no ${header}, so its CPython version cannot be checked`);
+  }
+  const version = /^#define\s+PY_VERSION\s+"([^"]+)"/m.exec(text)?.[1];
+  if (version !== PYTHON_VERSION) {
+    throw new BuildError(`the archive holds CPython ${version ?? "of unknown version"}, expected ${PYTHON_VERSION}`);
+  }
   return version;
 }
 
@@ -633,15 +640,14 @@ export async function installDependencies(target, work, requirements) {
 }
 
 /** Copies app/aihub_web into site-packages, without bytecode. Returns the number of files copied. */
-function copyApp(work) {
-  const source = join(repoRoot, "app", "aihub_web");
+export function copyApp(work, source = join(repoRoot, "app", "aihub_web")) {
   const dest = join(work, "lib", `python${PYTHON_MINOR}`, "site-packages", "aihub_web");
   const wanted = (path) => basename(path) !== "__pycache__" && !path.endsWith(".pyc");
   cpSync(source, dest, { recursive: true, force: false, errorOnExist: true, filter: wanted });
   return measure(dest).files;
 }
 
-function measure(root) {
+export function measure(root) {
   let files = 0;
   let symlinks = 0;
   let bytes = 0;

@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -36,6 +37,7 @@ import {
   auditPayload,
   buildAtomically,
   canRunTarget,
+  copyApp,
   downloadFile,
   exportRequirements,
   extract,
@@ -43,9 +45,11 @@ import {
   fetchVerified,
   finishPayload,
   installDependencies,
+  measure,
   parseTarget,
   pbsAgeDays,
   prune,
+  readPythonVersion,
   requiredFiles,
   sha256File,
   shouldPrune,
@@ -222,7 +226,8 @@ describe("parseTarget", () => {
   });
 
   it("refuses a missing, unknown or extra argument with status 2 and says what is accepted", () => {
-    for (const args of [[], ["windows-x64"], ["linux-x64", "mac-x64"], ["--help"]]) {
+    const names = ["toString", "__proto__", "constructor", "hasOwnProperty", ""]; // keys every object has
+    for (const args of [[], ["windows-x64"], ["linux-x64", "mac-x64"], ["--help"], ...names.map((name) => [name])]) {
       assert.throws(
         () => parseTarget(args),
         (err) => err instanceof BuildError && err.status === 2 && /linux-x64.*mac-arm64.*mac-x64/.test(err.message),
@@ -296,6 +301,7 @@ describe("shouldPrune", () => {
     "lib/tcl9/9.0/http-2.10.0.tm",
     "lib/tk9.0/tk.tcl",
     "lib/itcl4.3.8/itcl.tcl",
+    "lib/tdbc1.1.10/tdbc.tcl",
     "lib/thread3.0.6/pkgIndex.tcl",
     "lib/libtcl9.0.so",
     "lib/libtcl9tk9.0.dylib",
@@ -387,6 +393,21 @@ describe("prune", () => {
     ]);
     const interpreter = elf("libm.so.6", "libc.so.6");
     writeFileSync(join(root, "bin/python3.12"), interpreter);
+    // The files and symlinks that go, so that the bytes can be added up from their sizes before they are deleted.
+    const going = [
+      "bin/python3",
+      "bin/pip",
+      "include/python3.12/Python.h",
+      "lib/libpython3.12.so.1.0",
+      "lib/libpython3.12.so",
+      "lib/tcl9.0/init.tcl",
+      "lib/python3.12/__pycache__/os.cpython-312.pyc",
+      "lib/python3.12/lib-dynload/_dbm.cpython-312-darwin.so",
+      "lib/python3.12/site-packages/.lock",
+      "lib/python3.12/site-packages/bin/uvicorn",
+      "lib/python3.12/site-packages/pkg/__pycache__/mod.cpython-312.pyc",
+    ];
+    const goingBytes = going.reduce((sum, rel) => sum + lstatSync(join(root, rel)).size, 0);
 
     const { entries, bytes } = prune(root);
 
@@ -405,7 +426,7 @@ describe("prune", () => {
     assert.deepEqual(readFileSync(join(root, "bin/python3.12")), interpreter);
     // bin/python3, bin/pip, include, 2 x libpython, lib/tcl9.0, 2 x __pycache__, _dbm, .lock, site-packages/bin
     assert.equal(entries, 11);
-    assert.ok(bytes > 0);
+    assert.equal(bytes, goingBytes);
   });
 
   it("does not follow a symlink out of the payload", () => {
@@ -459,8 +480,8 @@ describe("prune and the shared libraries it removes", () => {
   it("lets files that stay mention a name without linking it", () => {
     lay(root(), [...withLibpython, "lib/python3.12/os.py"]);
     mkdirSync(join(root(), "bin"));
-    // a source file that talks about the library (sysconfig data does)
-    writeFileSync(join(root(), "lib/python3.12/_sysconfigdata.py"), "LDLIBRARY = 'libpython3.12.so.1.0'\0\n");
+    // a file that is not a binary, with the name in it as a loader would read it: only ELF and Mach-O files count
+    writeFileSync(join(root(), "lib/python3.12/_sysconfigdata.py"), "LDLIBRARY\0libpython3.12.so.1.0\0\n");
     // a binary with a longer name that only starts the same, and one that links only what stays
     writeFileSync(join(root(), "bin/python3.12"), elf("libpython3.12.so.1.0.1", "libm.so.6"));
     prune(root());
@@ -539,9 +560,22 @@ describe("auditPayload", () => {
     assert.match(messageFor(good.filter((e) => !e.startsWith("bin/"))), /missing bin\/python3\.12/);
   });
 
-  it("names a world-writable file", () => {
-    const message = messageFor(good, (root) => chmodSync(join(root, "lib/python3.12/site-packages/pkg/mod.py"), 0o666));
+  it("names a world-writable file, and not one that only its group can write", () => {
+    const mod = "lib/python3.12/site-packages/pkg/mod.py";
+    const message = messageFor(good, (root) => chmodSync(join(root, mod), 0o646));
     assert.match(message, /world-writable: lib\/python3\.12\/site-packages\/pkg\/mod\.py/);
+    assert.equal(
+      messageFor(good, (root) => chmodSync(join(root, mod), 0o664)),
+      null,
+    );
+  });
+
+  it("lists the first five problems and counts the rest", () => {
+    const pyc = (count) => Array.from({ length: count }, (_, i) => `lib/python3.12/a${i}.pyc`);
+    const listed = [0, 1, 2, 3, 4].map((i) => `left over: lib/python3.12/a${i}.pyc`).join("; ");
+    assert.equal(messageFor([...good, ...pyc(5)]), `payload check failed: ${listed}`);
+    assert.equal(messageFor([...good, ...pyc(6)]), `payload check failed: ${listed} (and 1 more)`);
+    assert.equal(messageFor([...good, ...pyc(7)]), `payload check failed: ${listed} (and 2 more)`);
   });
 
   it("names bytecode or another entry the prune should have removed", () => {
@@ -565,6 +599,20 @@ describe("auditPayload", () => {
     assert.match(
       messageFor([...good, "lib/link-c -> ../../outside"], (root) => lay(dirname(root), ["outside"])),
       /symlink leaves the payload: lib\/link-c -> \.\.\/\.\.\/outside/,
+    );
+  });
+});
+
+describe("auditPayload and a sibling folder", () => {
+  it("names a symlink into a folder next to the payload whose name only starts like the payload's", () => {
+    const root = join(scratch, "pay");
+    lay(root, ["bin/python3.12", "lib/link -> ../../pay-evil/secret"]);
+    lay(scratch, ["pay-evil/secret"]);
+    assert.throws(
+      () => auditPayload(root, ["bin/python3.12"]),
+      (err) =>
+        err instanceof BuildError &&
+        /symlink leaves the payload: lib\/link -> \.\.\/\.\.\/pay-evil\/secret/.test(err.message),
     );
   });
 });
@@ -613,8 +661,17 @@ describe("buildAtomically", () => {
   it("removes what a killed run of the same target left, but not another target's or a live run's", async () => {
     const parent = join(scratch, "payload");
     const gone = spawnSync(process.execPath, ["-e", ""]).pid; // a process id that is free again
-    const leftovers = [`.build-linux-x64-${gone}-0123abcd`, `.old-linux-x64-${gone}-0123abcd`];
-    const kept = [`.build-mac-x64-${gone}-0123abcd`, `.build-linux-x64-${process.pid}-0123abcd`];
+    // The name of a run ends in its pid; a name with no pid is nobody's, and pid 1 is a process of another user.
+    const leftovers = [
+      `.build-linux-x64-${gone}-0123abcd`,
+      `.old-linux-x64-${gone}-0123abcd`,
+      ".build-linux-x64-nopid",
+    ];
+    const kept = [
+      `.build-mac-x64-${gone}-0123abcd`,
+      `.build-linux-x64-${process.pid}-0123abcd`,
+      ".build-linux-x64-1-0123abcd",
+    ];
     lay(
       parent,
       [...leftovers, ...kept].map((dir) => `${dir}/partial`),
@@ -755,6 +812,112 @@ describe("finishPayload", () => {
   });
 });
 
+describe("copyApp", () => {
+  const work = () => join(scratch, "work");
+  const dest = () => join(work(), "lib/python3.12/site-packages/aihub_web");
+  function appSource() {
+    const source = join(scratch, "app", "aihub_web");
+    lay(source, [
+      "__main__.py",
+      "static/index.html",
+      "static/js/app.js",
+      "__pycache__/__main__.cpython-312.pyc",
+      "static/js/__pycache__/app.cpython-312.pyc",
+      "stray.pyc",
+      "pycache_notes.txt",
+      "sub/__pycache__/",
+    ]);
+    return source;
+  }
+
+  it("copies the app with its static folder, leaves out bytecode at every depth, and counts the files", () => {
+    assert.equal(copyApp(work(), appSource()), 4);
+    assert.deepEqual(listing(dest()), [
+      "__main__.py",
+      "pycache_notes.txt",
+      "static",
+      "static/index.html",
+      "static/js",
+      "static/js/app.js",
+      "sub",
+    ]);
+  });
+
+  it("refuses to overwrite a package of that name that is already installed", () => {
+    lay(dest(), ["__main__.py"]);
+    const before = readFileSync(join(dest(), "__main__.py"), "utf8");
+    assert.throws(() => copyApp(work(), appSource()), { code: "ERR_FS_CP_EEXIST" });
+    assert.equal(readFileSync(join(dest(), "__main__.py"), "utf8"), before);
+  });
+
+  it("copies the real app of this repository by default, with its static folder and entry point", () => {
+    assert.ok(copyApp(work()) > 10);
+    assert.ok(existsSync(join(dest(), "__main__.py")));
+    assert.ok(existsSync(join(dest(), "static", "index.html")));
+    const bytecode = listing(dest()).filter((path) => path.includes("__pycache__") || path.endsWith(".pyc"));
+    assert.deepEqual(bytecode, []);
+  });
+});
+
+describe("measure", () => {
+  it("counts files and their bytes, and symlinks apart from both", () => {
+    const root = join(scratch, "tree");
+    lay(root, ["a.txt", "dir/b.txt", "dir/deeper/c.txt", "link -> a.txt", "dir/link2 -> deeper"]);
+    const bytes = ["a.txt", "dir/b.txt", "dir/deeper/c.txt"].reduce(
+      (sum, path) => sum + `contents of ${path}\n`.length,
+      0,
+    );
+    assert.deepEqual(measure(root), { files: 3, symlinks: 2, bytes });
+  });
+});
+
+describe("readPythonVersion", () => {
+  // The lines around the version that a loose pattern could take for it: a comment that quotes the define, and the
+  // define of PY_VERSION_HEX in front of the one of PY_VERSION.
+  const header = (version) =>
+    [
+      "#define PY_MAJOR_VERSION 3",
+      '/* it reads: #define PY_VERSION "1.2.3" */',
+      "#define PY_VERSION_HEX 0x030c0ff0",
+      `#define PY_VERSION "${version}"`,
+      "",
+    ].join("\n");
+  const work = () => join(scratch, "work");
+  const withHeader = (text) => {
+    mkdirSync(join(work(), "include/python3.12"), { recursive: true });
+    writeFileSync(join(work(), "include/python3.12/patchlevel.h"), text);
+  };
+
+  it("returns the version of the pinned release", () => {
+    withHeader(header("3.12.15"));
+    assert.equal(readPythonVersion(work()), "3.12.15");
+  });
+
+  it("refuses an archive that holds another version, naming both", () => {
+    withHeader(header("3.12.14"));
+    assert.throws(
+      () => readPythonVersion(work()),
+      (err) => err instanceof BuildError && err.message === "the archive holds CPython 3.12.14, expected 3.12.15",
+    );
+  });
+
+  it("says so in one line when the header has no version or the archive has no header", () => {
+    withHeader("#define PY_MAJOR_VERSION 3\n");
+    assert.throws(
+      () => readPythonVersion(work()),
+      (err) =>
+        err instanceof BuildError && err.message === "the archive holds CPython of unknown version, expected 3.12.15",
+    );
+    rmSync(join(work(), "include"), { recursive: true });
+    assert.throws(
+      () => readPythonVersion(work()),
+      (err) =>
+        err instanceof BuildError &&
+        err.message === "the archive has no include/python3.12/patchlevel.h, so its CPython version cannot be checked",
+    );
+  });
+});
+
 describe("failureReason", () => {
   it("gives the error line of uv with the cause line after it", () => {
     const output = [
@@ -792,7 +955,7 @@ describe("the age of the release", () => {
   });
 
   it("refuses a tag that is not a date", () => {
-    for (const tag of ["2026-10-03", "20261303", "20260230", "latest"]) {
+    for (const tag of ["2026-10-03", "20261303", "20260230", "latest", "202610031", "x20261003", "20261003x", ""]) {
       assert.throws(() => pbsAgeDays(tag), BuildError, tag);
     }
   });
