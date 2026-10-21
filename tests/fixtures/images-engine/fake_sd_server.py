@@ -142,6 +142,7 @@ def flood() -> None:
         sys.stdout.write(f"untagged line {number}\n")
     log("E", "x" * 300_000)  # one line far longer than any log line sd-server writes
     sys.stderr.write("y" * 300_000 + "\n")
+    log("E", "z" * 5000)  # long, but inside what the launcher reads of a line
     log("E", "last error line")
 
 

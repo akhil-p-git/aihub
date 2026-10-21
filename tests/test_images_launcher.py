@@ -13,6 +13,7 @@ The tests use only the standard library and pytest, so `python3 -m pytest` runs 
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import signal
@@ -404,6 +405,29 @@ def quiet_rig(tmp_path_factory):
         assert rig.starts() == [] and rig.engine_requests() == []
     finally:
         rig.close()
+
+
+def test_the_documented_defaults_are_the_ones_in_the_code():
+    # The ADR and the plan quote these numbers. Only the tests that shorten a timing would notice a change to
+    # a default if nothing pinned it, and the unit sets none.
+    spec = importlib.util.spec_from_file_location("images_launcher", LAUNCHER)
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    assert launcher.TIMES == {
+        "IDLE": 300.0,
+        "BACKOFF": 30.0,
+        "START": 90.0,
+        "GRACE": 5.0,
+        "CLIENT": 30.0,
+        "ENGINE": 60.0,
+    }
+    assert launcher.HEAD_MAX == HEAD_MAX == 16 * 1024
+    assert launcher.BODY_MAX == BODY_MAX == 32 * 1024 * 1024
+    assert launcher.REPLY_MAX == 16 * 1024 * 1024
+    assert launcher.MAX_CONNECTIONS == 16
+    assert launcher.RING == 20
+    assert launcher.LINE_MAX == 1000
+    assert launcher.LOG_LINES_MAX == 200
 
 
 # --- start-up checks: the launcher fails closed with status 78 (EX_CONFIG) ---------------------------
@@ -891,9 +915,13 @@ class TestFailSoft:
         errors = rig.status()["last_error"]
         assert len(errors) == 20
         assert errors[-1] == "[E] last error line --- fake_sd_server.py:1"
+        # a 5000-character line is cut to 1000 characters
+        assert errors[-2] == "[E] " + "z" * 996
         assert all(len(line) <= 1000 for line in errors)
         log = rig.log()
-        assert len(log) < 150_000 and "not logged" in log
+        assert len(log) < 150_000 and log.count("not logged") == 1
+        # the first 200 lines of a start go to the journal, and no more
+        assert log.count("launcher: engine noisy: ") == 200
 
 
 class TestKill:
@@ -1094,6 +1122,7 @@ class TestLogging:
         )
         errors = rig.status()["last_error"]
         assert len(errors) == 20 and all(len(x) <= 1000 for x in errors)
+        assert errors[-2] == "[E] " + "z" * 996
         assert rig.finish("zimage", job_id).json()["status"] == "completed"
         assert len(rig.log()) < 150_000
 
