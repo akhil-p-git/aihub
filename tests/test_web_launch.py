@@ -267,6 +267,16 @@ def test_stopping_mid_reply_keeps_the_partial_reply(
         store.close()
 
 
+def test_closing_stdin_stops_an_idle_server_and_logs_why(launch) -> None:
+    app = launch(stdin=subprocess.PIPE, AIHUB_PORT="0", AIHUB_EXIT_ON_STDIN_EOF="1")
+    app.ready_line()
+    close_stdin(app)
+    assert app.process.wait(timeout=7) in (0, -signal.SIGTERM), app.log()
+    log = app.log()
+    assert "stdin closed, stopping" in log
+    assert "Traceback" not in log and "Fatal Python error" not in log, log
+
+
 def test_a_signal_still_stops_a_server_that_is_watching_stdin(
     launch, occupied_port: int
 ) -> None:
