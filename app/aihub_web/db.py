@@ -8,14 +8,15 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DAY_MS = 86_400_000
 # Columns update_chat may change; the names are interpolated into SQL, so never take them from input.
 EDITABLE_CHAT_COLUMNS = ("title", "model", "effort")
@@ -53,6 +54,28 @@ CREATE TABLE settings (
 );
 """
 
+# Added in version 2. The pixels live in the row, so a reply's images are deleted with the reply, with the
+# chat and with the retention sweep, and secure_delete wipes them like text.
+IMAGES_SCHEMA = """
+CREATE TABLE images (
+    id         TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    chat_id    TEXT NOT NULL,
+    mime       TEXT NOT NULL CHECK (mime = 'image/webp'),
+    width      INTEGER NOT NULL,
+    height     INTEGER NOT NULL,
+    seed       INTEGER NOT NULL,
+    steps      INTEGER NOT NULL,
+    model      TEXT NOT NULL,
+    ref        TEXT,
+    bytes      INTEGER NOT NULL,
+    data       BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX images_message ON images (message_id);
+CREATE INDEX images_chat ON images (chat_id);
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class Chat:
@@ -82,9 +105,24 @@ class Message:
     status: str
     error: dict[str, str] | None
     created_at: int
+    # Metadata of the images in this reply ({id, w, h, seed, steps, model, ref}), never their bytes.
+    images: list[dict[str, object]] | None = None
 
     def to_json(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ImageRow:
+    """An image on its way into the database; `ref` is the image an edit started from."""
+
+    width: int
+    height: int
+    seed: int
+    steps: int
+    model: str
+    data: bytes
+    ref: str | None = None
 
 
 def _like(term: str) -> str:
@@ -103,7 +141,7 @@ def _snippet(text: str, term: str, width: int = 60) -> str:
     return ("…" if start else "") + body + ("…" if end < len(text) else "")
 
 
-def _message(row: sqlite3.Row) -> Message:
+def _message(row: sqlite3.Row, images: list[dict[str, object]] | None) -> Message:
     return Message(
         id=row["id"],
         chat_id=row["chat_id"],
@@ -117,6 +155,7 @@ def _message(row: sqlite3.Row) -> Message:
         status=row["status"],
         error=json.loads(row["error"]) if row["error"] else None,
         created_at=row["created_at"],
+        images=images,
     )
 
 
@@ -145,10 +184,13 @@ class Store:
             raise RuntimeError(
                 f"database schema {version} is newer than this app ({SCHEMA_VERSION})"
             )
-        if version == 0:
+        # A new file gets everything. Version 1 only lacks the images table: the upgrade adds it and
+        # touches nothing else, so there is nothing to back-fill.
+        script = {0: SCHEMA + IMAGES_SCHEMA, 1: IMAGES_SCHEMA}.get(version)
+        if script:
             with self._lock:
                 self._db.executescript(
-                    f"BEGIN;\n{SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+                    f"BEGIN;\n{script}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
                 )
 
     def _now(self) -> int:
@@ -169,6 +211,11 @@ class Store:
         with self._lock:
             self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._db.close()
+
+    def _wipe_wal(self) -> None:
+        """Move deleted pixels out of the write-ahead log: secure_delete only zeroes pages in the main file."""
+        with self._lock:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # chats
 
@@ -234,7 +281,15 @@ class Store:
 
     def delete_chat(self, chat_id: str) -> bool:
         with self._tx() as db:
-            return db.execute("DELETE FROM chats WHERE id = ?", (chat_id,)).rowcount > 0
+            had_images = db.execute(
+                "SELECT EXISTS (SELECT 1 FROM images WHERE chat_id = ?)", (chat_id,)
+            ).fetchone()[0]
+            deleted = (
+                db.execute("DELETE FROM chats WHERE id = ?", (chat_id,)).rowcount > 0
+            )
+        if had_images:
+            self._wipe_wal()
+        return deleted
 
     def delete_all(self) -> int:
         with self._tx() as db:
@@ -269,8 +324,22 @@ class Store:
         usage: dict[str, object] | None = None,
         status: str = "done",
         error: dict[str, str] | None = None,
+        images: Sequence[ImageRow] = (),
     ) -> Message:
+        """Store a message and its images in one transaction: either all of it is kept or none."""
         now = self._now()
+        stored = [
+            {
+                "id": secrets.token_hex(8),
+                "w": image.width,
+                "h": image.height,
+                "seed": image.seed,
+                "steps": image.steps,
+                "model": image.model,
+                "ref": image.ref,
+            }
+            for image in images
+        ]
         with self._tx() as db:
             seq = db.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?",
@@ -289,6 +358,7 @@ class Store:
                 status,
                 error,
                 now,
+                stored or None,
             )
             db.execute(
                 "INSERT INTO messages (id, chat_id, seq, role, content, thinking, model, effort, usage, status, error, created_at)"
@@ -308,6 +378,25 @@ class Store:
                     now,
                 ),
             )
+            for image, meta in zip(images, stored, strict=True):
+                db.execute(
+                    "INSERT INTO images (id, message_id, chat_id, mime, width, height, seed, steps, model, ref,"
+                    " bytes, data, created_at) VALUES (?, ?, ?, 'image/webp', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        meta["id"],
+                        message.id,
+                        chat_id,
+                        image.width,
+                        image.height,
+                        image.seed,
+                        image.steps,
+                        image.model,
+                        image.ref,
+                        len(image.data),
+                        image.data,
+                        now,
+                    ),
+                )
             db.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
         return message
 
@@ -316,11 +405,51 @@ class Store:
             rows = self._db.execute(
                 "SELECT * FROM messages WHERE chat_id = ? ORDER BY seq", (chat_id,)
             ).fetchall()
-        return [_message(r) for r in rows]
+            # Metadata columns only: the bytes stay in the database until get_image asks for them.
+            pictures = self._db.execute(
+                "SELECT id, message_id, width, height, seed, steps, model, ref FROM images"
+                " WHERE chat_id = ? ORDER BY rowid",
+                (chat_id,),
+            ).fetchall()
+        by_message = defaultdict(list)
+        for pic in pictures:
+            by_message[pic["message_id"]].append(
+                {
+                    "id": pic["id"],
+                    "w": pic["width"],
+                    "h": pic["height"],
+                    "seed": pic["seed"],
+                    "steps": pic["steps"],
+                    "model": pic["model"],
+                    "ref": pic["ref"],
+                }
+            )
+        return [_message(r, by_message.get(r["id"])) for r in rows]
+
+    def get_image(self, chat_id: str, image_id: str) -> tuple[str, bytes] | None:
+        """(mime type, bytes) of an image, only when it belongs to that chat."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT mime, data FROM images WHERE id = ? AND chat_id = ?",
+                (image_id, chat_id),
+            ).fetchone()
+        return (row["mime"], row["data"]) if row else None
+
+    def image_bytes_total(self) -> int:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COALESCE(SUM(bytes), 0) FROM images"
+            ).fetchone()[0]
 
     def delete_message(self, message_id: str) -> None:
         with self._tx() as db:
+            had_images = db.execute(
+                "SELECT EXISTS (SELECT 1 FROM images WHERE message_id = ?)",
+                (message_id,),
+            ).fetchone()[0]
             db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        if had_images:
+            self._wipe_wal()
 
     # settings
 
