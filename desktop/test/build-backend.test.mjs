@@ -33,6 +33,7 @@ import {
   ageWarning,
   archiveName,
   archiveUrl,
+  assertHost,
   assertHttps,
   auditPayload,
   buildAtomically,
@@ -237,7 +238,59 @@ describe("parseTarget", () => {
   });
 });
 
+describe("assertHost", () => {
+  it("accepts Linux on an x86-64 CPU", () => {
+    assert.doesNotThrow(() => assertHost("linux", "x64"));
+  });
+
+  it("refuses any other platform or CPU with status 2, naming the machine in one line", () => {
+    for (const [platform, arch] of [
+      ["freebsd", "x64"],
+      ["openbsd", "arm64"],
+      ["linux", "arm64"],
+      ["linux", "ia32"],
+    ]) {
+      assert.throws(
+        () => assertHost(platform, arch),
+        (err) =>
+          err instanceof BuildError &&
+          err.status === 2 &&
+          err.message === `must run on Linux x86_64, not ${platform} ${arch}`,
+        `${platform} ${arch}`,
+      );
+    }
+  });
+});
+
 describe("running the script", () => {
+  // The script runs with a uv that fails at once. A run that these tests expect to be refused then cannot go on to
+  // build a payload in the real desktop/payload folder if the refusal is ever lost: it ends at uv with another status.
+  function runScript(args, nodeArgs = []) {
+    const bin = join(scratch, "uv-that-fails");
+    mkdirSync(bin, { recursive: true });
+    const stub = '#!/bin/sh\necho "uv ran, so the script did not stop before the build" >&2\nexit 99\n';
+    writeFileSync(join(bin, "uv"), stub, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` };
+    return spawnSync(process.execPath, [...nodeArgs, script, ...args], { encoding: "utf8", env });
+  }
+  /** A node option that makes the process report another platform and CPU, as a data: module run before the script. */
+  const pretendHost = (platform, arch) => {
+    const code = `Object.defineProperty(process, "platform", { value: "${platform}" });`;
+    return `--import=data:text/javascript,${encodeURIComponent(`${code} Object.defineProperty(process, "arch", { value: "${arch}" });`)}`;
+  };
+
+  it("exits 2 with a one-line reason on a machine that is not Linux x86_64, before it builds anything", () => {
+    for (const [platform, arch] of [
+      ["freebsd", "x64"],
+      ["linux", "arm64"],
+    ]) {
+      const run = runScript(["linux-x64"], [pretendHost(platform, arch)]);
+      assert.equal(run.status, 2, run.stderr);
+      assert.equal(run.stdout, "");
+      assert.equal(run.stderr, `build-backend: must run on Linux x86_64, not ${platform} ${arch}\n`);
+    }
+  });
+
   it("exits 2 with a one-line message for an unknown target", () => {
     const run = spawnSync(process.execPath, [script, "windows-x64"], { encoding: "utf8" });
     assert.equal(run.status, 2, run.stderr);

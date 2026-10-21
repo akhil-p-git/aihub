@@ -19,11 +19,11 @@
 // RECORD, which loses the lines of the files that the prune removed. Bytecode is not compiled either; the app runs
 // Python with -X pycache_prefix so that nothing is written into the payload.
 //
-// It needs only Node, uv and tar, and uses nothing specific to GNU or Linux, so it is meant to run unchanged on a
-// Mac. To move to another release, change PBS_TAG, PYTHON_VERSION and the three sha256 values (they are in the
-// release's SHA256SUMS file).
+// It needs only Node, uv and tar, and runs only on Linux x86_64. To move to another release, change PBS_TAG,
+// PYTHON_VERSION and the three sha256 values (they are in the release's SHA256SUMS file).
 //
-// Exit status: 0 on success, 2 for a bad command line, 1 for any other failure (one line on stderr says why).
+// Exit status: 0 on success, 2 for a bad command line or a machine that is not Linux x86_64, 1 for any other
+// failure (one line on stderr says why).
 
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -107,6 +107,12 @@ export function parseTarget(args) {
     throw new BuildError(`unknown target "${args[0]}" (expected ${list})`, 2);
   }
   return args[0];
+}
+
+/** Throws a BuildError with status 2 unless this machine is Linux on an x86-64 CPU. */
+export function assertHost(platform = process.platform, arch = process.arch) {
+  if (platform === "linux" && arch === "x64") return;
+  throw new BuildError(`must run on Linux x86_64, not ${platform} ${arch}`, 2);
 }
 
 export function archiveName(target) {
@@ -700,6 +706,7 @@ async function buildTarget(target) {
 export async function main(args) {
   try {
     const target = parseTarget(args);
+    assertHost();
     process.umask(0o022); // the modes of what is built should not depend on the caller's umask
     exitOnInterrupt();
     await buildTarget(target);
