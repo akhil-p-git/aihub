@@ -127,6 +127,23 @@ export class Backend extends EventEmitter {
   }
 
   /**
+   * Whether the backend process is running. This turns false the moment the process has died, which can be some
+   * milliseconds before "exit" is emitted, because Node learns of a death only when its event loop gets to it. A
+   * process that has died and not been collected yet is a zombie, and /proc shows that at once.
+   */
+  isAlive() {
+    const child = this.#child;
+    if (child === null || child.exitCode !== null || child.signalCode !== null) return false;
+    try {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, "latin1");
+      // The state letter follows the process name, which sits in parentheses and may hold some itself.
+      return !/^[ZX]/.test(stat.slice(stat.lastIndexOf(")") + 2));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Starts the backend and resolves with its port, its origin and its launch token once it has printed its
    * ready line. The token is the one this spawn was given: the caller has to put it in the page's cookie,
    * and it is worth nothing to the next backend, which makes its own.

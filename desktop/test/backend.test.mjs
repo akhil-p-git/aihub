@@ -645,6 +645,39 @@ describe("a stand-in interpreter", () => {
     assert.deepEqual(exits, [{ code: null, signal: "SIGTERM" }]);
   });
 
+  it("tells that the process is gone at once, before the exit event has had its turn", async (t) => {
+    const r = rig(t, { stub: `${READY_LINE}\nexec sleep 1000` });
+    const { backend } = r.make();
+    const exits = [];
+    backend.on("exit", (event) => exits.push(event));
+    assert.equal(backend.isAlive(), false, "nothing runs before start()");
+    await backend.start();
+    assert.equal(backend.isAlive(), true);
+    const pid = backend.pid;
+
+    process.kill(pid, "SIGKILL");
+    // This loop keeps the event loop from running, so the exit cannot be handled yet and the dead process stays a
+    // zombie: it is still in the process table, and /proc says so.
+    const deadline = performance.now() + 5000;
+    while (isAlive(pid) && performance.now() < deadline);
+    assert.equal(isAlive(pid), false, "the process was still running 5 s after SIGKILL");
+    assert.equal(backend.isAlive(), false, "a dead process counts as running until its exit event");
+    assert.equal(exits.length, 0, "the event loop has not run, so the exit event cannot have come");
+    assert.equal(backend.pid, pid, "the exit has not been handled");
+
+    await until(() => exits.length === 1, 10_000, "the exit event");
+    assert.equal(backend.isAlive(), false);
+  });
+
+  it("is not alive after stop()", async (t) => {
+    const r = rig(t, { stub: `${READY_LINE}\nexec sleep 1000` });
+    const { backend } = r.make();
+    await backend.start();
+    assert.equal(backend.isAlive(), true);
+    await backend.stop();
+    assert.equal(backend.isAlive(), false);
+  });
+
   it("can be stopped before it starts, twice at once, and again afterwards", async (t) => {
     const r = rig(t, { stub: `${READY_LINE}\nexec sleep 1000` });
     const { backend } = r.make();

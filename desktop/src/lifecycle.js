@@ -46,9 +46,13 @@ export class Lifecycle {
     return this.#origin;
   }
 
-  /** Whether the window may ask for `url`: it must be a page of the backend that is up. */
+  /**
+   * Whether the window may ask for `url`: it must be a page of the backend that is up, and that backend must still
+   * run. The exit event comes some milliseconds after the death, and a request in between would reach whatever
+   * binds the freed port.
+   */
   allows(url) {
-    return this.#origin !== null && allowsRequest(url, this.#origin);
+    return this.#origin !== null && allowsRequest(url, this.#origin) && this.#backend.isAlive();
   }
 
   /** From here on the app is leaving: a backend that ends is expected to, and no dialog follows. */

@@ -21,7 +21,8 @@ const settle = async () => {
 /**
  * A Lifecycle on stand-ins. `log` holds, in order, everything they were asked to do, as { type, ... }.
  * `backend.willStart(...)` queues what the next starts answer: a reply, or an Error to fail with.
- * `backend.die()` ends the running backend the way a crash does: its origin goes, then "exit" is emitted.
+ * `backend.die()` ends the running backend the way a crash does: it is no longer alive and its origin goes, then
+ * "exit" is emitted. Setting `backend.alive = false` alone is the moment between the process dying and Node saying so.
  */
 function rig() {
   const log = [];
@@ -30,6 +31,7 @@ function rig() {
 
   const backend = Object.assign(new EventEmitter(), {
     origin: null,
+    alive: false,
     logPath: LOG_PATH,
     queue: [],
     willStart(...answers) {
@@ -40,9 +42,14 @@ function rig() {
       const answer = this.queue.shift();
       if (answer instanceof Error) throw answer;
       this.origin = answer.origin;
+      this.alive = true;
       return answer;
     },
+    isAlive() {
+      return this.alive;
+    },
     die(event = { code: null, signal: "SIGKILL" }) {
+      this.alive = false;
       this.origin = null;
       this.emit("exit", event);
     },
@@ -199,6 +206,7 @@ describe("the first start", () => {
       r.log.push({ type: "backend-start" });
       await new Promise((resolve) => (release = resolve));
       r.backend.origin = "http://127.0.0.1:4001";
+      r.backend.alive = true;
       return reply(4001, "token-one");
     };
     const done = r.lifecycle.start();
@@ -416,6 +424,14 @@ describe("allows", () => {
     await r.up(4001);
     for (const url of PAGES) assert.equal(r.lifecycle.allows(url), true, url);
     for (const url of ELSEWHERE) assert.equal(r.lifecycle.allows(url), false, url);
+  });
+
+  it("refuses everything once the backend process is gone, before its exit has reached the Lifecycle", async () => {
+    const r = rig();
+    await r.up(4001);
+    r.backend.alive = false;
+    assert.equal(r.lifecycle.origin, "http://127.0.0.1:4001", "the exit has not been handled yet");
+    for (const url of PAGES) assert.equal(r.lifecycle.allows(url), false, url);
   });
 
   it("refuses everything from the moment the backend has ended", async () => {
