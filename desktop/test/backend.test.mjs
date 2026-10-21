@@ -508,7 +508,10 @@ describe("the real backend", () => {
   );
 
   for (const [name, makeEnv] of [
-    ["a Finder-like environment", (dir) => ({ PATH: "/usr/bin:/bin", HOME: dir, USER: "tester", TMPDIR: dir })],
+    [
+      "an environment with only PATH, HOME, USER and TMPDIR",
+      (dir) => ({ PATH: "/usr/bin:/bin", HOME: dir, USER: "tester", TMPDIR: dir }),
+    ],
     ["an environment with nothing but PATH", () => ({ PATH: "/usr/bin:/bin" })],
   ]) {
     it(`still starts in ${name}`, { timeout: 60_000 }, async (t) => {

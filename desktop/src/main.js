@@ -35,8 +35,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", showWindow);
-  app.on("activate", showWindow);
-  // Closing the last window quits, on every platform: a backend without a window has no use.
+  // Closing the last window quits: a backend without a window has no use.
   app.on("window-all-closed", () => app.quit());
   app.on("before-quit", stopBackendThenQuit);
   app.whenReady().then(main).catch(fatal);
@@ -55,7 +54,7 @@ async function main() {
     applicationVersion: `${version} (${aihubCommit || "dev"})`,
     copyright: `Electron ${process.versions.electron}, Chromium ${process.versions.chrome}`,
   });
-  Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate(process.platform, app.isPackaged)));
+  Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate(app.isPackaged)));
 
   backend = new Backend({
     userData: app.getPath("userData"),

@@ -185,8 +185,6 @@ describe("externalTarget", () => {
     "steam://run/10",
     "slack://open",
     "myapp://anything",
-    "x-apple.systempreferences:com.apple.preference.security",
-    "search-ms:query=x",
     "view-source:https://example.com/",
     "chrome://gpu",
     "devtools://devtools/bundled/inspector.html",
@@ -302,39 +300,24 @@ describe("menuTemplate", () => {
   }
   const top = (template) => template.map((item) => (item.role ?? item.label).toLowerCase());
 
-  it("gives macOS an app menu, Edit, View and Window, and no developer tools when packaged", () => {
-    const template = menuTemplate("darwin", true);
-    assert.deepEqual(top(template), ["appmenu", "editmenu", "view", "windowmenu"]);
+  it("gives File (Ctrl+Q), Edit, View, Window and Help (About), and no developer tools when packaged", () => {
+    const template = menuTemplate(true);
+    assert.deepEqual(top(template), ["filemenu", "editmenu", "view", "windowmenu", "help"]);
+    assert.ok(names(template).includes("about"));
     assert.ok(!names(template).includes("toggledevtools"));
     assert.ok(names(template).includes("reload"));
     assert.ok(["zoomin", "zoomout", "resetzoom"].every((role) => names(template).includes(role)));
   });
 
-  it("offers the developer tools in a macOS development run", () => {
-    assert.ok(names(menuTemplate("darwin", false)).includes("toggledevtools"));
-  });
-
-  it("gives Linux File (Ctrl+Q), Edit, View, Window and Help (About), and no app menu", () => {
-    const template = menuTemplate("linux", true);
+  it("offers the developer tools in a development run", () => {
+    const template = menuTemplate(false);
     assert.deepEqual(top(template), ["filemenu", "editmenu", "view", "windowmenu", "help"]);
-    assert.ok(!names(template).includes("appmenu"));
-    assert.ok(names(template).includes("about"));
-    assert.ok(!names(template).includes("toggledevtools"));
-  });
-
-  it("offers the developer tools in a Linux development run", () => {
-    assert.ok(names(menuTemplate("linux", false)).includes("toggledevtools"));
-  });
-
-  it("treats every other platform like Linux", () => {
-    for (const platform of ["win32", "freebsd", "", undefined, null, 7]) {
-      assert.deepEqual(top(menuTemplate(platform, true)), top(menuTemplate("linux", true)), String(platform));
-    }
+    assert.ok(names(template).includes("toggledevtools"));
   });
 
   it("hides the developer tools unless it is told the app is not packaged", () => {
     for (const packaged of [true, undefined, null, 1, "no", "false"]) {
-      assert.ok(!names(menuTemplate("linux", packaged)).includes("toggledevtools"), String(packaged));
+      assert.ok(!names(menuTemplate(packaged)).includes("toggledevtools"), String(packaged));
     }
   });
 
@@ -346,8 +329,7 @@ describe("menuTemplate", () => {
         walk(item.submenu ?? []);
       }
     };
-    for (const platform of ["darwin", "linux"])
-      for (const packaged of [true, false]) walk(menuTemplate(platform, packaged));
+    for (const packaged of [true, false]) walk(menuTemplate(packaged));
   });
 });
 

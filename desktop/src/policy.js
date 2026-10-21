@@ -54,13 +54,12 @@ export function externalTarget(url, origin) {
 }
 
 /**
- * The application menu as an Electron template of roles, which the platform fills in.
+ * The application menu as an Electron template of roles, which Electron fills in.
  *
- * Linux has no app menu, so File carries Quit (Ctrl+Q) and Help carries About. The developer tools
- * are offered only when `isPackaged` is false; anything else, including a missing value, hides them.
+ * File carries Quit (Ctrl+Q) and Help carries About. The developer tools are offered only when
+ * `isPackaged` is false; anything else, including a missing value, hides them.
  */
-export function menuTemplate(platform, isPackaged) {
-  const mac = platform === "darwin";
+export function menuTemplate(isPackaged) {
   const view = {
     label: "View",
     submenu: [
@@ -76,11 +75,11 @@ export function menuTemplate(platform, isPackaged) {
     ],
   };
   return [
-    mac ? { role: "appMenu" } : { role: "fileMenu" },
+    { role: "fileMenu" },
     { role: "editMenu" },
     view,
     { role: "windowMenu" },
-    ...(mac ? [] : [{ role: "help", submenu: [{ role: "about" }] }]),
+    { role: "help", submenu: [{ role: "about" }] },
   ];
 }
 
