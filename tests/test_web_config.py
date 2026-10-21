@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from aihub_web.config import Config, ConfigError, load_config, secret
+from aihub_web.config import Config, ConfigError, ImagesConfig, load_config, secret
 
 EXAMPLE = Path(__file__).parents[1] / "config" / "web.example.yaml"
 
@@ -123,3 +123,118 @@ def test_secret_ignores_blank_values() -> None:
     assert secret("K", {"K": "  sk-1  "}) == "sk-1"
     assert secret("K", {"K": "   "}) is None
     assert secret("K", {}) is None
+
+
+class TestImages:
+    def test_image_generation_is_off_until_a_socket_is_named(self) -> None:
+        assert Config().images.socket is None
+
+    def test_the_shipped_models(self) -> None:
+        zimage, klein = ImagesConfig().models
+        assert (zimage.id, zimage.steps, zimage.sample_method, zimage.edits) == (
+            "zimage",
+            8,
+            None,
+            False,
+        )
+        assert (klein.id, klein.steps, klein.sample_method, klein.edits) == (
+            "klein4b",
+            4,
+            "euler",
+            True,
+        )
+        assert zimage.est_s.model_dump() == {"square": 23, "wide": 12, "tall": 12}
+        assert klein.est_s.model_dump() == {"square": 8, "wide": 5, "tall": 5}
+
+    def test_a_socket_and_models_load_from_the_file(self, tmp_path: Path) -> None:
+        path = write(
+            tmp_path,
+            {
+                "images": {
+                    "socket": "/run/user/1000/aihub-images/engine.sock",
+                    "models": [
+                        {
+                            "id": "fast-one",
+                            "name": "Fast one",
+                            "steps": 2,
+                            "est_s": {"square": 3, "wide": 2.5, "tall": 2.5},
+                        }
+                    ],
+                }
+            },
+        )
+        images = load_config(path, {}).images
+        assert images.socket == "/run/user/1000/aihub-images/engine.sock"
+        [model] = images.models
+        assert (model.id, model.edits, model.note, model.sample_method) == (
+            "fast-one",
+            False,
+            "",
+            None,
+        )
+        assert model.est_s.wide == 2.5
+
+    @pytest.mark.parametrize(
+        "socket", ["engine.sock", "~/engine.sock", "./run/engine.sock", ""]
+    )
+    def test_the_socket_must_be_an_absolute_path(
+        self, tmp_path: Path, socket: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="images.socket"):
+            load_config(write(tmp_path, {"images": {"socket": socket}}), {})
+
+    @pytest.mark.parametrize(
+        "model_id", ["", "Zimage", "z_image", "a/b", "../etc", "x" * 33, "a b"]
+    )
+    def test_model_ids_are_short_lowercase_words(
+        self, tmp_path: Path, model_id: str
+    ) -> None:
+        model = {
+            "id": model_id,
+            "name": "M",
+            "steps": 4,
+            "est_s": {"square": 1, "wide": 1, "tall": 1},
+        }
+        with pytest.raises(ConfigError, match=r"images\.models\.0\.id"):
+            load_config(write(tmp_path, {"images": {"models": [model]}}), {})
+
+    def test_model_ids_are_unique(self, tmp_path: Path) -> None:
+        model = {
+            "id": "same",
+            "name": "M",
+            "steps": 4,
+            "est_s": {"square": 1, "wide": 1, "tall": 1},
+        }
+        path = write(tmp_path, {"images": {"models": [model, model]}})
+        with pytest.raises(ConfigError, match="same"):
+            load_config(path, {})
+
+    @pytest.mark.parametrize(
+        "est_s",
+        [
+            {"square": 1, "wide": 1},
+            {"square": 1, "wide": 1, "tall": 1, "huge": 1},
+            {"square": 0, "wide": 1, "tall": 1},
+        ],
+    )
+    def test_every_shape_needs_a_positive_estimate(
+        self, tmp_path: Path, est_s: dict
+    ) -> None:
+        model = {"id": "m", "name": "M", "steps": 4, "est_s": est_s}
+        with pytest.raises(ConfigError, match="est_s"):
+            load_config(write(tmp_path, {"images": {"models": [model]}}), {})
+
+    def test_typos_in_the_images_block_are_errors(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="sockett"):
+            load_config(write(tmp_path, {"images": {"sockett": "/x"}}), {})
+
+    @pytest.mark.parametrize(
+        "default_models",
+        [["images/zimage"], ["ollama/qwen3:8b", "images/klein4b"]],
+    )
+    def test_an_image_model_can_never_be_the_default(
+        self, tmp_path: Path, default_models: list[str]
+    ) -> None:
+        path = write(tmp_path, {"default_models": default_models})
+        with pytest.raises(ConfigError, match="default_models can't include an image"):
+            load_config(path, {})

@@ -97,6 +97,66 @@ class AnthropicConfig(_Section):
     max_tokens_deep: int = Field(64_000, ge=1024)
 
 
+class ImageEstimates(_Section):
+    """Seconds one image takes on a warm engine, per shape: the picker's hint, and (with 3x and a minute) the job's time limit."""
+
+    square: int | float = Field(gt=0)
+    wide: int | float = Field(gt=0)
+    tall: int | float = Field(gt=0)
+
+
+class ImageModel(_Section):
+    # Also a path component for the engine launcher, hence the strict pattern.
+    id: str = Field(pattern=r"^[a-z0-9-]{1,32}$")
+    name: str
+    steps: int = Field(ge=1)
+    sample_method: str | None = None
+    edits: bool = False
+    note: str = ""
+    est_s: ImageEstimates
+
+
+DEFAULT_IMAGE_MODELS = (
+    ImageModel(
+        id="zimage",
+        name="Z-Image Turbo",
+        steps=8,
+        note="Best with text in images.",
+        est_s=ImageEstimates(square=23, wide=12, tall=12),
+    ),
+    ImageModel(
+        id="klein4b",
+        name="FLUX.2 klein 4B",
+        steps=4,
+        sample_method="euler",
+        edits=True,
+        note="Fast drafts; edits images; text often misspelled.",
+        est_s=ImageEstimates(square=8, wide=5, tall=5),
+    ),
+)
+
+
+class ImagesConfig(_Section):
+    # The image engine's Unix socket. Unset means there is no image feature at all.
+    socket: str | None = None
+    # The first model is the default image model.
+    models: tuple[ImageModel, ...] = DEFAULT_IMAGE_MODELS
+
+    @field_validator("socket")
+    @classmethod
+    def _absolute(cls, value: str | None) -> str | None:
+        if value is not None and not Path(value).is_absolute():
+            raise ValueError(f"must be an absolute path, got {value!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _unique(self) -> Self:
+        ids = [model.id for model in self.models]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"model ids must be unique, got {ids}")
+        return self
+
+
 class Limits(_Section):
     max_message_chars: int = Field(100_000, ge=1)
     # History sent to cloud models is trimmed to this many (estimated) tokens to bound the cost of a turn.
@@ -119,6 +179,7 @@ class Config(_Section):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     anthropic: AnthropicConfig = Field(default_factory=AnthropicConfig)
+    images: ImagesConfig = Field(default_factory=ImagesConfig)
     limits: Limits = Field(default_factory=Limits)
 
     @field_validator("state_dir")
@@ -136,6 +197,11 @@ class Config(_Section):
         if not self.default_models:
             problems.append("default_models is empty")
         for model in self.default_models:
+            if model.startswith("images/"):
+                problems.append(
+                    f"default_models can't include an image model, got {model!r}"
+                )
+                continue
             is_local = model.startswith("ollama/")
             is_free = model.startswith("openrouter/") and model.endswith(":free")
             if not (is_local or is_free):
