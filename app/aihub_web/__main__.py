@@ -77,7 +77,11 @@ def main() -> None:
             timeout_graceful_shutdown=5,
         )
     )
-    server.run()
+    # After Ctrl+C has stopped the server gracefully, uvicorn raises KeyboardInterrupt out of Server.run.
+    # uvicorn.run swallows it, so Ctrl+C ends with status 0 and no traceback; calling Server.run leaves
+    # that to us.
+    with contextlib.suppress(KeyboardInterrupt):
+        server.run()
     # uvicorn.run ends with this check; calling Server.run directly leaves it to us.
     if not server.started:
         sys.exit(STARTUP_FAILURE)

@@ -171,8 +171,34 @@ def test_without_any_new_variable_the_service_path_is_unchanged(
     assert app.stdout_rest() == ""
 
 
-def test_closing_stdin_stops_the_server_and_keeps_the_partial_reply(
-    launch, occupied_port: int, tmp_path: Path
+def close_stdin(app: Launch) -> None:
+    """What the kernel does when the parent that owns the pipe dies."""
+    assert app.process.stdin is not None
+    app.process.stdin.close()
+
+
+def interrupt(app: Launch) -> None:
+    """What Ctrl+C sends to a server started in a terminal."""
+    app.process.send_signal(signal.SIGINT)
+
+
+@pytest.mark.parametrize(
+    ("stop", "statuses", "forbidden"),
+    [
+        (close_stdin, (0, -signal.SIGTERM), ("Traceback", "Fatal Python error")),
+        # SIGINT does not end the process the instant the shutdown is done, as SIGTERM does, so the
+        # request uvicorn cancelled after the grace period logs its CancelledError. uvicorn.run did too.
+        (interrupt, (0,), ("KeyboardInterrupt", "Fatal Python error")),
+    ],
+    ids=["stdin closed", "SIGINT"],
+)
+def test_stopping_mid_reply_keeps_the_partial_reply(
+    launch,
+    occupied_port: int,
+    tmp_path: Path,
+    stop,
+    statuses: tuple[int, ...],
+    forbidden: tuple[str, ...],
 ) -> None:
     app = launch(
         stdin=subprocess.PIPE,
@@ -193,17 +219,16 @@ def test_closing_stdin_stops_the_server_and_keeps_the_partial_reply(
             if streamed.count("word") >= 3:
                 break
         deadline = time.monotonic() + 7
-        assert app.process.stdin is not None
-        app.process.stdin.close()  # what the kernel does when the parent that owns the pipe dies
+        stop(app)
         # Once the grace period is over the server drops the connection mid-stream.
         with contextlib.suppress(httpx2.RemoteProtocolError):
             for _ in lines:
                 pass
     status = app.process.wait(timeout=max(deadline - time.monotonic(), 0.1))
-    assert status in (0, -signal.SIGTERM), app.log()
+    assert status in statuses, app.log()
 
     log = app.log()
-    assert "Traceback" not in log and "Fatal Python error" not in log, log
+    assert all(text not in log for text in forbidden), log
     store = Store(tmp_path / "state" / "chats.db")
     try:
         [chat] = store.list_chats()
@@ -229,6 +254,17 @@ def test_a_signal_still_stops_a_server_that_is_watching_stdin(
     app.stop()
     log = app.log()
     assert "Traceback" not in log and "Fatal Python error" not in log, log
+
+
+def test_sigint_ends_the_server_cleanly(start) -> None:
+    """Ctrl+C on the README's throwaway instance ended with status 0 and no traceback under uvicorn.run."""
+    app = start(AIHUB_PORT="0")
+    app.ready_line()
+    interrupt(app)
+    assert app.process.wait(timeout=20) == 0, app.log()
+    log = app.log()
+    assert "Traceback" not in log and "Fatal Python error" not in log, log
+    assert app.stdout_rest() == ""
 
 
 def test_a_taken_port_exits_3_without_a_ready_line(start, occupied_port: int) -> None:
