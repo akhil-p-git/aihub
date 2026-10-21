@@ -29,7 +29,7 @@ export class Lifecycle {
   #repeats = 0;
 
   /**
-   * - backend: the Backend: start(), origin, logPath and an "exit" event.
+   * - backend: the Backend: start(), isAlive(), origin, logPath and an "exit" event.
    * - window: the BrowserWindow that shows the loading page and then the backend's page.
    * - cookies: the cookie jar of the window's session: set(cookie) and remove(url, name).
    * - showDialog(options): the message box; resolves with { response }.
