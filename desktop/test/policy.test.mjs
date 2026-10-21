@@ -1,7 +1,7 @@
 // Run inside desktop/ with: npm test
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildChildEnv, externalTarget, isBackendUrl, menuTemplate } from "../src/policy.js";
+import { allowsRequest, buildChildEnv, externalTarget, isBackendUrl, menuTemplate } from "../src/policy.js";
 
 const ORIGIN = "http://127.0.0.1:41234";
 
@@ -215,6 +215,124 @@ describe("externalTarget", () => {
   });
 });
 
+describe("allowsRequest", () => {
+  const allowed = [
+    [ORIGIN, "the origin without a path"],
+    [`${ORIGIN}/`, "the root page"],
+    [`${ORIGIN}/api/chat`, "an API path"],
+    [`${ORIGIN}/api/chats?limit=20&q=a%20b`, "a query"],
+    [`${ORIGIN}/static/js/app.js`, "a script"],
+    [`${ORIGIN}/#/c/0123456789abcdef`, "a hash route"],
+    [`${ORIGIN}/\\@evil.example`, "a backslash after the origin, which belongs to the path"],
+    [`${ORIGIN}//127.0.0.1:41235/`, "another origin written into the path"],
+  ];
+  for (const [url, what] of allowed) {
+    it(`lets through ${what}`, () => assert.equal(allowsRequest(url, ORIGIN), true, url));
+  }
+
+  const refused = [
+    ["http://127.0.0.1:41235/", "another port"],
+    ["http://127.0.0.1:8787/", "the service's port"],
+    ["http://127.0.0.1/", "port 80"],
+    ["http://localhost:41234/", "localhost, which is another host"],
+    ["http://127.0.0.2:41234/", "another loopback address"],
+    ["http://[::1]:41234/", "the IPv6 loopback"],
+    ["http://0.0.0.0:41234/", "the unspecified address"],
+    ["http://example.com/", "another host"],
+    ["https://example.com/", "another host over https"],
+    ["http://evil.example:41234/", "the port on another host"],
+    ["https://127.0.0.1:41234/", "https on the backend's host and port"],
+    ["http://evil.example@127.0.0.1:41234/", "userinfo in front of the backend's host"],
+    ["http://user:secret@127.0.0.1:41234/", "a user name and password for the backend's host"],
+    ["http://127.0.0.1:41234@evil.example/", "userinfo that looks like the origin"],
+    ["http://127.0.0.1:41234%40evil.example/", "an encoded @ after the port"],
+    ["http://127.0.0.1.evil.example:41234/", "a look-alike host"],
+    ["http://127.0.0.1:41234.evil.example/", "a look-alike host after the port"],
+    ["http://evil.example/?u=http://127.0.0.1:41234/", "the origin in a query"],
+    ["http://evil.example/#http://127.0.0.1:41234/", "the origin in a fragment"],
+    ["ws://127.0.0.1:41234/", "a WebSocket on the backend's host and port"],
+    ["wss://127.0.0.1:41234/", "a secure WebSocket on the backend's host and port"],
+    ["ws://127.0.0.1:41234/api/chat", "a WebSocket on an API path"],
+    ["ws://example.com/", "a WebSocket elsewhere"],
+    ["HTTP://127.0.0.1:41234/", "an uppercase scheme on the backend's host and port"],
+    ["Http://127.0.0.1:41234/api/chat", "a mixed-case scheme"],
+    ["HTTP://EVIL.EXAMPLE/", "an uppercase scheme elsewhere"],
+    ["WS://127.0.0.1:41234/", "an uppercase WebSocket scheme"],
+    ["http://127.0.0.1:041234/", "a port with a leading zero"],
+    ["http://127.0.0.1.:41234/", "a trailing dot on the address"],
+    ["http://127.1:41234/", "the address written short"],
+    ["blob:http://127.0.0.1:41234/6f1e1f0c", "a blob URL, whose origin is the backend's"],
+    ["filesystem:http://127.0.0.1:41234/temporary/x", "a filesystem URL"],
+    ["view-source:http://127.0.0.1:41234/", "view-source"],
+    ["data:text/html,<p>x</p>", "a data URL"],
+    ["file:///etc/passwd", "a file URL"],
+    ["javascript:void(0)", "a javascript URL"],
+    ["about:blank", "about:blank"],
+    ["chrome://gpu", "a chrome URL"],
+    ["devtools://devtools/bundled/inspector.html", "a devtools URL"],
+    ["ftp://127.0.0.1:41234/", "an ftp URL on the backend's host and port"],
+    ["//127.0.0.1:41234/", "a scheme-less URL"],
+    ["127.0.0.1:41234", "a bare host and port"],
+    ["/api/health", "a relative path"],
+    ["", "an empty string"],
+  ];
+  for (const [url, what] of refused) {
+    it(`stops ${what}`, () => assert.equal(allowsRequest(url, ORIGIN), false, url));
+  }
+
+  // Before the first backend is up, and from the moment it has ended, there is no origin: nothing may go out.
+  it("stops everything while there is no origin", () => {
+    const urls = [
+      ORIGIN,
+      `${ORIGIN}/`,
+      `${ORIGIN}/api/chat`,
+      "http://127.0.0.1:8787/",
+      "https://example.com/",
+      "ws://x/",
+      "",
+    ];
+    for (const origin of [null, undefined, "", "null", ...NOT_STRINGS, ...GARBAGE]) {
+      for (const url of urls) {
+        assert.equal(allowsRequest(url, origin), false, `${url} against an origin of type ${typeof origin}`);
+      }
+    }
+  });
+
+  it("stops an origin that is not exactly an origin, rather than guessing", () => {
+    for (const origin of [
+      `${ORIGIN}/`,
+      `${ORIGIN} `,
+      ` ${ORIGIN}`,
+      "HTTP://127.0.0.1:41234",
+      "http://127.0.0.1:041234",
+      "http://",
+      "127.0.0.1:41234",
+      "https://127.0.0.1:41234/x",
+    ]) {
+      assert.equal(allowsRequest(`${ORIGIN}/`, origin), false, origin);
+      assert.equal(allowsRequest(`${origin}/`, origin), false, origin);
+    }
+  });
+
+  it("answers false, without throwing, for garbage and for non-strings", () => {
+    for (const url of [...GARBAGE, ...NOT_STRINGS]) {
+      assert.equal(allowsRequest(url, ORIGIN), false, String(typeof url === "string" ? url.slice(0, 40) : typeof url));
+    }
+  });
+
+  it("copes with a very long path on the backend and a very long host elsewhere", () => {
+    assert.equal(allowsRequest(`${ORIGIN}/${"a".repeat(1_000_000)}`, ORIGIN), true);
+    assert.equal(allowsRequest(`http://${"a".repeat(1_000_000)}/`, ORIGIN), false);
+  });
+
+  it("follows the origin it is given, so a restart on another port moves the allowance", () => {
+    const next = "http://127.0.0.1:50000";
+    assert.equal(allowsRequest(`${ORIGIN}/api/health`, next), false);
+    assert.equal(allowsRequest(`${next}/api/health`, next), true);
+    assert.equal(allowsRequest(`${next}/api/health`, ORIGIN), false);
+  });
+});
+
 describe("isBackendUrl and externalTarget together", () => {
   // Seeded, so a failure reproduces: mulberry32.
   function random(seed) {
@@ -276,9 +394,18 @@ describe("isBackendUrl and externalTarget together", () => {
       for (let j = 0; j < length; j++) url += PIECES[Math.floor(next() * PIECES.length)];
       const backend = isBackendUrl(url, ORIGIN);
       const target = externalTarget(url, ORIGIN);
+      const allowedRequest = allowsRequest(url, ORIGIN);
       assert.equal(typeof backend, "boolean", url);
       assert.ok(target === null || typeof target === "string", url);
       if (backend) assert.equal(target, null, `the backend's own URL must not leave the app: ${JSON.stringify(url)}`);
+      assert.equal(allowsRequest(url, null), false, `nothing goes out without an origin: ${JSON.stringify(url)}`);
+      if (allowedRequest) {
+        const spelled = url === ORIGIN || url.startsWith(`${ORIGIN}/`);
+        assert.ok(
+          backend && spelled,
+          `a request may only go to the backend, spelled as Chromium spells it: ${JSON.stringify(url)}`,
+        );
+      }
       if (target !== null) {
         const parsed = new URL(target);
         assert.ok(["http:", "https:", "mailto:"].includes(parsed.protocol), target);

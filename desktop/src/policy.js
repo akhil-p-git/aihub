@@ -38,6 +38,20 @@ export function isBackendUrl(url, origin) {
 }
 
 /**
+ * Whether a network request for `url` may go ahead while the backend's origin is `origin`.
+ *
+ * Only the backend itself may be asked for anything. This guards every request the window makes, so it is
+ * stricter than isBackendUrl: besides naming the backend's origin, the URL must be spelled the way Chromium
+ * spells the requests it reports (lower-case scheme and host, no user name, no zero in front of the port, a
+ * slash after the origin). Any other spelling is refused, and so is every WebSocket. With an `origin` that is
+ * not exactly an origin, which includes null and undefined, everything is refused: that is the state before the
+ * first backend is up and from the moment it has ended.
+ */
+export function allowsRequest(url, origin) {
+  return isBackendUrl(url, origin) && (url === origin || url.startsWith(`${origin}/`));
+}
+
+/**
  * The address to hand to the operating system for a link the window may not show, or null to do nothing.
  *
  * Web links go to the default browser, except links to the backend itself: opened there they would
