@@ -10,6 +10,16 @@ const INHERITED = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR
 // The only names taken from the keys file. The same file holds the Discord token, which must stay out.
 const KEY_NAMES = ["AIHUB_OPENROUTER_KEY", "AIHUB_ANTHROPIC_KEY"];
 
+/**
+ * Chromium's host-resolver-rules switch: every host name fails to resolve at once, except the backend's own address.
+ *
+ * The page can show links to anywhere, and Chromium looks up the host of a link as soon as the pointer is over it or
+ * it is clicked. That lookup is not a request, so the guard on requests never sees it, and it would tell a name server
+ * which site the page links to. The backend is reached by an address that needs no lookup, and a link to the outside
+ * opens in the system browser, which does its own.
+ */
+export const HOST_RESOLVER_RULES = "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1";
+
 /** The parsed URL, or null for anything that is not a string holding a URL. */
 function parseUrl(value) {
   if (typeof value !== "string") return null;

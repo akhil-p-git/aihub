@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, clipboard, dialog, Menu, nativeTheme, session, shell } from "electron";
 import { Backend } from "./backend.js";
 import { Lifecycle } from "./lifecycle.js";
-import { externalTarget, isBackendUrl, menuTemplate } from "./policy.js";
+import { externalTarget, HOST_RESOLVER_RULES, isBackendUrl, menuTemplate } from "./policy.js";
 
 const SRC = fileURLToPath(new URL(".", import.meta.url));
 // The requests the guard looks at, which are the ones that reach the network. The loading page (file:), devtools:
@@ -30,6 +30,9 @@ app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-des
 // a 4 to 5 MB core dump on /, and Chromium gives up on the GPU after the third anyway. Software rendering is enough
 // for a text chat, and the app then holds no GPU memory or channels, which local image generation needs.
 app.commandLine.appendSwitch("disable-gpu");
+
+// No host name resolves except the backend's address (see policy.js): a link the pointer only touches is not looked up.
+app.commandLine.appendSwitch("host-resolver-rules", HOST_RESOLVER_RULES);
 
 let backend = null;
 let lifecycle = null;

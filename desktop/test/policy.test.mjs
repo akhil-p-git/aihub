@@ -1,7 +1,14 @@
 // Run inside desktop/ with: npm test
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { allowsRequest, buildChildEnv, externalTarget, isBackendUrl, menuTemplate } from "../src/policy.js";
+import {
+  allowsRequest,
+  buildChildEnv,
+  externalTarget,
+  HOST_RESOLVER_RULES,
+  isBackendUrl,
+  menuTemplate,
+} from "../src/policy.js";
 
 const ORIGIN = "http://127.0.0.1:41234";
 
@@ -414,6 +421,18 @@ describe("isBackendUrl and externalTarget together", () => {
         assert.equal(isBackendUrl(target, ORIGIN), false, target);
       }
     }
+  });
+});
+
+describe("HOST_RESOLVER_RULES", () => {
+  // What Chromium does with the rules is checked in a real window (its net log shows no lookup of a hovered or
+  // clicked link's host, and session.resolveHost fails for a real name); here only their shape is held.
+  it("fails every host name at once, except the backend's own address", () => {
+    const rules = HOST_RESOLVER_RULES.split(",").map((rule) => rule.trim().split(/\s+/));
+    assert.deepEqual(rules, [
+      ["MAP", "*", "~NOTFOUND"],
+      ["EXCLUDE", "127.0.0.1"],
+    ]);
   });
 });
 
