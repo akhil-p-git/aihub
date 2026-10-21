@@ -35,6 +35,7 @@ import {
   parseTarget,
   pbsAgeDays,
   prune,
+  requiredFiles,
   sha256File,
   shouldPrune,
   verifyArchive,
@@ -73,6 +74,16 @@ function listing(root, rel = "") {
     return entry.isDirectory() ? [path, ...listing(root, path)] : [path];
   });
 }
+
+/**
+ * Stand-ins for a binary: the magic number of an ELF or a 64-bit Mach-O file, then the library names that the
+ * loader would read from it, each as a NUL-terminated string (the form they have in .dynstr and in a dylib load
+ * command).
+ */
+const withNames = (magic, names) =>
+  Buffer.concat([Buffer.from(magic), ...names.map((name) => Buffer.from(`\0${name}\0`))]);
+const elf = (...names) => withNames([0x7f, 0x45, 0x4c, 0x46], names);
+const macho = (...names) => withNames([0xcf, 0xfa, 0xed, 0xfe], names);
 
 describe("the pin table", () => {
   it("has linux-x64, mac-arm64 and mac-x64, each with a known triple and a 64-hex sha256", () => {
@@ -213,6 +224,12 @@ describe("shouldPrune", () => {
     "lib/pkgconfig/python3.pc",
     "lib/python3.12/config-3.12-darwin",
     "lib/python3.12/config-3.12-x86_64-linux-gnu/Makefile",
+    // the shared libpython: a second copy of the interpreter, which bin/python3.12 does not link
+    "lib/libpython3.12.so.1.0",
+    "lib/libpython3.12.so",
+    "lib/libpython3.so",
+    "lib/libpython3.12.dylib",
+    "lib/libpython3.12.a",
     // stdlib packages the app never imports
     "lib/python3.12/ensurepip",
     "lib/python3.12/idlelib/idle.py",
@@ -269,13 +286,10 @@ describe("shouldPrune", () => {
     "lib/python3.12/config.py",
     "lib/threading_helpers.py",
     "lib/python3.12/site-packages/thread2/x.py",
+    "lib/libpythonic.so",
   ];
-  // The shared libraries the interpreter or the wheels may link to or load: never matched.
+  // The shared libraries that can be loaded by the interpreter or a wheel: never matched.
   const sharedLibraries = [
-    "lib/libpython3.12.so.1.0",
-    "lib/libpython3.12.so",
-    "lib/libpython3.so",
-    "lib/libpython3.12.dylib",
     "lib/python3.12/lib-dynload/_ssl.cpython-312-x86_64-linux-gnu.so",
     "lib/python3.12/site-packages/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so",
     "lib/python3.12/site-packages/pydantic_core/_pydantic_core.cpython-312-darwin.so",
@@ -295,9 +309,9 @@ describe("shouldPrune", () => {
     for (const path of ["bin/python3.12", ...sharedLibraries]) assert.ok(!shouldPrune(path), `${path} should stay`);
   });
 
-  it("matches a shared library only when it belongs to _dbm, _crypt, _tkinter or Tcl/Tk", () => {
+  it("matches a shared library only when it is libpython, Tcl/Tk or the _dbm, _crypt or _tkinter module", () => {
     const shared = /\.(so(\.\d+)*|dylib)$/;
-    const allowed = /lib-dynload\/(_dbm|_crypt|_tkinter)[^/]*$|^lib\/lib(tcl|tk)[^/]*$/;
+    const allowed = /lib-dynload\/(_dbm|_crypt|_tkinter)[^/]*$|^lib\/lib(tcl|tk|python)[^/]*$/;
     for (const path of removed.filter((p) => shared.test(p))) assert.match(path, allowed);
   });
 });
@@ -306,7 +320,6 @@ describe("prune", () => {
   it("removes exactly what shouldPrune matches and leaves the kept files untouched", () => {
     const root = join(scratch, "payload");
     lay(root, [
-      "bin/python3.12",
       "bin/python3 -> python3.12",
       "bin/pip",
       "include/python3.12/Python.h",
@@ -322,7 +335,8 @@ describe("prune", () => {
       "lib/python3.12/site-packages/pkg/mod.py",
       "lib/python3.12/site-packages/pkg/__pycache__/mod.cpython-312.pyc",
     ]);
-    const before = readFileSync(join(root, "bin/python3.12"), "utf8");
+    const interpreter = elf("libm.so.6", "libc.so.6");
+    writeFileSync(join(root, "bin/python3.12"), interpreter);
 
     const { entries, bytes } = prune(root);
 
@@ -330,8 +344,6 @@ describe("prune", () => {
       "bin",
       "bin/python3.12",
       "lib",
-      "lib/libpython3.12.so",
-      "lib/libpython3.12.so.1.0",
       "lib/python3.12",
       "lib/python3.12/lib-dynload",
       "lib/python3.12/lib-dynload/.empty",
@@ -340,9 +352,9 @@ describe("prune", () => {
       "lib/python3.12/site-packages/pkg",
       "lib/python3.12/site-packages/pkg/mod.py",
     ]);
-    assert.equal(readFileSync(join(root, "bin/python3.12"), "utf8"), before);
-    // bin/python3, bin/pip, include, lib/tcl9.0, 2 x __pycache__, _dbm, .lock, site-packages/bin
-    assert.equal(entries, 9);
+    assert.deepEqual(readFileSync(join(root, "bin/python3.12")), interpreter);
+    // bin/python3, bin/pip, include, 2 x libpython, lib/tcl9.0, 2 x __pycache__, _dbm, .lock, site-packages/bin
+    assert.equal(entries, 11);
     assert.ok(bytes > 0);
   });
 
@@ -356,13 +368,103 @@ describe("prune", () => {
   });
 });
 
+describe("prune and the shared libraries it removes", () => {
+  const root = () => join(scratch, "payload");
+  const withLibpython = [
+    "lib/libpython3.12.so.1.0",
+    "lib/libpython3.12.so -> libpython3.12.so.1.0",
+    "lib/libpython3.so",
+  ];
+
+  it("refuses, before it deletes anything, when an ELF file that stays links a library that would go", () => {
+    lay(root(), [...withLibpython, "lib/python3.12/os.py"]);
+    mkdirSync(join(root(), "bin"));
+    writeFileSync(join(root(), "bin/python3.12"), elf("libm.so.6", "libpython3.12.so.1.0", "libc.so.6"));
+    const before = listing(root());
+
+    assert.throws(
+      () => prune(root()),
+      (err) =>
+        err instanceof BuildError &&
+        err.message.startsWith("bin/python3.12 links libpython3.12.so.1.0, which the prune would delete") &&
+        !err.message.includes("\n"),
+    );
+    assert.deepEqual(listing(root()), before, "nothing was deleted");
+  });
+
+  it("does the same for a Mach-O file that names the dylib by @rpath, and for an extension module", () => {
+    lay(root(), ["lib/libpython3.12.dylib", "lib/python3.12/os.py"]);
+    mkdirSync(join(root(), "lib/python3.12/site-packages/ext"), { recursive: true });
+    const module = join(root(), "lib/python3.12/site-packages/ext/_ext.cpython-312-darwin.so");
+    writeFileSync(module, macho("/usr/lib/libSystem.B.dylib", "@rpath/libpython3.12.dylib"));
+    assert.throws(
+      () => prune(root()),
+      (err) =>
+        err instanceof BuildError &&
+        err.message.startsWith("lib/python3.12/site-packages/ext/_ext.cpython-312-darwin.so links libpython3.12.dylib"),
+    );
+    assert.ok(existsSync(join(root(), "lib/libpython3.12.dylib")));
+  });
+
+  it("lets files that stay mention a name without linking it", () => {
+    lay(root(), [...withLibpython, "lib/python3.12/os.py"]);
+    mkdirSync(join(root(), "bin"));
+    // a source file that talks about the library (sysconfig data does)
+    writeFileSync(join(root(), "lib/python3.12/_sysconfigdata.py"), "LDLIBRARY = 'libpython3.12.so.1.0'\0\n");
+    // a binary with a longer name that only starts the same, and one that links only what stays
+    writeFileSync(join(root(), "bin/python3.12"), elf("libpython3.12.so.1.0.1", "libm.so.6"));
+    prune(root());
+    assert.deepEqual(listing(root()), [
+      "bin",
+      "bin/python3.12",
+      "lib",
+      "lib/python3.12",
+      "lib/python3.12/_sysconfigdata.py",
+      "lib/python3.12/os.py",
+    ]);
+  });
+
+  it("checks only the binaries that stay: a library that links another one that goes is removed with it", () => {
+    lay(root(), ["bin/python3.12", "lib/python3.12/os.py"]);
+    writeFileSync(join(root(), "lib/libpython3.12.so.1.0"), elf("libc.so.6"));
+    writeFileSync(join(root(), "lib/libpython3.so"), elf("libpython3.12.so.1.0"));
+    prune(root());
+    assert.deepEqual(listing(root()), ["bin", "bin/python3.12", "lib", "lib/python3.12", "lib/python3.12/os.py"]);
+  });
+});
+
+describe("requiredFiles", () => {
+  const site = "lib/python3.12/site-packages";
+  const common = [
+    "bin/python3.12",
+    "lib/python3.12/os.py",
+    `${site}/aihub_web/__main__.py`,
+    `${site}/aihub_web/static/index.html`,
+  ];
+
+  it("lists the interpreter, the app and the two compiled dependencies of each target, and no libpython", () => {
+    assert.deepEqual(requiredFiles("linux-x64"), [
+      ...common,
+      `${site}/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so`,
+      `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
+    ]);
+    for (const target of ["mac-arm64", "mac-x64"]) {
+      assert.deepEqual(requiredFiles(target), [
+        ...common,
+        `${site}/pydantic_core/_pydantic_core.cpython-312-darwin.so`,
+        `${site}/yaml/_yaml.cpython-312-darwin.so`,
+      ]);
+    }
+  });
+});
+
 describe("auditPayload", () => {
   const required = ["bin/python3.12", "lib/python3.12/site-packages/pkg/mod.py"];
   const good = [
     "bin/python3.12",
-    "lib/libpython3.12.so.1.0",
-    "lib/libpython3.12.so -> libpython3.12.so.1.0",
+    "lib/python3.12/os.py",
     "lib/python3.12/site-packages/pkg/mod.py",
+    "lib/python3.12/site-packages/pkg/data -> mod.py",
   ];
 
   let audits = 0;
@@ -401,6 +503,7 @@ describe("auditPayload", () => {
       messageFor([...good, "lib/python3.12/site-packages/.lock"]),
       /left over: lib\/python3\.12\/site-packages\/\.lock/,
     );
+    assert.match(messageFor([...good, "lib/libpython3.12.so.1.0"]), /left over: lib\/libpython3\.12\.so\.1\.0/);
   });
 
   it("names a symlink that dangles, is absolute or leaves the payload", () => {

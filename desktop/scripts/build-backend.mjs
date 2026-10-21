@@ -58,28 +58,24 @@ const MAX_REDIRECTS = 5;
 // triple: the archive's platform and the value of uv's --python-platform.
 // host: the Node platform and architecture that can run the target's interpreter.
 // extension: the suffix of compiled modules (name.cpython-312-<extension>.so).
-// libpython: the shared libpython in the archive (see PRUNE_PATTERNS for why it stays).
 export const TARGETS = Object.freeze({
   "linux-x64": Object.freeze({
     triple: "x86_64-unknown-linux-gnu",
     sha256: "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91",
     host: Object.freeze({ platform: "linux", arch: "x64" }),
     extension: "x86_64-linux-gnu",
-    libpython: "lib/libpython3.12.so.1.0",
   }),
   "mac-arm64": Object.freeze({
     triple: "aarch64-apple-darwin",
     sha256: "ad8d0c637c0a36b967b310e2c07254f4d2ca8cabaa7699e55ed6290aceb481a2",
     host: Object.freeze({ platform: "darwin", arch: "arm64" }),
     extension: "darwin",
-    libpython: "lib/libpython3.12.dylib",
   }),
   "mac-x64": Object.freeze({
     triple: "x86_64-apple-darwin",
     sha256: "562c30864ece2cb1d3e0ad66a1acd498611a47e5a10ce81b99158bef1ccbd355",
     host: Object.freeze({ platform: "darwin", arch: "x64" }),
     extension: "darwin",
-    libpython: "lib/libpython3.12.dylib",
   }),
 });
 
@@ -246,16 +242,19 @@ async function fetchArchive(target) {
 
 // Paths are relative to the payload, with "/" separators. A matching entry is removed with everything below it.
 //
-// libpython3.12.so.1.0 and libpython3.12.dylib are deliberately not listed. bin/python3.12 does not link them
-// (readelf -d and llvm-otool -L list only system libraries, because the interpreter contains libpython and
-// exports the C API to extension modules), so each is an unused copy: about 31 MiB on Linux, 17 MiB on macOS.
-// They stay while the macOS payloads have not run on a Mac; dropping them later is one pattern here. The pinned
-// archives have no static libpython (.a) and nothing of libpython under config-3.12-*, which goes as a whole.
+// The shared libpython is a second copy of the interpreter: libpython3.12.so.1.0 and its two symlinks on Linux,
+// libpython3.12.dylib on macOS, about as large as bin/python3.12 itself (31 MiB and 17 MiB). The interpreter
+// contains libpython and exports the C API to extension modules; readelf -d and llvm-otool -L show that it links
+// only system libraries. prune() checks that on every build and refuses to delete a library that a binary which
+// stays names, so a release that links the interpreter to it fails the build here, not the app on a Mac. The
+// pinned archives hold no static libpython (.a); the pattern would also remove one at lib/.
 const PRUNE_PATTERNS = [
   // Every launcher but the interpreter: pip, idle, pydoc, 2to3, the python and python3 symlinks, *-config.
   /^bin\/(?!python3\.12$)/,
   // C headers, man pages and terminfo, pkg-config files.
   /^(include|share|lib\/pkgconfig)(\/|$)/,
+  // The shared and static libpython copies.
+  /^lib\/libpython[\d.]*(\.a|\.so[\d.]*|\.dylib)$/,
   // Build configuration and stdlib packages the app never imports.
   /^lib\/python3\.12\/(config-3\.12-[^/]+|ensurepip|idlelib|lib2to3|pydoc_data|tkinter|turtledemo)(\/|$)/,
   // The extension modules for crypt, dbm and Tcl/Tk, which the app never imports.
@@ -289,8 +288,40 @@ function bytesIn(path) {
   return readdirSync(path).reduce((sum, name) => sum + bytesIn(join(path, name)), 0);
 }
 
-/** Deletes what shouldPrune matches below `root`. Returns how many entries went and how many bytes they held. */
+const SHARED_LIBRARY = /^lib.*\.(so(\.\d+)*|dylib)$/;
+// The first four bytes of an ELF file and of a Mach-O file (thin, in either byte order, or fat).
+const NATIVE_MAGIC = new Set(["7f454c46", "feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"]);
+
+/**
+ * Throws, before anything is deleted, when an ELF or Mach-O file that stays has the name of a shared library that
+ * goes in its bytes. The loader looks a library up by the name in DT_NEEDED or in a dylib load command, which is a
+ * NUL-terminated string in the file, so a link shows up as that name followed by a NUL.
+ */
+function assertNoLinkToPruned(root) {
+  const tree = [...walk(root)];
+  const going = tree
+    .filter(({ rel, dirent }) => shouldPrune(rel) && !dirent.isDirectory() && SHARED_LIBRARY.test(dirent.name))
+    .map(({ dirent }) => dirent.name);
+  if (going.length === 0) return;
+  for (const { rel, dirent } of tree) {
+    if (!dirent.isFile() || shouldPrune(rel)) continue;
+    const bytes = readFileSync(join(root, rel));
+    if (!NATIVE_MAGIC.has(bytes.subarray(0, 4).toString("hex"))) continue;
+    const name = going.find((library) => bytes.includes(`${library}\0`));
+    if (name) {
+      throw new BuildError(
+        `${rel} links ${name}, which the prune would delete (take its pattern out of PRUNE_PATTERNS)`,
+      );
+    }
+  }
+}
+
+/**
+ * Deletes what shouldPrune matches below `root`, unless a binary that stays links a library that goes.
+ * Returns how many entries went and how many bytes they held.
+ */
 export function prune(root) {
+  assertNoLinkToPruned(root);
   let entries = 0;
   let bytes = 0;
   const visit = (dir, rel) => {
@@ -333,13 +364,12 @@ export function auditPayload(payload, required = []) {
   }
 }
 
-function requiredFiles(target) {
-  const { extension, libpython } = TARGETS[target];
+export function requiredFiles(target) {
+  const { extension } = TARGETS[target];
   const site = `lib/python${PYTHON_MINOR}/site-packages`;
   const tag = `cpython-${PYTHON_MINOR.replace(".", "")}-${extension}`;
   return [
     `bin/python${PYTHON_MINOR}`,
-    libpython,
     `lib/python${PYTHON_MINOR}/os.py`,
     `${site}/aihub_web/__main__.py`,
     `${site}/aihub_web/static/index.html`,
