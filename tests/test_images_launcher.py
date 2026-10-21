@@ -502,6 +502,31 @@ class TestStartChecks:
         assert rig.exit_code() == 78
         assert "models.json" in rig.log()
 
+    @pytest.mark.parametrize(
+        ("key", "doubled"),
+        [
+            pytest.param(
+                '"engine": ', '"engine": "/bin/false", "engine": ', id="engine"
+            ),
+            pytest.param(
+                '"zimage": [', '"zimage": ["--other"], "zimage": [', id="model"
+            ),
+        ],
+    )
+    def test_refuses_a_models_file_that_says_a_key_twice(
+        self, launch, tmp_path, key, doubled
+    ):
+        # json.loads keeps the last of two equal keys without a word, so the first would silently not count.
+        config = json.loads(SHIPPED_MODELS.read_text())
+        config["engine"] = str(STAND_IN)
+        text = json.dumps(config)
+        assert key in text
+        path = tmp_path / "bad-models.json"
+        path.write_text(text.replace(key, doubled, 1))
+        rig = launch(models_file=path)
+        assert rig.exit_code(timeout=3) == 78
+        assert "models.json" in rig.log() and "twice" in rig.log()
+
     @pytest.mark.parametrize("text", ["{", "[]", '"x"', ""])
     def test_refuses_a_models_file_that_is_not_an_object(self, launch, tmp_path, text):
         path = tmp_path / "bad-models.json"

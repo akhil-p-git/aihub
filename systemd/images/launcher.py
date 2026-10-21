@@ -194,8 +194,16 @@ def load_config(path: str) -> Config:
             isinstance(v, str) and "\0" not in v for v in value
         )
 
+    def once(pairs: list[tuple[str, object]]) -> dict:
+        # json.loads would keep the last of two equal keys and say nothing.
+        keys = [key for key, _ in pairs]
+        for key in keys:
+            if keys.count(key) > 1:
+                raise ValueError(f"the key {key!r} is there twice")
+        return dict(pairs)
+
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(), object_pairs_hook=once)
     except (OSError, ValueError) as err:
         bad(f"cannot read {path}: {err}")
     if not isinstance(data, dict):
