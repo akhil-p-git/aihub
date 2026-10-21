@@ -571,12 +571,20 @@ describe("allows", () => {
     for (const url of ELSEWHERE) assert.equal(r.lifecycle.allows(url), false, url);
   });
 
-  it("refuses everything once the backend process is gone, before its exit has reached the Lifecycle", async () => {
+  it("refuses everything, and has no origin, once the backend process is gone but its exit is not in yet", async () => {
     const r = rig();
     await r.up(4001);
     r.backend.alive = false;
-    assert.equal(r.lifecycle.origin, "http://127.0.0.1:4001", "the exit has not been handled yet");
     for (const url of PAGES) assert.equal(r.lifecycle.allows(url), false, url);
+    assert.equal(r.lifecycle.origin, null, "the window's other guards ask for the origin as well");
+
+    // The exit event follows, and still takes the cookie of the backend that was up.
+    r.backend.die();
+    await settle();
+    assert.deepEqual(
+      r.all("cookie-remove").map(({ url }) => url),
+      ["http://127.0.0.1:4001"],
+    );
   });
 
   it("refuses everything from the moment the backend has ended", async () => {

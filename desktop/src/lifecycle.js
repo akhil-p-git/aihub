@@ -46,9 +46,12 @@ export class Lifecycle {
     this.#loadingFile = loadingFile;
   }
 
-  /** The origin of the backend that is up, like "http://127.0.0.1:41234", or null. */
+  /**
+   * The origin of the backend that is up, like "http://127.0.0.1:41234", or null: none has started yet, or the
+   * process of the last one is gone, even if its exit event has not come in.
+   */
   get origin() {
-    return this.#origin;
+    return this.#origin !== null && this.#backend.isAlive() ? this.#origin : null;
   }
 
   /**
