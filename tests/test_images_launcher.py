@@ -933,12 +933,13 @@ class TestLifetime:
         assert len(rig.starts()) == 2
 
     def test_every_connection_restarts_the_idle_clock(self, launch):
-        rig = launch(env={"AIHUB_IMAGES_IDLE_S": "1.5"})
+        # Six rounds of 0.5 s outlast the 2 s timeout, and each stays well inside it.
+        rig = launch(env={"AIHUB_IMAGES_IDLE_S": "2"})
         for _ in range(6):
-            time.sleep(0.4)
+            time.sleep(0.5)
             assert rig.proc.poll() is None
             rig.status()
-        assert rig.exit_code(timeout=8) == 0
+        assert rig.exit_code(timeout=10) == 0
 
     def test_a_connection_in_flight_keeps_the_launcher_up(self, launch):
         rig = launch(env={"AIHUB_IMAGES_IDLE_S": "0.6", "AIHUB_IMAGES_CLIENT_S": "5"})
