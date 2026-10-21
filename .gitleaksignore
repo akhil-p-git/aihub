@@ -1,0 +1,4 @@
+# False positives: made-up key-shaped fixtures in tests (sk-test-SECRET-1234, sk-or-fixture-0001, parent-*-key-0007).
+10940149002a9bbc27562a7c7c0551511dee7b7a:tests/test_web_providers.py:generic-api-key:28
+5d58d91d0e7ce9144eb61656a39c74276700fc06:desktop/test/backend.test.mjs:generic-api-key:36
+5d58d91d0e7ce9144eb61656a39c74276700fc06:desktop/test/backend.test.mjs:generic-api-key:54
