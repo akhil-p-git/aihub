@@ -1,4 +1,5 @@
-"""The models the picker offers: installed Ollama models, OpenRouter's free list and pinned paid models, and Claude."""
+"""The models the picker offers: installed Ollama models, OpenRouter's free list and pinned paid models, Claude, and
+the image models of the settings where an image engine is set up."""
 
 import asyncio
 import json
