@@ -20,6 +20,20 @@ const KEY_NAMES = ["AIHUB_OPENROUTER_KEY", "AIHUB_ANTHROPIC_KEY"];
  */
 export const HOST_RESOLVER_RULES = "MAP * ~NOTFOUND , EXCLUDE 127.0.0.1";
 
+/**
+ * The request headers with the connection set to close after the request, whatever they said about it before.
+ *
+ * Chromium sends a request again, by itself and on a new connection, when the kept-alive connection it was first sent
+ * on is closed before any answer comes. After a backend has died that is a way for a request to reach a program that
+ * has bound the freed port, and no request hook sees it. A connection that is closed after every request is never
+ * reused, so there is nothing to send again on.
+ */
+export function withoutKeepAlive(headers) {
+  const plain = typeof headers === "object" && headers !== null && !Array.isArray(headers) ? headers : {};
+  const kept = Object.entries(plain).filter(([name]) => name.toLowerCase() !== "connection");
+  return { ...Object.fromEntries(kept), Connection: "close" };
+}
+
 /** The parsed URL, or null for anything that is not a string holding a URL. */
 function parseUrl(value) {
   if (typeof value !== "string") return null;

@@ -8,6 +8,7 @@ import {
   HOST_RESOLVER_RULES,
   isBackendUrl,
   menuTemplate,
+  withoutKeepAlive,
 } from "../src/policy.js";
 
 const ORIGIN = "http://127.0.0.1:41234";
@@ -433,6 +434,43 @@ describe("HOST_RESOLVER_RULES", () => {
       ["MAP", "*", "~NOTFOUND"],
       ["EXCLUDE", "127.0.0.1"],
     ]);
+  });
+});
+
+describe("withoutKeepAlive", () => {
+  // That Chromium then has no connection to retry a request on is checked in a real window, with a program that
+  // binds the port of a backend the moment it dies; here only the headers are held.
+  it("asks for the connection to be closed after the request", () => {
+    assert.deepEqual(withoutKeepAlive({ Accept: "*/*" }), { Accept: "*/*", Connection: "close" });
+  });
+
+  it("replaces a Connection header, whatever its case or value", () => {
+    for (const name of ["Connection", "connection", "CONNECTION"]) {
+      for (const value of ["keep-alive", "Upgrade", "close", ""]) {
+        assert.deepEqual(
+          withoutKeepAlive({ [name]: value, Accept: "*/*" }),
+          { Accept: "*/*", Connection: "close" },
+          `${name}: ${value}`,
+        );
+      }
+    }
+  });
+
+  it("keeps every other header as it was, the cookie included", () => {
+    const headers = { Cookie: "aihub_t=fixture", "Content-Type": "application/json", "X-Empty": "" };
+    assert.deepEqual(withoutKeepAlive(headers), { ...headers, Connection: "close" });
+  });
+
+  it("does not change the headers it is given", () => {
+    const headers = { Connection: "keep-alive", Accept: "*/*" };
+    withoutKeepAlive(headers);
+    assert.deepEqual(headers, { Connection: "keep-alive", Accept: "*/*" });
+  });
+
+  it("copes with headers that are missing or odd", () => {
+    for (const odd of [undefined, null, 0, "text", []]) {
+      assert.deepEqual(withoutKeepAlive(odd), { Connection: "close" }, String(odd));
+    }
   });
 });
 
