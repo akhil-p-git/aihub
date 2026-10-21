@@ -223,7 +223,14 @@ export class Backend extends EventEmitter {
         pythonPath,
       });
       // The data directory is the working directory: without -I (development) Python puts it on its path.
-      const child = spawn(python, args, { env, cwd: this.#userData, stdio: ["pipe", "pipe", "pipe"] });
+      let child;
+      try {
+        child = spawn(python, args, { env, cwd: this.#userData, stdio: ["pipe", "pipe", "pipe"] });
+      } catch (error) {
+        // What spawn refuses it can quote: a key with a NUL byte in it comes back in the message, value and all.
+        reject(new Error(`The aihub backend could not be started (${error.code ?? error.name}).`));
+        return;
+      }
       this.#child = child;
       let ready = false;
       let timedOut = false;

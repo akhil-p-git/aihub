@@ -931,6 +931,26 @@ describe("a stand-in interpreter", () => {
     });
   });
 
+  it("does not repeat a value of the keys file when the environment is refused", async (t) => {
+    const counter = counterFile(t);
+    const word = "nul-fixture-secret-0009";
+    const r = rig(t, {
+      stub: `echo started >> ${quote(counter)}\n${READY_LINE}\nexec sleep 1000`,
+      keys: `AIHUB_OPENROUTER_KEY=nul\u0000-${word}\n`,
+    });
+    const { backend } = r.make();
+    const error = await rejection(backend.start());
+    assert.match(error.message, /^The aihub backend could not be started \(ERR_INVALID_ARG_VALUE\)\.$/);
+    const log = existsSync(join(r.userData, "logs", "backend.log")) ? r.log() : "";
+    assert.ok(!JSON.stringify([error.message, error.stack, log]).includes(word), "a value of the keys file leaked");
+    assert.deepEqual(attempts(counter), [], "a child was started");
+    assert.equal(backend.pid, null);
+
+    // and the Backend is not stuck: with a usable keys file it starts
+    writeFileSync(r.keysFile, "AIHUB_OPENROUTER_KEY=fixture-0010\n");
+    assert.equal((await backend.start()).port, 4321);
+  });
+
   it("says where the interpreter should have been when it cannot be run", async (t) => {
     const r = rig(t);
     const nowhere = join(r.dir, "nowhere");
