@@ -148,6 +148,12 @@ def alive(pid: int) -> bool:
     return state != "Z"
 
 
+def cpu_ticks(pid: int) -> int:
+    """User plus system CPU time of a process, in clock ticks."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    return int(fields[11]) + int(fields[12])
+
+
 class Rig:
     """One launcher in its namespaces, the socket it was activated with, and the stand-in's records."""
 
@@ -165,6 +171,7 @@ class Rig:
         listen_pid: str | None = "self",
         listen_fds: str | None = "1",
         fd3="listener",
+        nofile: int | None = None,
         start=True,
     ):
         base.mkdir(parents=True, exist_ok=True)
@@ -178,6 +185,7 @@ class Rig:
         self.listen_pid = listen_pid
         self.listen_fds = listen_fds
         self.fd3 = fd3
+        self.nofile = nofile
         # A unix socket path is limited to 107 bytes, which pytest's tmp_path can exceed.
         self.sock_dir = Path(tempfile.mkdtemp(prefix="img-"))
         self.sock_path = str(self.sock_dir / "engine.sock")
@@ -213,6 +221,8 @@ class Rig:
 
     def start(self) -> None:
         script = "exec 3<&0 </dev/null; "
+        if self.nofile is not None:
+            script += f"ulimit -n {self.nofile}; "
         if self.namespaces:
             script += "mount -t sysfs sysfs /sys && ip link set lo up || exit 70; "
         if self.listen_pid == "self":
@@ -1002,6 +1012,40 @@ class TestConcurrency:
         wait_for(
             lambda: rig.get("/launcher/status").status == 200, "a free slot", rig=rig
         )
+
+    def test_running_out_of_descriptors_pauses_accepting_instead_of_spinning(
+        self, launch
+    ):
+        # With no descriptor left, accept() fails and the connection stays queued, so the listening socket
+        # stays readable: a reader that only logs and returns is called again at once, without end.
+        rig = launch(nofile=20, env={"AIHUB_IMAGES_CLIENT_S": "5"})
+        waiting = []
+        try:
+            for _ in range(40):
+                conn = socket.socket(socket.AF_UNIX)
+                conn.connect(rig.sock_path)
+                waiting.append(conn)
+            wait_for(
+                lambda: "accept failed" in rig.log(),
+                "the launcher to run out of descriptors",
+                rig=rig,
+            )
+            logged, spent = rig.log_path.stat().st_size, cpu_ticks(rig.proc.pid)
+            time.sleep(1.0)
+            assert rig.log_path.stat().st_size - logged < 4000
+            assert (
+                cpu_ticks(rig.proc.pid) - spent < 30
+            )  # a spin costs about 100 a second
+        finally:
+            for conn in waiting:
+                conn.close()
+        # it picks the queue up again once descriptors are free
+        wait_for(
+            lambda: rig.get("/launcher/status").status == 200,
+            "the launcher to serve again",
+            rig=rig,
+        )
+        assert rig.proc.poll() is None
 
 
 # --- idle exit, signals and the engine's lifetime ---------------------------------------------------

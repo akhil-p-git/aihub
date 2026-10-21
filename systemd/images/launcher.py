@@ -460,6 +460,8 @@ class Host:
         self.connections: set[asyncio.Task] = set()
         self.watchers: set[asyncio.Task] = set()
         self.stopping = asyncio.Event()
+        # False while accept() is paused for lack of descriptors.
+        self.accepting = True
 
     def settle(self, state: str) -> None:
         self.state = state
@@ -787,6 +789,22 @@ class Host:
         if not busy:
             self.active -= 1
         self.idle_since = time.monotonic()
+        # A descriptor is about to be free (the transport closes it in the next step).
+        self.resume_accepting()
+
+    def pause_accepting(self, err: OSError) -> None:
+        """No descriptor to accept with (EMFILE, ENFILE). The connection stays queued and the socket stays
+        readable, so listening on would call accept() again at once, without end."""
+        if self.accepting:
+            self.accepting = False
+            asyncio.get_running_loop().remove_reader(self.sock.fileno())
+            log(f"accept failed ({err}); trying again when a connection ends")
+            asyncio.get_running_loop().call_later(1.0, self.resume_accepting)
+
+    def resume_accepting(self) -> None:
+        if not self.accepting and not self.stopping.is_set():
+            self.accepting = True
+            asyncio.get_running_loop().add_reader(self.sock.fileno(), self.accept)
 
     def accept(self) -> None:
         """The listening socket is readable. The connection is counted in the same step as the accept."""
@@ -795,7 +813,7 @@ class Host:
         except (BlockingIOError, InterruptedError):
             return
         except OSError as err:
-            log(f"accept failed: {err}")
+            self.pause_accepting(err)
             return
         conn.setblocking(False)
         # The decision is made here, from the connections being served, not in the task that answers.
