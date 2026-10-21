@@ -82,7 +82,9 @@ def main() -> None:
     # that to us.
     with contextlib.suppress(KeyboardInterrupt):
         server.run()
-    # uvicorn.run ends with this check; calling Server.run directly leaves it to us.
+    # uvicorn.run ends with this check, so Server.run leaves it to us. uvicorn 0.54.0 already calls
+    # sys.exit(STARTUP_FAILURE) from Server.startup when the bind or the lifespan fails (test_web_launch.py
+    # pins both); the check keeps status 3 should a run ever return without having started.
     if not server.started:
         sys.exit(STARTUP_FAILURE)
 

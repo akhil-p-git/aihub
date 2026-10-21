@@ -23,6 +23,17 @@ from test_web_shutdown import free_port, wait_until_up
 
 ROOT = Path(__file__).parents[1]
 READY = re.compile(r'\{"event":"ready","port":[0-9]+\}\n')
+RETURNS_WITHOUT_STARTING = """
+import uvicorn
+
+async def startup(self, sockets=None):
+    self.should_exit = True  # give up without binding and without exiting
+
+uvicorn.Server.startup = startup
+from aihub_web.__main__ import main
+
+main()
+"""
 
 
 @dataclass
@@ -87,7 +98,11 @@ def launch(tmp_path: Path, fake_url: str):
     started: list[Launch] = []
 
     def start(
-        *, stdin=subprocess.DEVNULL, config_port: int | None = None, **env: str
+        *,
+        stdin=subprocess.DEVNULL,
+        config_port: int | None = None,
+        args: tuple[str, ...] = ("-m", "aihub_web"),
+        **env: str,
     ) -> Launch:
         config = tmp_path / "web.yaml"
         config.write_text(
@@ -99,7 +114,7 @@ def launch(tmp_path: Path, fake_url: str):
         log_path = tmp_path / "app.log"
         with log_path.open("w") as log:
             process = subprocess.Popen(
-                [sys.executable, "-m", "aihub_web"],
+                [sys.executable, *args],
                 env={
                     "PATH": os.environ["PATH"],
                     "PYTHONPATH": str(ROOT / "app"),
@@ -169,6 +184,17 @@ def test_without_any_new_variable_the_service_path_is_unchanged(
     assert httpx2.get(health, timeout=5).status_code == 200
     app.stop()
     assert app.stdout_rest() == ""
+
+
+@pytest.mark.parametrize("value", ["0", "true", ""])
+def test_only_the_value_1_turns_the_stdin_watcher_on(launch, value: str) -> None:
+    """Here stdin is at EOF from the first read, so a watcher that was on would stop the server at once."""
+    app = launch(AIHUB_EXIT_ON_STDIN_EOF=value)
+    base = f"http://127.0.0.1:{app.port()}"
+    with pytest.raises(subprocess.TimeoutExpired):
+        app.process.wait(timeout=1)
+    assert httpx2.get(f"{base}/api/health", timeout=5).status_code == 200
+    app.stop()
 
 
 def close_stdin(app: Launch) -> None:
@@ -283,6 +309,17 @@ def test_a_startup_failure_exits_3_without_a_ready_line(start, tmp_path: Path) -
     assert app.process.wait(timeout=10) == 3, app.log()
     assert app.stdout_rest() == ""
     assert "newer than this app" in app.log()
+
+
+def test_a_server_that_returns_without_starting_exits_3(launch) -> None:
+    """uvicorn 0.54.0 exits 3 by itself when the bind or the lifespan fails (the two tests above).
+
+    This pins our own exit status for a uvicorn whose Server.run returns without having started, as
+    the startup of older releases did after a lifespan failure.
+    """
+    app = launch(args=("-c", RETURNS_WITHOUT_STARTING))
+    assert app.process.wait(timeout=10) == 3, app.log()
+    assert app.stdout_rest() == ""
 
 
 def test_a_bad_port_variable_exits_1_with_a_message(start) -> None:
