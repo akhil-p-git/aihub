@@ -9,7 +9,9 @@
   "scripts": {
     "prestart": "node node_modules/electron/install.js",
     "start": "electron .",
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test \"test/*.test.mjs\"",
+    "build:backend": "node scripts/build-backend.mjs",
+    "dist:linux": "node scripts/package-linux.mjs"
   },
   "devDependencies": {
     "electron": "44.6.0"
