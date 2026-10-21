@@ -205,12 +205,10 @@ function rig(t, { stub, keys = KEYS_FILE, parentEnv = PARENT_ENV } = {}) {
     keysFile,
     repoRoot,
     useStub,
-    /** A new Backend on this data directory, with a launch token of its own. */
+    /** A new Backend on this data directory. Its launch token comes from start(), a new one per start. */
     make(overrides = {}) {
-      const token = randomBytes(32).toString("base64url");
       const backend = new Backend({
         userData,
-        token,
         keysFile,
         env: { ...parentEnv, HOME: dir, TMPDIR: dir },
         ...(stubbed ? { repoRoot } : {}),
@@ -218,7 +216,7 @@ function rig(t, { stub, keys = KEYS_FILE, parentEnv = PARENT_ENV } = {}) {
       });
       made.push(backend);
       everyBackend.add(backend);
-      return { backend, token };
+      return { backend };
     },
     log: () => logs("backend.log"),
     oldLog: () => logs("backend.log.1"),
@@ -270,13 +268,16 @@ const rejection = (promise) =>
 describe("the real backend", () => {
   it("reports the port from the ready line, and the API wants the launch cookie", { timeout: 60_000 }, async (t) => {
     const r = rig(t);
-    const { backend, token } = r.make();
-    const { port, origin } = await backend.start();
+    const { backend } = r.make();
+    const { port, origin, token } = await backend.start();
 
     assert.ok(Number.isInteger(port) && port > 0 && port < 65536, `port ${port}`);
     assert.equal(origin, `http://127.0.0.1:${port}`);
     assert.equal(backend.origin, origin);
     assert.ok(Number.isInteger(backend.pid) && isAlive(backend.pid));
+    // Not assert.match: a failed match would print the token.
+    assert.ok(/^[A-Za-z0-9_-]{43}$/.test(token), "start() returns a token of 43 base64url characters");
+    assert.equal(Buffer.from(token, "base64url").length, 32);
 
     const refused = await get(origin, "/api/health");
     assert.equal(refused.status, 401);
@@ -307,8 +308,8 @@ describe("the real backend", () => {
     { timeout: 90_000 },
     async (t) => {
       const r = rig(t);
-      const { backend, token } = r.make();
-      const { origin } = await backend.start();
+      const { backend } = r.make();
+      const { origin, token } = await backend.start();
       const exits = [];
       backend.on("exit", (event) => exits.push(event));
 
@@ -349,13 +350,13 @@ describe("the real backend", () => {
       assert.equal(backend.pid, null);
 
       const second = r.make();
-      const { origin: again } = await second.backend.start();
-      const { chats } = await (await get(again, "/api/chats", second.token)).json();
+      const { origin: again, token: againToken } = await second.backend.start();
+      const { chats } = await (await get(again, "/api/chats", againToken)).json();
       assert.deepEqual(
         chats.map((chat) => chat.id),
         [chatId],
       );
-      const { messages } = await (await get(again, `/api/chats/${chatId}`, second.token)).json();
+      const { messages } = await (await get(again, `/api/chats/${chatId}`, againToken)).json();
       const reply = messages.find((message) => message.role === "assistant");
       assert.equal(reply.status, "stopped");
       assert.ok(reply.content.startsWith("word word word"), reply.content.slice(0, 40));
@@ -369,8 +370,8 @@ describe("the real backend", () => {
     t.after(held.close);
     r.rememberPort(held.port);
 
-    const { backend, token } = r.make();
-    const { port, origin } = await backend.start();
+    const { backend } = r.make();
+    const { port, origin, token } = await backend.start();
     assert.notEqual(port, held.port);
     assert.equal((await get(origin, "/api/health", token)).status, 200);
     assert.equal(r.remembered(), port, "the port that worked is the one remembered");
@@ -404,7 +405,7 @@ describe("the real backend", () => {
       writeFileSync(join(r.userData, "web.yaml"), "bogus: 1\n");
       r.rememberPort(await freePort());
 
-      const { backend, token } = r.make();
+      const { backend } = r.make();
       const error = await rejection(backend.start());
       assert.match(error.message, /^aihub-web: .*bogus/);
       assert.equal(error.exitCode, 1);
@@ -413,7 +414,7 @@ describe("the real backend", () => {
       assert.equal(backend.pid, null);
 
       writeFileSync(join(r.userData, "web.yaml"), "");
-      const { origin } = await backend.start();
+      const { origin, token } = await backend.start();
       assert.equal((await get(origin, "/api/health", token)).status, 200);
     },
   );
@@ -434,7 +435,6 @@ describe("the real backend", () => {
     );
     const options = {
       userData: r.userData,
-      token: randomBytes(32).toString("base64url"),
       keysFile: r.keysFile,
       env: { ...PARENT_ENV, HOME: r.dir },
     };
@@ -459,8 +459,8 @@ describe("the real backend", () => {
     { timeout: 60_000, skip: process.platform !== "linux" && "reads /proc/<pid>/environ, which only Linux has" },
     async (t) => {
       const r = rig(t);
-      const { backend, token } = r.make();
-      await backend.start();
+      const { backend } = r.make();
+      const { token } = await backend.start();
 
       const entries = readFileSync(`/proc/${backend.pid}/environ`, "utf8").split("\0").filter(Boolean);
       const vars = Object.fromEntries(
@@ -485,7 +485,10 @@ describe("the real backend", () => {
       ]);
       assert.equal(vars.AIHUB_OPENROUTER_KEY, OPENROUTER_KEY);
       assert.equal(vars.AIHUB_ANTHROPIC_KEY, ANTHROPIC_KEY);
-      assert.equal(vars.AIHUB_LAUNCH_TOKEN, token, "not the token from the file or from the parent");
+      assert.ok(
+        vars.AIHUB_LAUNCH_TOKEN === token,
+        "the child has the token start() returned, not the file's or the parent's",
+      );
       assert.equal(vars.AIHUB_PORT, "0");
       assert.equal(vars.AIHUB_EXIT_ON_STDIN_EOF, "1");
       assert.equal(vars.AIHUB_WEB_CONFIG, join(r.userData, "web.yaml"));
@@ -501,7 +504,8 @@ describe("the real backend", () => {
       // Nothing the app writes down repeats a value of the environment.
       await backend.stop();
       const log = r.log();
-      for (const secret of [token, OPENROUTER_KEY, ANTHROPIC_KEY, ...crossed]) {
+      assert.ok(!log.includes(token), "the log repeats the launch token");
+      for (const secret of [OPENROUTER_KEY, ANTHROPIC_KEY, ...crossed]) {
         assert.ok(!log.includes(secret), `the log repeats ${secret.slice(0, 12)}...`);
       }
     },
@@ -516,16 +520,16 @@ describe("the real backend", () => {
   ]) {
     it(`still starts in ${name}`, { timeout: 60_000 }, async (t) => {
       const r = rig(t);
-      const { backend, token } = r.make({ env: makeEnv(r.dir) });
-      const { origin } = await backend.start();
+      const { backend } = r.make({ env: makeEnv(r.dir) });
+      const { origin, token } = await backend.start();
       assert.equal((await get(origin, "/api/health", token)).status, 200);
     });
   }
 
   it("reports a backend that dies as an exit event, and starts again on request", { timeout: 60_000 }, async (t) => {
     const r = rig(t);
-    const { backend, token } = r.make();
-    await backend.start();
+    const { backend } = r.make();
+    const first = await backend.start();
     const exits = [];
     backend.on("exit", (event) => exits.push(event));
     const pid = backend.pid;
@@ -537,10 +541,29 @@ describe("the real backend", () => {
     assert.equal(backend.origin, null);
     assert.ok(!isAlive(pid));
 
-    const { origin } = await backend.start();
-    assert.equal((await get(origin, "/api/health", token)).status, 200);
+    const second = await backend.start();
+    assert.equal((await get(second.origin, "/api/health", second.token)).status, 200);
+    assert.ok(second.token !== first.token, "the restart reused the token of the backend that died");
+    assert.equal((await get(second.origin, "/api/health", first.token)).status, 401, "the old token still works");
     assert.equal(exits.length, 1, "starting again is not an exit");
   });
+
+  it(
+    "gives every start a token of its own, and the new backend refuses the old one",
+    { timeout: 60_000 },
+    async (t) => {
+      const r = rig(t);
+      const { backend } = r.make();
+      const first = await backend.start();
+      assert.equal((await get(first.origin, "/api/health", first.token)).status, 200);
+      await backend.stop();
+
+      const second = await backend.start();
+      assert.ok(second.token !== first.token, "the second start reused the token of the first");
+      assert.equal((await get(second.origin, "/api/health", second.token)).status, 200);
+      assert.equal((await get(second.origin, "/api/health", first.token)).status, 401, "the old token still works");
+    },
+  );
 });
 
 describe("a stand-in interpreter", () => {
@@ -566,7 +589,9 @@ describe("a stand-in interpreter", () => {
       ].join("\n"),
     });
     const { backend } = r.make();
-    assert.deepEqual(await backend.start(), { port: 4321, origin: "http://127.0.0.1:4321" });
+    const { token, ...found } = await backend.start();
+    assert.deepEqual(found, { port: 4321, origin: "http://127.0.0.1:4321" });
+    assert.equal(typeof token, "string");
     await until(() => existsSync(done), 5000, "the stub to print its last line");
     await sleep(100);
     assert.equal(backend.origin, "http://127.0.0.1:4321", "a second ready line changes nothing");
@@ -778,6 +803,101 @@ describe("a stand-in interpreter", () => {
     });
   });
 
+  describe("the launch token", () => {
+    const TOKEN_SHAPE = /^[A-Za-z0-9_-]{43}$/;
+
+    it("is new for every start, and start() returns the one the child was given", async (t) => {
+      const counter = counterFile(t);
+      const r = rig(t, { stub: `echo "$AIHUB_LAUNCH_TOKEN" >> ${quote(counter)}\n${READY_LINE}\nexec sleep 1000` });
+      const { backend } = r.make();
+      const started = [];
+      for (let i = 0; i < 3; i++) {
+        started.push(await backend.start());
+        await backend.stop();
+      }
+      const given = attempts(counter);
+      assert.equal(given.length, 3);
+      // assert.ok with a plain message throughout: a failed assert.equal would print the tokens.
+      assert.ok(
+        started.every(({ token }, i) => token === given[i]),
+        "start() must return the token its child was given",
+      );
+      assert.equal(new Set(given).size, 3, "a token was used by more than one start");
+      for (const token of given) {
+        assert.ok(TOKEN_SHAPE.test(token), "a token is 43 base64url characters");
+        assert.equal(Buffer.from(token, "base64url").length, 32);
+      }
+    });
+
+    it("is new for the retry on a free port after exit status 3", async (t) => {
+      const counter = counterFile(t);
+      const r = rig(t, {
+        stub: [
+          `echo "$AIHUB_PORT $AIHUB_LAUNCH_TOKEN" >> ${quote(counter)}`,
+          '[ "$AIHUB_PORT" = 0 ] || exit 3',
+          READY_LINE,
+          "exec sleep 1000",
+        ].join("\n"),
+      });
+      r.rememberPort(4999);
+      const { backend } = r.make();
+      const started = await backend.start();
+      const rows = attempts(counter).map((line) => line.split(" "));
+      assert.deepEqual(
+        rows.map(([port]) => port),
+        ["4999", "0"],
+      );
+      assert.ok(rows[0][1] !== rows[1][1], "the retry reused the token of the attempt that failed");
+      assert.ok(rows[1][1] === started.token, "start() must return the token of the attempt that worked");
+      assert.ok(TOKEN_SHAPE.test(rows[0][1]) && TOKEN_SHAPE.test(rows[1][1]), "a token is 43 base64url characters");
+    });
+
+    it("comes from makeToken, once for every spawn", async (t) => {
+      const counter = counterFile(t);
+      const r = rig(t, {
+        stub: [
+          `echo "$AIHUB_PORT $AIHUB_LAUNCH_TOKEN" >> ${quote(counter)}`,
+          '[ "$AIHUB_PORT" = 0 ] || exit 3',
+          READY_LINE,
+          "exec sleep 1000",
+        ].join("\n"),
+      });
+      r.rememberPort(4999);
+      let made = 0;
+      const { backend } = r.make({ makeToken: () => `injected-${++made}` });
+      const started = await backend.start();
+      assert.deepEqual(attempts(counter), ["4999 injected-1", "0 injected-2"]);
+      assert.equal(started.token, "injected-2");
+      assert.equal(made, 2);
+    });
+
+    it("is not taken from the caller of the constructor", async (t) => {
+      const counter = counterFile(t);
+      const r = rig(t, { stub: `echo "$AIHUB_LAUNCH_TOKEN" >> ${quote(counter)}\n${READY_LINE}\nexec sleep 1000` });
+      const { backend } = r.make({ token: "token-from-the-caller" });
+      const { token } = await backend.start();
+      assert.ok(token !== "token-from-the-caller", "start() returned the token its caller gave the constructor");
+      assert.ok(
+        attempts(counter)[0] !== "token-from-the-caller",
+        "the child got the token its caller gave the constructor",
+      );
+      assert.ok(attempts(counter)[0] === token);
+    });
+
+    it("must exist: with no usable token nothing is started", async (t) => {
+      const counter = counterFile(t);
+      const r = rig(t, { stub: `echo started >> ${quote(counter)}\n${READY_LINE}\nexec sleep 1000` });
+      for (const unusable of ["", undefined, null, 7, {}]) {
+        const { backend } = r.make({ makeToken: () => unusable });
+        const error = await rejection(backend.start());
+        assert.ok(error instanceof TypeError, `start() rejected with ${error}`);
+        assert.match(error.message, /launch token/);
+        assert.equal(backend.pid, null);
+      }
+      assert.deepEqual(attempts(counter), [], "a child was started without a token");
+    });
+  });
+
   it("says where the interpreter should have been when it cannot be run", async (t) => {
     const r = rig(t);
     const nowhere = join(r.dir, "nowhere");
@@ -968,12 +1088,11 @@ describe("the Backend class", () => {
     assert.equal(LOG_LIMIT_BYTES, 5 * 1024 * 1024);
   });
 
-  it("needs a data directory and a launch token", () => {
-    assert.throws(() => new Backend({ token: "t" }), TypeError);
-    assert.throws(() => new Backend({ userData: "/x" }), TypeError);
-    assert.throws(() => new Backend({ userData: "", token: "t" }), TypeError);
-    assert.throws(() => new Backend({ userData: "/x", token: "" }), TypeError);
+  it("needs a data directory", () => {
+    assert.throws(() => new Backend({}), TypeError);
+    assert.throws(() => new Backend({ userData: "" }), TypeError);
     assert.throws(() => new Backend(), TypeError);
+    assert.doesNotThrow(() => new Backend({ userData: "/x" }));
   });
 
   it("imports nothing from Electron", () => {

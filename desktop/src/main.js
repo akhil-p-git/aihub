@@ -3,7 +3,6 @@
 // What the window may load, open or ask for is decided in policy.js, and the backend's life in backend.js.
 // There is no preload script and no IPC: the page talks to the backend over HTTP, as in a browser.
 
-import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,9 +19,6 @@ const PAPER = { light: "#f8fafd", dark: "#0c151d" };
 
 // A development run keeps its own data directory (and with it its own single-instance lock and port).
 app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-desktop" : "aihub-desktop-dev"));
-
-// 32 random bytes. The backend refuses /api/ without this value as a cookie, and only this window has it.
-const token = randomBytes(32).toString("base64url");
 
 let backend = null;
 let win = null;
@@ -58,7 +54,6 @@ async function main() {
 
   backend = new Backend({
     userData: app.getPath("userData"),
-    token,
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
   });
@@ -151,7 +146,7 @@ async function showBackend() {
   await session.defaultSession.cookies.set({
     url: origin,
     name: COOKIE,
-    value: token,
+    value: started.token,
     httpOnly: true,
     sameSite: "strict",
     // no expiry: the cookie ends with the session

@@ -12,6 +12,7 @@
 //   "aihub-web: ..." message on stderr.
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -37,6 +38,9 @@ const describeExit = (code, signal) => (signal ? `signal ${signal}` : `exit code
 
 const isPort = (value) => Number.isInteger(value) && value >= 1 && value <= 65535;
 
+/** A launch token: 32 random bytes as base64url, which is 43 characters. */
+const newToken = () => randomBytes(32).toString("base64url");
+
 /** The port of a ready line, or null for any other line. */
 function readyPort(line) {
   let message;
@@ -50,7 +54,7 @@ function readyPort(line) {
 
 export class Backend extends EventEmitter {
   #userData;
-  #token;
+  #makeToken;
   #isPackaged;
   #resourcesPath;
   #repoRoot;
@@ -69,7 +73,9 @@ export class Backend extends EventEmitter {
 
   /**
    * - userData: the app's data directory. It holds web.yaml, state/, pycache/, logs/ and desktop.json.
-   * - token: the launch token. The backend refuses /api/ requests that lack it as the aihub_t cookie.
+   * - makeToken: makes the launch token, which the backend demands as the aihub_t cookie on every /api/ request.
+   *   It is called once for every spawn, the retry on a free port and every restart included, so a token never
+   *   outlives its backend. By default it makes 32 random bytes as base64url; a test can inject its own.
    * - isPackaged, resourcesPath: where the interpreter is. Packaged, it is <resourcesPath>/backend/bin/python3.12.
    * - repoRoot: in development, the interpreter is <repoRoot>/.venv/bin/python and the code is <repoRoot>/app.
    * - keysFile: the file the two provider keys are read from, and nothing else in it.
@@ -81,7 +87,7 @@ export class Backend extends EventEmitter {
    */
   constructor({
     userData,
-    token,
+    makeToken = newToken,
     isPackaged = false,
     resourcesPath = process.resourcesPath,
     repoRoot = REPO_ROOT,
@@ -93,10 +99,9 @@ export class Backend extends EventEmitter {
   } = {}) {
     super();
     if (typeof userData !== "string" || userData === "") throw new TypeError("Backend needs the data directory");
-    if (typeof token !== "string" || token === "") throw new TypeError("Backend needs a launch token");
     if (isPackaged && typeof resourcesPath !== "string") throw new TypeError("A packaged Backend needs resourcesPath");
     this.#userData = userData;
-    this.#token = token;
+    this.#makeToken = makeToken;
     this.#isPackaged = isPackaged;
     this.#resourcesPath = resourcesPath;
     this.#repoRoot = repoRoot;
@@ -122,10 +127,12 @@ export class Backend extends EventEmitter {
   }
 
   /**
-   * Starts the backend and resolves with its port and origin once it has printed its ready line.
+   * Starts the backend and resolves with its port, its origin and its launch token once it has printed its
+   * ready line. The token is the one this spawn was given: the caller has to put it in the page's cookie,
+   * and it is worth nothing to the next backend, which makes its own.
    *
    * It asks for the port of the last run, so that the origin, and with it the page's saved settings, stay
-   * the same. If that port is taken (exit status 3) it tries once more with a free one.
+   * the same. If that port is taken (exit status 3) it tries once more with a free one, and a new token.
    */
   async start() {
     if (this.#starting || this.#child) throw new Error("The aihub backend is already running.");
@@ -182,15 +189,19 @@ export class Backend extends EventEmitter {
     return { python, args: ["-X", pycache, "-m", "aihub_web"], pythonPath: join(this.#repoRoot, "app") };
   }
 
-  /** Runs the backend once. Resolves at the ready line; rejects if it ends or times out before. */
+  /**
+   * Runs the backend once, with a launch token made for this spawn alone. Resolves at the ready line; rejects
+   * if it ends or times out before.
+   */
   #launch(port, keys) {
     return new Promise((resolve, reject) => {
       const { python, args, pythonPath } = this.#command();
+      const token = this.#makeToken();
       const env = buildChildEnv({
         parent: this.#env,
         userData: this.#userData,
         port,
-        token: this.#token,
+        token,
         keys,
         pythonPath,
       });
@@ -223,7 +234,7 @@ export class Backend extends EventEmitter {
         clearTimeout(readyTimer);
         this.#origin = `http://127.0.0.1:${found}`;
         this.#note("the backend is ready");
-        resolve({ port: found, origin: this.#origin });
+        resolve({ port: found, origin: this.#origin, token });
       });
 
       createInterface({ input: child.stderr }).on("line", (line) => {
