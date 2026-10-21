@@ -565,9 +565,14 @@ class ImageJobs:
 
     async def _take_the_gpu(self, job: Job) -> None:
         # Assigned in the same step that gets the lock, so a Stop at that instant cannot lose the lease.
-        job.lease = await self.gpu.exclusive(
-            wait=self._pacing.lock_wait, tick=self._pacing.tick
-        )
+        try:
+            job.lease = await self.gpu.exclusive(
+                wait=self._pacing.lock_wait, tick=self._pacing.tick
+            )
+        except OSError as err:  # the engine's socket directory is gone
+            raise ImageError(
+                "engine_unreachable", MESSAGES["engine_unreachable"]
+            ) from err
 
     async def _work(self, job: Job) -> bytes:
         plan, pace = job.plan, self._pacing

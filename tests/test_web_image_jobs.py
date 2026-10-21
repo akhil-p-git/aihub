@@ -94,6 +94,7 @@ async def rig(
     pacing: Pacing = FAST,
     deadline: Callable[[float], float] = lambda est_s: 30.0,
     monotonic: Callable[[], float] = time.monotonic,
+    lock_directory: Path | None = None,
 ) -> AsyncIterator[Rig]:
     timeline: list = []
     engine = engine or FakeEngine()
@@ -103,7 +104,7 @@ async def rig(
     client = httpx2.AsyncClient(
         transport=httpx2.MockTransport(handler_for(ollama=ollama))
     )
-    lock = GpuLock(socket_dir)
+    lock = GpuLock(lock_directory or socket_dir)
     jobs = ImageJobs(
         store,
         EngineClient("/never/used.sock", transport=transport or engine.transport()),
@@ -510,6 +511,20 @@ class TestWhenItGoesWrong:
             tmp_path, socket_dir, engine=engine, transport=httpx2.MockTransport(flaky)
         ) as r:
             assert (await self.run_to_the_end(r))["code"] == "engine_crashed"
+
+    async def test_a_socket_directory_that_has_vanished_means_no_engine(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        async with rig(
+            tmp_path, socket_dir, lock_directory=socket_dir / "vanished"
+        ) as r:
+            chat_id = r.chat()
+            events = await collect(r.jobs.start(plan_for(chat_id)))
+            error = events[-1]["message"]["error"]
+            assert error["code"] == "engine_unreachable"
+            assert error["message"].startswith("The image engine isn't running.")
+            assert r.replies(chat_id)[0].status == "error"
+            assert r.engine.calls == [] and r.jobs.pending(chat_id) is None
 
     async def test_a_cancel_nobody_asked_for_is_a_failure(
         self, tmp_path: Path, socket_dir: Path
