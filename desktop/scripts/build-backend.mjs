@@ -495,17 +495,27 @@ function run(command, args, { cwd, env, input, what = command } = {}) {
   });
 }
 
-/** The locked runtime dependencies as requirements.txt text, with their hashes. */
-async function exportRequirements() {
-  // --frozen: use uv.lock as it is, never re-resolve; hashes are part of the output unless --no-hashes is given.
+/** The arguments of uv export: the runtime dependencies of uv.lock as they are locked, hashes included. */
+export function uvExportArgs() {
+  // --frozen: use uv.lock as it is, never re-resolve. The hashes are part of the output unless --no-hashes is given.
   const args = ["export", "--frozen", "--no-dev", "--no-emit-project", "--format", "requirements.txt"];
   args.push("--no-header", "--no-annotate");
-  const { stdout } = await run("uv", args, { cwd: repoRoot, what: "uv export" });
+  return args;
+}
+
+/** The locked runtime dependencies as requirements.txt text, with their hashes. */
+export async function exportRequirements() {
+  const { stdout } = await run("uv", uvExportArgs(), { cwd: repoRoot, what: "uv export" });
   return stdout;
 }
 
-async function extract(archive, work) {
-  await run("tar", ["-xzf", archive, "--strip-components=1", "-C", work], { what: "tar" });
+/** The arguments of tar for unpacking `archive` into `dest` without the archive's top-level folder. */
+export function tarExtractArgs(archive, dest) {
+  return ["-xzf", archive, "--strip-components=1", "-C", dest];
+}
+
+export async function extract(archive, work) {
+  await run("tar", tarExtractArgs(archive, work), { what: "tar" });
 }
 
 /** The CPython version the archive holds, from its headers (read before include/ is pruned). */
@@ -517,9 +527,18 @@ function readPythonVersion(work) {
   return version;
 }
 
-async function installDependencies(target, work, requirements) {
-  const { triple, host } = TARGETS[target];
-  const site = join(work, "lib", `python${PYTHON_MINOR}`, "site-packages");
+/** Whether this machine can run the target's interpreter. */
+export function canRunTarget(target, platform = process.platform, arch = process.arch) {
+  const { host } = TARGETS[target];
+  return host.platform === platform && host.arch === arch;
+}
+
+/**
+ * The arguments of uv pip install for the target's wheels: only hashed wheels (the requirements come on stdin
+ * with their hashes), copied rather than linked into uv's cache, for the target's platform and Python 3.12.
+ * `python` is the interpreter that uv asks about the machine it runs on; without one uv looks for its own.
+ */
+export function uvInstallArgs(target, site, python = null) {
   const args = [
     "pip",
     "install",
@@ -528,7 +547,7 @@ async function installDependencies(target, work, requirements) {
     "--target",
     site,
     "--python-platform",
-    triple,
+    TARGETS[target].triple,
     "--python-version",
     PYTHON_MINOR,
     "--only-binary",
@@ -539,12 +558,18 @@ async function installDependencies(target, work, requirements) {
     "-r",
     "-",
   ];
+  if (python) args.push("--python", python);
+  return args;
+}
+
+export async function installDependencies(target, work, requirements) {
+  const site = join(work, "lib", `python${PYTHON_MINOR}`, "site-packages");
   // uv needs some interpreter to ask about the host. The target's own is used when this machine can run it, so a
   // Mac with only Node and uv installed can build its own architecture; for the other targets uv finds one on the
   // machine (UV_PYTHON picks it). uv may not download one: with no interpreter at all it would fetch a CPython
   // that nothing here pins.
-  const native = host.platform === process.platform && host.arch === process.arch;
-  if (native) args.push("--python", join(work, "bin", `python${PYTHON_MINOR}`));
+  const python = canRunTarget(target) ? join(work, "bin", `python${PYTHON_MINOR}`) : null;
+  const args = uvInstallArgs(target, site, python);
   // Run from the temp folder, not from inside the repository: uv would read the repository's pyproject.toml
   // settings and look for its .venv there. PYTHONDONTWRITEBYTECODE keeps uv's query of the payload's own
   // interpreter from writing .pyc files into the payload.

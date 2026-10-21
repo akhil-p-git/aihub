@@ -1,4 +1,5 @@
-// The pure parts of scripts/build-backend.mjs: no network, no uv, no archive.
+// scripts/build-backend.mjs without the network, the real uv or the real archive: its pure parts, and the parts that
+// run uv and tar, against a stand-in uv that records how it was called and the real tar on a tiny archive.
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -10,13 +11,14 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -31,13 +33,20 @@ import {
   assertHttps,
   auditPayload,
   buildAtomically,
+  canRunTarget,
+  exportRequirements,
+  extract,
   failureReason,
+  installDependencies,
   parseTarget,
   pbsAgeDays,
   prune,
   requiredFiles,
   sha256File,
   shouldPrune,
+  tarExtractArgs,
+  uvExportArgs,
+  uvInstallArgs,
   verifyArchive,
 } from "../scripts/build-backend.mjs";
 
@@ -649,5 +658,239 @@ describe("the age of the release", () => {
     for (const tag of ["2026-10-03", "20261303", "20260230", "latest"]) {
       assert.throws(() => pbsAgeDays(tag), BuildError, tag);
     }
+  });
+});
+
+describe("the uv and tar arguments", () => {
+  /** The value that follows `flag`, which must be there. */
+  function valueOf(args, flag) {
+    const at = args.indexOf(flag);
+    assert.notEqual(at, -1, `${flag} is missing from: ${args.join(" ")}`);
+    return args[at + 1];
+  }
+
+  it("exports the runtime dependencies from uv.lock as it is, hashes included", () => {
+    const args = uvExportArgs();
+    assert.equal(args[0], "export");
+    for (const flag of ["--frozen", "--no-dev", "--no-emit-project"]) assert.ok(args.includes(flag), flag);
+    assert.equal(valueOf(args, "--format"), "requirements.txt");
+    assert.ok(!args.includes("--no-hashes"), "the hashes stay in the output");
+  });
+
+  it("installs only hashed wheels, copied, for the target's platform and Python 3.12", () => {
+    const triples = [
+      ["linux-x64", "x86_64-unknown-linux-gnu"],
+      ["mac-arm64", "aarch64-apple-darwin"],
+      ["mac-x64", "x86_64-apple-darwin"],
+    ];
+    for (const [target, triple] of triples) {
+      const args = uvInstallArgs(target, "/work/site");
+      assert.deepEqual(args.slice(0, 2), ["pip", "install"], target);
+      assert.equal(valueOf(args, "--link-mode"), "copy", target);
+      assert.equal(valueOf(args, "--target"), "/work/site", target);
+      assert.equal(valueOf(args, "--python-platform"), triple, target);
+      assert.equal(valueOf(args, "--python-version"), "3.12", target);
+      assert.equal(valueOf(args, "--only-binary"), ":all:", target);
+      assert.equal(valueOf(args, "-r"), "-", `${target}: the requirements come on stdin`);
+      for (const flag of ["--require-hashes", "--no-python-downloads"]) assert.ok(args.includes(flag), flag);
+    }
+  });
+
+  it("names an interpreter for uv only when it is given one", () => {
+    assert.ok(!uvInstallArgs("mac-arm64", "/work/site").includes("--python"));
+    assert.ok(!uvInstallArgs("mac-arm64", "/work/site", null).includes("--python"));
+    assert.equal(
+      valueOf(uvInstallArgs("linux-x64", "/work/site", "/work/bin/python3.12"), "--python"),
+      "/work/bin/python3.12",
+    );
+  });
+
+  it("unpacks the archive without its top-level folder, into the folder it is given", () => {
+    assert.deepEqual(tarExtractArgs("/cache/a.tar.gz", "/work"), [
+      "-xzf",
+      "/cache/a.tar.gz",
+      "--strip-components=1",
+      "-C",
+      "/work",
+    ]);
+  });
+
+  it("can run a target's interpreter only on the platform and CPU it was built for", () => {
+    assert.equal(canRunTarget("linux-x64", "linux", "x64"), true);
+    assert.equal(canRunTarget("linux-x64", "linux", "arm64"), false);
+    assert.equal(canRunTarget("linux-x64", "darwin", "x64"), false);
+    assert.equal(canRunTarget("mac-arm64", "darwin", "arm64"), true);
+    assert.equal(canRunTarget("mac-arm64", "darwin", "x64"), false);
+    assert.equal(canRunTarget("mac-x64", "darwin", "x64"), true);
+    // Rosetta would run it on an Apple silicon Mac; the script does not rely on that.
+    assert.equal(canRunTarget("mac-x64", "darwin", "arm64"), false);
+    assert.equal(canRunTarget("mac-x64", "linux", "x64"), false);
+  });
+});
+
+describe("running uv", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  let savedPath;
+
+  // A uv that writes down how it was called (directory, environment, arguments, standard input) and then prints a
+  // requirements file, or, by STUB_UV_MODE, fails the way uv does: finding no Python, a hash mismatch, an error
+  // after some output on stdout, or being killed.
+  const stubUv = [
+    "#!/bin/sh",
+    "{",
+    '  echo "cwd=$PWD"',
+    '  echo "bytecode=${PYTHONDONTWRITEBYTECODE-unset}"',
+    '  for arg in "$@"; do echo "arg=$arg"; done',
+    '  echo "stdin-follows"',
+    "  cat",
+    '} > "$STUB_UV_LOG"',
+    'case "$STUB_UV_MODE" in',
+    '  no-interpreter) echo "error: No interpreter found for Python 3.12 in the system path" >&2; exit 2 ;;',
+    "  hash-mismatch) echo 'error: Failed to download `idna==3.20`' >&2; echo '  cause: Hash mismatch' >&2; exit 2 ;;",
+    '  partial) echo "idna==3.20"; echo "error: the lock file needs to be updated" >&2; exit 1 ;;',
+    "  killed) kill -9 $$ ;;",
+    "esac",
+    'echo "idna==3.20 \\\\"',
+    'echo "    --hash=sha256:00"',
+    "",
+  ].join("\n");
+
+  beforeEach(() => {
+    const bin = join(scratch, "stub-bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "uv"), stubUv, { mode: 0o755 });
+    savedPath = process.env.PATH;
+    process.env.PATH = `${bin}${delimiter}${savedPath}`;
+    process.env.STUB_UV_LOG = join(scratch, "uv-call.txt");
+  });
+  afterEach(() => {
+    process.env.PATH = savedPath;
+    delete process.env.STUB_UV_LOG;
+    delete process.env.STUB_UV_MODE;
+  });
+
+  /** What the stand-in uv wrote down about its last call. */
+  function call() {
+    const lines = readFileSync(process.env.STUB_UV_LOG, "utf8").split("\n");
+    const field = (name) => lines.find((line) => line.startsWith(`${name}=`))?.slice(name.length + 1);
+    return {
+      cwd: field("cwd"),
+      bytecode: field("bytecode"),
+      args: lines.filter((line) => line.startsWith("arg=")).map((line) => line.slice(4)),
+      stdin: lines.slice(lines.indexOf("stdin-follows") + 1).join("\n"),
+    };
+  }
+
+  /** A work folder as the archive leaves it: site-packages holding pip and two installed packages. */
+  function workFolder() {
+    const work = join(scratch, "work");
+    lay(work, [
+      "lib/python3.12/site-packages/idna/__init__.py",
+      "lib/python3.12/site-packages/idna-3.20.dist-info/METADATA",
+      "lib/python3.12/site-packages/yaml-6.0.dist-info/METADATA",
+      "lib/python3.12/site-packages/pip-26.2.1.dist-info/METADATA",
+    ]);
+    return work;
+  }
+
+  it("exports from the repository root with uvExportArgs and returns what uv prints", async () => {
+    const text = await exportRequirements();
+    const seen = call();
+    assert.deepEqual(seen.args, uvExportArgs());
+    assert.equal(realpathSync(seen.cwd), realpathSync(repoRoot));
+    assert.equal(text, "idna==3.20 \\\n    --hash=sha256:00\n");
+  });
+
+  it("installs from the temp folder with the requirements on stdin and no bytecode, and counts the packages", async () => {
+    const work = workFolder();
+    const site = join(work, "lib/python3.12/site-packages");
+    const requirements = "idna==3.20 \\\n    --hash=sha256:00\n";
+
+    const packages = await installDependencies("linux-x64", work, requirements);
+
+    const seen = call();
+    const python = canRunTarget("linux-x64") ? join(work, "bin/python3.12") : null;
+    assert.deepEqual(seen.args, uvInstallArgs("linux-x64", site, python));
+    assert.equal(seen.stdin, requirements);
+    assert.equal(seen.bytecode, "1", "uv's query of the payload's interpreter must not write .pyc files");
+    assert.equal(
+      realpathSync(seen.cwd),
+      realpathSync(tmpdir()),
+      "not the repository, whose pyproject.toml uv would read",
+    );
+    assert.equal(packages, 2, "pip's own dist-info is not a locked package");
+  });
+
+  it("leaves the choice of interpreter to uv for a target that this machine cannot run", async () => {
+    const other = process.platform === "darwin" ? "linux-x64" : "mac-arm64";
+    await installDependencies(other, workFolder(), "x\n");
+    assert.ok(!call().args.includes("--python"));
+  });
+
+  it("turns uv's failure into one line, with what to do when it found no Python", async () => {
+    process.env.STUB_UV_MODE = "no-interpreter";
+    await assert.rejects(
+      installDependencies("mac-arm64", workFolder(), "x\n"),
+      (err) =>
+        err instanceof BuildError &&
+        !err.message.includes("\n") &&
+        /^uv pip install failed \(exit 2\): error: No interpreter found for Python 3\.12.*UV_PYTHON/.test(err.message),
+    );
+    await assert.rejects(exportRequirements(), /^BuildError: uv export failed \(exit 2\): error: No interpreter found/);
+  });
+
+  it("gives uv's own reason, cause line included, without Python advice, when it fails for another reason", async () => {
+    process.env.STUB_UV_MODE = "hash-mismatch";
+    await assert.rejects(
+      installDependencies("linux-x64", workFolder(), "x\n"),
+      (err) =>
+        err instanceof BuildError &&
+        err.message === "uv pip install failed (exit 2): error: Failed to download `idna==3.20`; cause: Hash mismatch",
+    );
+  });
+
+  it("reads the reason from stderr when the program printed on stdout first, and names the signal that killed it", async () => {
+    process.env.STUB_UV_MODE = "partial";
+    await assert.rejects(exportRequirements(), /^BuildError: uv export failed \(exit 1\): error: the lock file needs/);
+    process.env.STUB_UV_MODE = "killed";
+    await assert.rejects(exportRequirements(), /^BuildError: uv export failed \(signal SIGKILL\): no output$/);
+  });
+
+  it("says so when uv is not installed", async () => {
+    process.env.PATH = join(scratch, "no-programs");
+    await assert.rejects(
+      exportRequirements(),
+      (err) => err instanceof BuildError && err.message === "uv was not found on PATH",
+    );
+  });
+});
+
+describe("extract", () => {
+  function archive() {
+    const source = join(scratch, "source");
+    lay(source, ["python/bin/python3.12", "python/lib/python3.12/os.py"]);
+    const file = join(scratch, "archive.tar.gz");
+    const made = spawnSync("tar", ["-czf", file, "-C", source, "python"], { encoding: "utf8" });
+    assert.equal(made.status, 0, made.stderr);
+    return file;
+  }
+
+  it("unpacks the files of the archive's top-level folder into the work folder", async () => {
+    const work = join(scratch, "work");
+    mkdirSync(work);
+    await extract(archive(), work);
+    assert.deepEqual(listing(work), ["bin", "bin/python3.12", "lib", "lib/python3.12", "lib/python3.12/os.py"]);
+  });
+
+  it("reports a file that is not an archive in one line", async () => {
+    const work = join(scratch, "work");
+    mkdirSync(work);
+    const file = join(scratch, "not-an-archive.tar.gz");
+    writeFileSync(file, "this is not a tar file\n");
+    await assert.rejects(
+      extract(file, work),
+      (err) => err instanceof BuildError && /^tar failed \(exit \d+\)/.test(err.message) && !err.message.includes("\n"),
+    );
+    assert.deepEqual(listing(work), []);
   });
 });
