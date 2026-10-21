@@ -24,11 +24,13 @@ const PAPER = { light: "#f8fafd", dark: "#0c151d" };
 // A development run keeps its own data directory (and with it its own single-instance lock and port).
 app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-desktop" : "aihub-desktop-dev"));
 
-// Render in software. On this machine (NVIDIA driver 615.78.08 on KDE Wayland) Chromium's GPU process dies with
-// SIGSEGV on a NULL pointer, in libnvidia-eglcore or in Chromium just after it, three times at every start, whenever
-// the driver refuses it a GPU channel group (the kernel log shows NV_ERR_STATE_IN_USE just before). Each crash leaves
-// a 4 to 5 MB core dump on /, and Chromium gives up on the GPU after the third anyway. Software rendering is enough
-// for a text chat, and the app then holds no GPU memory or channels, which local image generation needs.
+// Render in software. On this machine (NVIDIA driver 615.78.08, KDE Wayland) Chromium's GPU process dies with SIGSEGV
+// at start whenever the driver refuses it a GPU channel group (the kernel log shows NV_ERR_STATE_IN_USE just before).
+// That comes and goes: the same build crashed on some launches and not on others. Chromium starts the GPU process
+// three times before it gives up, and each crash leaves a 4 to 5 MB core dump on /. No switch that keeps GPU rendering
+// avoided it (--disable-gpu-compositing, ANGLE on EGL, the ozone flags and --disable-gpu-sandbox were tried). A text
+// chat does not need the GPU, and with this switch the app opens no NVIDIA device and holds no GPU memory, which
+// local image generation can use instead.
 app.commandLine.appendSwitch("disable-gpu");
 
 // No host name resolves except the backend's address (see policy.js): a link the pointer only touches is not looked up.
