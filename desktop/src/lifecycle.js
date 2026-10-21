@@ -94,8 +94,14 @@ export class Lifecycle {
 
   /** Takes what the window held for the backend at `gone` (null if it held nothing): the page, and the cookie. */
   async #forget(gone) {
-    this.#showLoadingPage();
+    this.#startLoadingPage();
     if (gone !== null) await this.#cookies.remove(gone, COOKIE);
+  }
+
+  /** The loading page as the start of an episode (a backend has ended, or one is about to start), with a full budget. */
+  #startLoadingPage() {
+    this.#repeats = 0;
+    this.#showLoadingPage();
   }
 
   #showLoadingPage() {
@@ -133,7 +139,7 @@ export class Lifecycle {
    * The origin is set last, once the cookie is in place, so a start that fails leaves it null.
    */
   async #show() {
-    this.#showLoadingPage();
+    this.#startLoadingPage();
     const started = await this.#backend.start();
     if (this.#quitting) return;
     const stillUp = () => this.#backend.origin === started.origin;

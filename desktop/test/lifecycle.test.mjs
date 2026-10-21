@@ -58,8 +58,10 @@ function rig() {
   const window = {
     destroyed: false,
     url: "",
-    // What the next loadFile lands on instead of the page it was asked for, as when Chromium shows its error page.
+    // What loadFile lands on instead of the page it was asked for, as when Chromium shows its error page, and for
+    // how many loads from now on.
     landOn: null,
+    landFor: Infinity,
     onLoadURL: null,
     webContents: Object.assign(new EventEmitter(), {
       getURL: () => window.url,
@@ -69,7 +71,9 @@ function rig() {
     },
     async loadFile(path) {
       log.push({ type: "loadFile", path });
-      this.url = this.landOn ?? pathToFileURL(path).href;
+      const lands = this.landOn !== null && this.landFor > 0;
+      if (lands) this.landFor--;
+      this.url = lands ? this.landOn : pathToFileURL(path).href;
       this.webContents.emit("did-stop-loading");
     },
     async loadURL(url) {
@@ -524,6 +528,28 @@ describe("the loading page", () => {
     staleSettles(r);
     await settle();
     assert.equal(r.all("loadFile").length, 11, "five more repeats, from a budget that started over");
+  });
+
+  it("starts every episode with a full budget of repeats", async () => {
+    const r = rig();
+    await r.up(4001);
+    r.window.landOn = STALE; // the first episode never gets the loading page, and uses up the budget
+    r.backend.die();
+    await settle();
+    assert.equal(r.all("loadFile").length, 6);
+
+    r.backend.willStart(reply(4002, "token-two"));
+    r.dialogs[0].answer(0);
+    await settle();
+    assert.equal(r.lifecycle.origin, "http://127.0.0.1:4002");
+
+    // Second episode: the first two loads land elsewhere again, and the third gets through.
+    r.log.length = 0;
+    r.window.landFor = 2;
+    r.backend.die();
+    await settle();
+    assert.equal(r.all("loadFile").length, 3, "the ask of the exit handler and two repeats");
+    assert.equal(r.window.url, loadingUrl);
   });
 
   it("is not mistaken for a page whose address merely contains its name", async () => {
