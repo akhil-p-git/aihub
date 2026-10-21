@@ -97,11 +97,27 @@ describe("the pin table", () => {
     assert.equal(new Set(Object.values(TARGETS).map((t) => t.sha256)).size, 3, "each archive has its own hash");
   });
 
-  it("names the install_only_stripped archive of the pinned release", () => {
-    assert.equal(
-      archiveName("linux-x64"),
-      `cpython-${PYTHON_VERSION}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz`,
-    );
+  // A new release changes the tag, the version and the three hashes together, here and in the script.
+  it("pins CPython 3.12.15 from python-build-standalone release 20261003", () => {
+    assert.equal(PYTHON_VERSION, "3.12.15");
+    assert.equal(PBS_TAG, "20261003");
+  });
+
+  it("holds the sha256 values that the release's SHA256SUMS file lists for the three archives", () => {
+    // https://github.com/astral-sh/python-build-standalone/releases/download/20261003/SHA256SUMS
+    assert.deepEqual(Object.fromEntries(Object.entries(TARGETS).map(([name, { sha256 }]) => [name, sha256])), {
+      "linux-x64": "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91",
+      "mac-arm64": "ad8d0c637c0a36b967b310e2c07254f4d2ca8cabaa7699e55ed6290aceb481a2",
+      "mac-x64": "562c30864ece2cb1d3e0ad66a1acd498611a47e5a10ce81b99158bef1ccbd355",
+    });
+  });
+
+  it("names the install_only_stripped archive of the pinned release for each target", () => {
+    assert.deepEqual(Object.keys(TARGETS).map(archiveName), [
+      "cpython-3.12.15+20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "cpython-3.12.15+20261003-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "cpython-3.12.15+20261003-x86_64-apple-darwin-install_only_stripped.tar.gz",
+    ]);
   });
 
   it("downloads over https from the release's asset path, with the + written as %2B", () => {
@@ -110,8 +126,8 @@ describe("the pin table", () => {
     assert.equal(url.host, "github.com");
     assert.equal(
       url.pathname,
-      `/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/` +
-        `cpython-${PYTHON_VERSION}%2B${PBS_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz`,
+      "/astral-sh/python-build-standalone/releases/download/20261003/" +
+        "cpython-3.12.15%2B20261003-aarch64-apple-darwin-install_only_stripped.tar.gz",
     );
   });
 
@@ -162,6 +178,25 @@ describe("verifyArchive", () => {
       writeFileSync(file, bytes.subarray(0, cut));
       await assert.rejects(verifyArchive(file, sha256), /sha256 mismatch/, `cut at ${cut}`);
       assert.ok(!existsSync(file));
+    }
+  });
+
+  it("compares all 64 characters: a pin that differs in any one of them is a mismatch", async () => {
+    const file = join(scratch, "archive.tar.gz");
+    for (let at = 0; at < sha256.length; at++) {
+      const other = sha256[at] === "0" ? "1" : "0";
+      const wrong = sha256.slice(0, at) + other + sha256.slice(at + 1);
+      writeFileSync(file, bytes);
+      await assert.rejects(verifyArchive(file, wrong), /sha256 mismatch/, `character ${at}`);
+      assert.ok(!existsSync(file), `character ${at}: the file is deleted`);
+    }
+  });
+
+  it("compares the whole lowercase digest: a shorter, longer or upper-case pin is a mismatch", async () => {
+    const file = join(scratch, "archive.tar.gz");
+    for (const wrong of [sha256.slice(0, 63), sha256.slice(0, 32), `${sha256}0`, sha256.toUpperCase(), ""]) {
+      writeFileSync(file, bytes);
+      await assert.rejects(verifyArchive(file, wrong), /sha256 mismatch/, JSON.stringify(wrong));
     }
   });
 });
