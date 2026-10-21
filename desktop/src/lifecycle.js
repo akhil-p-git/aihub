@@ -29,7 +29,7 @@ export class Lifecycle {
   #repeats = 0;
 
   /**
-   * - backend: the Backend: start(), isAlive(), origin, logPath and an "exit" event.
+   * - backend: the Backend: start(), stop(), isAlive(), origin, logPath and an "exit" event.
    * - window: the BrowserWindow that shows the loading page and then the backend's page.
    * - cookies: the cookie jar of the window's session: set(cookie) and remove(url, name).
    * - showDialog(options): the message box; resolves with { response }.
@@ -191,6 +191,11 @@ export class Lifecycle {
           return;
         }
         try {
+          // A page that failed to load leaves its backend running, and start() refuses while one runs. When none
+          // runs (it died, or never started) there is nothing to stop. The exit of the one that is stopped here
+          // reaches #ended, which takes its origin and cookie and finds the dialog still open.
+          await this.#backend.stop();
+          if (this.#quitting) return;
           await this.#show();
           return;
         } catch (error) {

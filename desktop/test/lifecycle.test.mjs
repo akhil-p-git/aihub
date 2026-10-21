@@ -23,6 +23,8 @@ const settle = async () => {
  * `backend.willStart(...)` queues what the next starts answer: a reply, or an Error to fail with.
  * `backend.die()` ends the running backend the way a crash does: it is no longer alive and its origin goes, then
  * "exit" is emitted. Setting `backend.alive = false` alone is the moment between the process dying and Node saying so.
+ * Like the real Backend, `start()` refuses while the process runs, and `stop()` does nothing when none runs and
+ * otherwise ends it, "exit" included, before it resolves.
  */
 function rig() {
   const log = [];
@@ -39,11 +41,17 @@ function rig() {
     },
     async start() {
       log.push({ type: "backend-start" });
+      if (this.alive) throw new Error("The aihub backend is already running.");
       const answer = this.queue.shift();
       if (answer instanceof Error) throw answer;
       this.origin = answer.origin;
       this.alive = true;
       return answer;
+    },
+    async stop() {
+      if (!this.alive) return;
+      log.push({ type: "backend-stop" });
+      this.die({ code: null, signal: "SIGTERM" });
     },
     isAlive() {
       return this.alive;
@@ -286,6 +294,90 @@ describe("the first start", () => {
     assert.match(r.dialogs[0].options.detail, /^net::ERR_CONNECTION_REFUSED\n\nLog: /);
     r.dialogs[0].answer(1);
     await done;
+  });
+});
+
+describe("a restart after the first page failed to load", () => {
+  /** The first load of a rig fails with ERR_ABORTED, as when a reload interrupts it, and the backend is up. */
+  async function failedFirstLoad(...next) {
+    const r = rig();
+    r.window.onLoadURL = async () => {
+      r.window.onLoadURL = null; // only this load fails
+      throw new Error("net::ERR_ABORTED");
+    };
+    r.backend.willStart(reply(4001, "token-one"), ...next);
+    const done = r.lifecycle.start();
+    await settle();
+    assert.equal(r.dialogs.length, 1);
+    assert.equal(r.dialogs[0].options.message, "aihub could not start its backend.");
+    assert.match(r.dialogs[0].options.detail, /^net::ERR_ABORTED\n\nLog: /);
+    assert.equal(r.backend.alive, true, "the backend whose page failed to load is still running");
+    return { r, done };
+  }
+
+  it("stops the backend that still runs, then starts another and loads its page", async () => {
+    const { r, done } = await failedFirstLoad(reply(4002, "token-two"));
+    r.log.length = 0;
+    r.dialogs[0].answer(0);
+    await settle();
+
+    assert.equal(r.dialogs.length, 1, "no second dialog, neither for a refused start nor for the exit the stop caused");
+    await done;
+    assert.deepEqual(
+      r.types().filter((type) => type.startsWith("backend-")),
+      ["backend-stop", "backend-start"],
+      "the old backend is gone before the new one is asked for",
+    );
+    assert.equal(r.all("fail").length, 0);
+    assert.deepEqual(
+      r.all("cookie-remove").map(({ url }) => url),
+      ["http://127.0.0.1:4001"],
+    );
+    assert.equal(r.first("cookie-set").cookie.value, "token-two");
+    assert.equal(r.first("loadURL").url, "http://127.0.0.1:4002");
+    assert.equal(r.lifecycle.origin, "http://127.0.0.1:4002");
+    assert.equal(r.all("quit").length, 0);
+  });
+
+  it("asks again when the new backend cannot start, and stops nothing the second time", async () => {
+    const { r, done } = await failedFirstLoad(new Error("second failure"), reply(4002, "token-two"));
+    r.log.length = 0;
+    r.dialogs[0].answer(0);
+    await settle();
+
+    assert.equal(r.dialogs.length, 2);
+    assert.match(r.dialogs[1].options.detail, /^second failure\n\nLog: /);
+    assert.equal(r.lifecycle.origin, null);
+    r.dialogs[1].answer(0);
+    await done;
+
+    assert.equal(r.all("backend-stop").length, 1, "the first Restart stopped the backend; the second had none");
+    assert.equal(r.all("backend-start").length, 2);
+    assert.equal(r.lifecycle.origin, "http://127.0.0.1:4002");
+    assert.equal(r.dialogs.length, 2);
+  });
+
+  it("starts no other backend when the app began to leave while the old one was stopping", async () => {
+    const { r, done } = await failedFirstLoad(reply(4002, "token-two"));
+    r.log.length = 0;
+    let finishStop;
+    r.backend.stop = () =>
+      new Promise((resolve) => {
+        finishStop = () => {
+          r.backend.die({ code: null, signal: "SIGTERM" });
+          resolve();
+        };
+      });
+    r.dialogs[0].answer(0);
+    await settle();
+    assert.equal(typeof finishStop, "function", "Restart asks the old backend to stop first");
+    r.lifecycle.beginQuit();
+    finishStop();
+    await done;
+
+    assert.equal(r.all("backend-start").length, 0);
+    assert.equal(r.dialogs.length, 1);
+    assert.equal(r.lifecycle.origin, null);
   });
 });
 
