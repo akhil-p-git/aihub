@@ -1,0 +1,18 @@
+{
+  "name": "aihub-desktop",
+  "productName": "aihub",
+  "version": "0.1.0",
+  "private": true,
+  "desktopName": "dev.akhil-p.aihub.desktop",
+  "main": "src/main.js",
+  "type": "module",
+  "scripts": {
+    "prestart": "node node_modules/electron/install.js",
+    "start": "electron .",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "devDependencies": {
+    "electron": "44.6.0",
+    "electron-builder": "26.17.0"
+  }
+}
