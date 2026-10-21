@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- No script, no network: this page only shows that the backend is starting. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <title>aihub</title>
+    <style>
+      /* The colour roles of the app's own stylesheet, so the window does not change colour when the chat loads. */
+      :root {
+        color-scheme: light dark;
+        --paper: light-dark(oklch(0.985 0.004 250), oklch(0.19 0.022 250));
+        --ink: light-dark(oklch(0.25 0.025 250), oklch(0.94 0.008 250));
+        --muted: light-dark(oklch(0.5 0.025 250), oklch(0.72 0.02 250));
+        --primary: light-dark(oklch(0.46 0.17 350), oklch(0.76 0.13 350));
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      body {
+        display: grid;
+        place-items: center;
+        min-block-size: 100dvh;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: system-ui, sans-serif;
+      }
+      main {
+        display: grid;
+        justify-items: center;
+        gap: 0.75rem;
+      }
+      .mark {
+        inline-size: 3rem;
+        block-size: 3rem;
+        fill: var(--primary);
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+      }
+      p {
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .mark rect {
+          transform-box: fill-box;
+          transform-origin: bottom;
+          animation: rise 1.2s ease-in-out infinite alternate;
+        }
+        .mark rect:nth-child(2) {
+          animation-delay: 0.15s;
+        }
+        .mark rect:nth-child(3) {
+          animation-delay: 0.3s;
+        }
+        .mark rect:nth-child(4) {
+          animation-delay: 0.45s;
+        }
+      }
+      @keyframes rise {
+        from {
+          transform: scaleY(0.55);
+        }
+        to {
+          transform: scaleY(1);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg class="mark" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+        <rect x="2" y="12" width="3" height="6" rx="1" />
+        <rect x="6.5" y="9" width="3" height="9" rx="1" />
+        <rect x="11" y="6" width="3" height="12" rx="1" />
+        <rect x="15.5" y="3" width="3" height="15" rx="1" />
+      </svg>
+      <h1>aihub</h1>
+      <p role="status">Starting…</p>
+    </main>
+  </body>
+</html>
