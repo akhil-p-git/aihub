@@ -24,10 +24,10 @@ const PAPER = { light: "#f8fafd", dark: "#0c151d" };
 app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-desktop" : "aihub-desktop-dev"));
 
 // Render in software. On this machine (NVIDIA driver 615.78.08 on KDE Wayland) Chromium's GPU process dies with
-// SIGSEGV in libnvidia-eglcore on its first GL call, three times at every start, whenever the driver refuses it a
-// GPU channel group (the kernel log shows NV_ERR_STATE_IN_USE just before). Each crash leaves a 4 to 5 MB core dump
-// on /, and Chromium gives up on the GPU after the third anyway. Software rendering is enough for a text chat, and
-// the app then holds no GPU memory or channels, which local image generation needs.
+// SIGSEGV on a NULL pointer, in libnvidia-eglcore or in Chromium just after it, three times at every start, whenever
+// the driver refuses it a GPU channel group (the kernel log shows NV_ERR_STATE_IN_USE just before). Each crash leaves
+// a 4 to 5 MB core dump on /, and Chromium gives up on the GPU after the third anyway. Software rendering is enough
+// for a text chat, and the app then holds no GPU memory or channels, which local image generation needs.
 app.commandLine.appendSwitch("disable-gpu");
 
 let backend = null;
