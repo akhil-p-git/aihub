@@ -12,6 +12,10 @@ The launcher starts it exactly as it would start sd-server. It listens on --list
         hang          never listen and never exit
         slow=SECONDS  "load the model" for that long before listening
         stubborn      ignore SIGTERM (noting it in DIR/signals.log), so that only SIGKILL stops it
+        orphan        on SIGTERM leave a child that keeps answering on the port (like a helper process or an
+                      engine stuck in the driver would), and exit
+        holdpipe      start a helper that holds stdout and stderr open for a minute, so that the launcher does
+                      not see this engine's output end when it exits
         noisy         write about 20,000 log lines and two huge ones before listening
 
 A keyword in the prompt of a job chooses how the job goes (the same style as tests/e2e/fake_providers.py):
@@ -48,6 +52,7 @@ import queue
 import re
 import resource
 import signal
+import socket
 import socketserver
 import sys
 import threading
@@ -192,6 +197,19 @@ def log_shapes() -> None:
     log("E", "kept after the long message")
 
 
+def leave_a_listener(listener: socket.socket) -> None:
+    """SIGTERM handler of the orphan mode: the child keeps the port and answers every request, the parent exits."""
+    if os.fork() == 0:
+        while True:
+            conn, _ = listener.accept()
+            conn.recv(65536)
+            body = b'{"orphan":true}'
+            head = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+            conn.sendall(head.encode() + body)
+            conn.close()
+    os._exit(0)
+
+
 def start_mode(mode: str) -> None:
     name, _, value = mode.partition("=")
     if name == "exit3":
@@ -215,6 +233,12 @@ def start_mode(mode: str) -> None:
         signal.signal(signal.SIGTERM, lambda *_: record("signals.log", {"sig": "TERM"}))
     elif name == "noisy":
         flood()
+    elif name == "holdpipe":
+        if os.fork() == 0:
+            time.sleep(60)
+            os._exit(0)
+    elif name == "orphan":
+        pass  # the handler needs the listening socket, so main() installs it
     elif name:
         sys.exit(f"unknown --standin-start mode {mode!r}")
 
@@ -469,6 +493,9 @@ def work() -> None:
 
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    # sd-server's HTTP library sets SO_REUSEPORT too (thirdparty/httplib.h at the pin), so a second engine
+    # can listen on the port of a first one that has not gone.
+    allow_reuse_port = True
     daemon_threads = True
 
 
@@ -503,6 +530,8 @@ def main() -> None:
     start_mode(args.standin_start)
     threading.Thread(target=work, daemon=True).start()
     with Server((args.listen_ip, args.listen_port), Handler) as server:
+        if args.standin_start == "orphan":
+            signal.signal(signal.SIGTERM, lambda *_: leave_a_listener(server.socket))
         log("I", f"listening on: http://{args.listen_ip}:{args.listen_port}")
         server.serve_forever()
 

@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import resource
 import signal
 import socket
 import subprocess
@@ -52,6 +53,8 @@ MODEL_ARGS = {
     "crashes": ["--standin-start", "crash"],
     "hangs": ["--standin-start", "hang"],
     "stubborn": ["--standin-start", "stubborn"],
+    "orphan": ["--standin-start", "orphan"],
+    "holdpipe": ["--standin-start", "holdpipe"],
     "noisy": ["--standin-start", "noisy"],
 }
 
@@ -66,6 +69,17 @@ def wait_for(predicate, what, *, timeout=10.0, rig=None):
             log = f"\nlauncher log:\n{rig.log()}" if rig else ""
             raise AssertionError(f"gave up after {timeout} s waiting for {what}{log}")
         time.sleep(0.02)
+
+
+def open_descriptors(pid: int) -> int:
+    """How many descriptors the process holds, once it has let go of the connections it served."""
+    seen: list[int] = []
+
+    def settled():
+        seen.append(len(os.listdir(f"/proc/{pid}/fd")))
+        return len(seen) >= 3 and len(set(seen[-3:])) == 1 and seen[-1]
+
+    return wait_for(settled, "the launcher to close what it served")
 
 
 @dataclass
@@ -447,6 +461,7 @@ def test_the_documented_defaults_are_the_ones_in_the_code():
         "BACKOFF": 30.0,
         "START": 90.0,
         "GRACE": 5.0,
+        "KILL": 10.0,
         "CLIENT": 30.0,
         "ENGINE": 60.0,
     }
@@ -833,6 +848,79 @@ class TestModelSwitch:
         assert not alive(stubborn) and len(rig.engines()) == 1
 
 
+class TestOneEngineAtATime:
+    """Never two engines, even when the old one will not go: sd-server listens with SO_REUSEPORT, so a second
+    engine on the port would share it, and half the requests would reach the wrong model."""
+
+    def test_a_listener_left_behind_by_the_old_engine_blocks_the_next_start(
+        self, launch
+    ):
+        rig = launch(env={"AIHUB_IMAGES_BACKOFF_S": "1"})
+        assert rig.submit("orphan").status == 202
+        # SIGTERM: the old engine exits and leaves a child listening on the port
+        reply = rig.submit("zimage")
+        assert reply.status == 503 and reply.json()["code"] == "engine_failed_to_start"
+        assert any("already taken" in line for line in reply.json()["last_error"])
+        assert len(rig.starts()) == 1
+        assert rig.status()["state"] == "failed"
+        # once nothing listens any more, and the backoff is over, the start goes ahead
+        [leftover] = rig.engines()
+        os.kill(leftover, signal.SIGKILL)
+        wait_for(lambda: rig.engines() == [], "the leftover to die", rig=rig)
+        wait_for(lambda: rig.submit("zimage").status == 202, "the next start", rig=rig)
+        assert len(rig.starts()) == 2 and len(rig.engines()) == 1
+
+    def test_an_engine_that_is_not_seen_to_exit_blocks_the_next_start(self, launch):
+        # holdpipe: the engine exits at SIGTERM, but a helper holds its output open, so the launcher cannot
+        # tell for 1 s that it is gone. With the grace and kill waits at 0.3 s that is "still running".
+        rig = launch(env={"AIHUB_IMAGES_GRACE_S": "0.3", "AIHUB_IMAGES_KILL_S": "0.3"})
+        assert rig.submit("holdpipe").status == 202
+        reply = rig.submit("zimage")
+        assert reply.status == 503 and reply.json()["code"] == "engine_failed_to_start"
+        assert any("still running" in line for line in reply.json()["last_error"])
+        assert len(rig.starts()) == 1
+        again = rig.submit("zimage")  # nothing is started while it lasts
+        assert again.status == 503 and len(rig.starts()) == 1
+        wait_for(
+            lambda: rig.submit("zimage").status == 202,
+            "the old engine to be gone",
+            rig=rig,
+        )
+        assert len(rig.starts()) == 2
+        assert rig.status()["engine"] == "zimage"
+
+    def test_a_kill_that_cannot_see_the_engine_exit_says_so(self, launch):
+        rig = launch(env={"AIHUB_IMAGES_KILL_S": "0.3"})
+        assert rig.submit("holdpipe").status == 202
+        reply = rig.kill()
+        assert reply.status == 504 and reply.json() == {"code": "engine_not_gone"}
+        # a moment later it is seen to be gone
+        wait_for(
+            lambda: rig.kill().json() == {"killed": False},
+            "the engine to be gone",
+            rig=rig,
+        )
+
+    def test_a_job_is_not_passed_to_an_engine_that_a_kill_could_not_see_exit(
+        self, launch
+    ):
+        rig = launch(env={"AIHUB_IMAGES_KILL_S": "0.3"})
+        assert rig.submit("holdpipe").status == 202
+        assert rig.kill().status == 504
+        # Killed but not seen to be gone, like an engine that a stop could not see exit: not ready.
+        assert rig.status()["state"] == "failed"
+        again = rig.submit("holdpipe")
+        assert again.status == 503 and again.json()["code"] == "engine_failed_to_start"
+        assert any("still running" in line for line in again.json()["last_error"])
+        assert len(rig.starts()) == 1
+        wait_for(
+            lambda: rig.submit("holdpipe").status == 202,
+            "the old engine to be gone",
+            rig=rig,
+        )
+        assert len(rig.starts()) == 2
+
+
 class TestEngineGone:
     def test_polls_without_an_engine_get_410_and_start_nothing(self, launch):
         rig = launch()
@@ -1149,6 +1237,39 @@ class TestConcurrency:
             rig=rig,
         )
         assert rig.proc.poll() is None
+
+    @pytest.mark.parametrize(
+        ("free", "noted"),
+        [(0, "cannot start"), (1, "cannot run")],
+        ids=["port_probe", "output_pipe"],
+    )
+    def test_running_out_of_descriptors_while_starting_is_answered_as_a_failed_start(
+        self, launch, free, noted
+    ):
+        # `free` descriptors are left once the request's own connection is counted: none for the look at the
+        # engine's port, one for the probe but not for the two ends of the engine's output pipe. `noted`
+        # begins the launcher's note, which says which of the two steps ran out.
+        rig = launch(env={"AIHUB_IMAGES_BACKOFF_S": "1"})
+        pid = rig.host_pid()
+        held = open_descriptors(pid)
+        soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (held + 1 + free, hard))
+        try:
+            reply = rig.submit("zimage")
+        finally:
+            resource.prlimit(pid, resource.RLIMIT_NOFILE, (soft, hard))
+        assert reply.status == 503 and reply.json()["code"] == "engine_failed_to_start"
+        last_error = reply.json()["last_error"]
+        assert any(
+            noted in line and "Too many open files" in line for line in last_error
+        )
+        assert not any("already taken" in line for line in last_error)
+        assert rig.starts() == []
+        assert rig.status()["state"] == "failed"
+        assert open_descriptors(pid) == held
+        # With descriptors again, the next start goes ahead once the backoff is over.
+        wait_for(lambda: rig.submit("zimage").status == 202, "the next start", rig=rig)
+        assert len(rig.starts()) == 1
 
 
 # --- idle exit, signals and the engine's lifetime ---------------------------------------------------

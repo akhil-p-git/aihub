@@ -8,8 +8,9 @@ at most one engine alive, and exits after 5 idle minutes. The next connection st
 Each connection carries one request and one reply, both with "Connection: close". The routes are:
 
     GET  /launcher/status                       200 {engine, state, last_error}; never starts an engine
-    POST /launcher/kill                         200 {killed}; SIGKILL to the engine, answered once it is gone.
-                                                An img_gen that was accepted before it is answered 503 killed
+    POST /launcher/kill                         200 {killed}; SIGKILL to the engine, answered once it is gone
+                                                (504 engine_not_gone if it still runs after 10 s). An img_gen
+                                                that was accepted before it is answered 503 killed
     POST /e/<model>/sdcpp/v1/img_gen            starts the engine for <model>, then forwards
     GET  /e/<model>/sdcpp/v1/jobs/<id>          forwarded when the engine for <model> is ready, else 410
     POST /e/<model>/sdcpp/v1/jobs/<id>/cancel   the same
@@ -21,8 +22,8 @@ The engine's reply is checked as hard: one Content-Length, no chunking, a bounde
 Errors have a JSON body {code, ...}: 400 bad_request, 404 not_found or unknown_model, 408 request_timeout,
 411 length_required, 413 body_too_large, 415 unsupported_media_type, 431 head_too_large, 503 busy, killed or
 engine_failed_to_start (with last_error), 410 engine_gone (with last_error), 502 bad_engine_reply or
-engine_unreachable, 504 engine_timeout. An img_gen whose client has hung up before the engine was asked is
-dropped without an answer: no engine is started for it and no job is queued.
+engine_unreachable, 504 engine_timeout or engine_not_gone. An img_gen whose client has hung up before the
+engine was asked is dropped without an answer: no engine is started for it and no job is queued.
 
 The engine's [E] and [W] lines are kept (the last 20 are last_error) and the first 200 per start go to this
 process's stderr, which systemd sends to the journal. Everything else it prints is dropped. At the pin
@@ -31,7 +32,10 @@ lines: the tag comes first and " --- file:line" last, so the lines of such an [I
 it. It prints [E] on stderr and the rest on stdout, so both are read.
 
 A start that fails (the engine exits or does not listen) leaves the launcher running in state "failed" and
-refuses any new start for 30 seconds, so one click costs one CUDA initialisation. Exit status 78 means the
+refuses any new start for 30 seconds, so one click costs one CUDA initialisation. Never two engines: no engine
+starts while the previous one has not been seen to exit, or while anything accepts connections on the
+engine's port (sd-server listens with SO_REUSEPORT, so a second listener would share the port and take half
+the requests). Exit status 78 means the
 launcher would not run: it is not alone in a network namespace, it was not given exactly one socket, or
 models.json or a timing variable is wrong.
 
@@ -39,7 +43,7 @@ The engine must not outlive the launcher. Under systemd, KillMode=control-group 
 with the unit; elsewhere PR_SET_PDEATHSIG ends it when the launcher dies. It inherits no file descriptor but
 stdin, stdout and stderr, and only the variables in ENGINE_ENV.
 
-AIHUB_IMAGES_<NAME>_S sets a timing in seconds, once, at start: IDLE, BACKOFF, START, GRACE, CLIENT and
+AIHUB_IMAGES_<NAME>_S sets a timing in seconds, once, at start: IDLE, BACKOFF, START, GRACE, KILL, CLIENT and
 ENGINE (the defaults are in TIMES). Tests use them so that they need not wait minutes. The unit sets none.
 """
 
@@ -79,8 +83,6 @@ LINE_CAP = 64 * 1024
 CONTINUATION_MAX = 50
 # Engine lines copied to the journal per start.
 LOG_LINES_MAX = 200
-# How long to wait for a SIGKILLed engine to be gone.
-KILL_WAIT = 10.0
 TIMES = {
     # No connection: stop the engine and exit.
     "IDLE": 300.0,
@@ -90,6 +92,8 @@ TIMES = {
     "START": 90.0,
     # From SIGTERM to SIGKILL.
     "GRACE": 5.0,
+    # From SIGKILL until the engine must be seen to be gone.
+    "KILL": 10.0,
     # To send a request, and to take the reply.
     "CLIENT": 30.0,
     # One exchange with the engine.
@@ -480,6 +484,9 @@ def describe_exit(status: int) -> str:
 class Engine:
     model: str
     proc: asyncio.subprocess.Process
+    # Its stdout and stderr, in one pipe, and the transport that reads the pipe.
+    output: asyncio.StreamReader
+    pipe: asyncio.ReadTransport
     # Set when the process has exited and its output is read.
     done: asyncio.Event = field(default_factory=asyncio.Event)
     # We signalled it, so its exit is no error.
@@ -513,6 +520,8 @@ class Host:
         self.accepting = True
         # Counts POST /launcher/kill. An img_gen that was accepted before a kill is dropped.
         self.kills = 0
+        # An engine that was sent SIGKILL and has not been seen to exit. Nothing else starts until it has.
+        self.stuck: Engine | None = None
 
     def settle(self, state: str) -> None:
         self.state = state
@@ -545,28 +554,31 @@ class Host:
         models.json may not ask for), in messages of several lines, and a library may print anything."""
         # Lines of the [I], [D] or [V] message that is going on over several lines, 0 when there is none.
         inside = 0
-        async for raw in read_lines(engine.proc.stdout):
-            text = raw.decode("utf-8", "replace").rstrip("\r")
-            if inside:
-                # A line of that message, whatever it looks like. A message that is never seen to end is
-                # dropped for CONTINUATION_MAX lines, so that a missing end cannot hide errors for long.
-                last = closes(text) or inside >= CONTINUATION_MAX
-                inside = 0 if last else inside + 1
-                continue
-            if text.startswith(("[I] ", "[D] ", "[V] ")):
-                # ggml's lines come through the same callback, and end without a file and line.
-                one_line = closes(text) or text[4:].startswith("ggml: ")
-                inside = 0 if one_line else 1
-                continue
-            if not text.startswith(("[E] ", "[W] ")):
-                continue
-            line = printable(raw)
-            self.errors.append(line)
-            if self.logged < LOG_LINES_MAX:
-                self.logged += 1
-                log(f"engine {engine.model}: {line}")
-                if self.logged == LOG_LINES_MAX:
-                    log("further engine lines are not logged; status has the last 20")
+        async with contextlib.aclosing(read_lines(engine.output)) as lines:
+            async for raw in lines:
+                text = raw.decode("utf-8", "replace").rstrip("\r")
+                if inside:
+                    # A line of that message, whatever it looks like. A message that is never seen to end
+                    # is dropped for CONTINUATION_MAX lines, so a missing end cannot hide errors for long.
+                    last = closes(text) or inside >= CONTINUATION_MAX
+                    inside = 0 if last else inside + 1
+                    continue
+                if text.startswith(("[I] ", "[D] ", "[V] ")):
+                    # ggml's lines come through the same callback, and end without a file and line.
+                    one_line = closes(text) or text[4:].startswith("ggml: ")
+                    inside = 0 if one_line else 1
+                    continue
+                if not text.startswith(("[E] ", "[W] ")):
+                    continue
+                line = printable(raw)
+                self.errors.append(line)
+                if self.logged < LOG_LINES_MAX:
+                    self.logged += 1
+                    log(f"engine {engine.model}: {line}")
+                    if self.logged == LOG_LINES_MAX:
+                        log(
+                            "further engine lines are not logged; status has the last 20"
+                        )
 
     async def watch(self, engine: Engine) -> None:
         reader = asyncio.create_task(self.read_output(engine))
@@ -582,8 +594,13 @@ class Host:
             if self.engine is engine and self.state == "ready":
                 self.settle("idle")
         finally:
+            engine.pipe.close()
             # Whatever went wrong above, whoever waits for the engine must be let go.
             engine.done.set()
+            if self.stuck is engine:
+                self.stuck = None
+                if self.state == "failed" and self.failed_at is None:
+                    self.settle("idle")
 
     # Starting and stopping
     async def ensure(self, model: str, wanted) -> bytes | None:
@@ -599,6 +616,8 @@ class Host:
                 # A request for another model. Never two engines at once.
                 await self.stop(engine)
                 wanted()
+            if self.stuck is not None:
+                return self.failure()
             since = (
                 None if self.failed_at is None else time.monotonic() - self.failed_at
             )
@@ -609,23 +628,35 @@ class Host:
     async def spawn(self, model: str) -> Engine | None:
         argv = self.config.argv(model)
         env = {k: v for k, v in os.environ.items() if ENGINE_ENV.fullmatch(k)}
-        self.spawned.clear()
+        # The engine's output comes through a pipe of our own. With stdout=PIPE, Process.wait() would not
+        # return while a process that the engine left behind still held the pipe, and the engine would not
+        # be seen to exit.
+        write_end = None
+        pipe = None
         try:
+            read_end, write_end = os.pipe()
+            output = asyncio.StreamReader()
+            pipe, _ = await asyncio.get_running_loop().connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(output),
+                os.fdopen(read_end, "rb", 0),
+            )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stdout=write_end,
+                stderr=write_end,
                 env=env,
-                limit=64 * 1024,
                 preexec_fn=die_with_the_launcher,
             )
         except (OSError, ValueError) as err:
+            if pipe is not None:
+                pipe.close()
             self.note(f"cannot run {argv[0]}: {err}")
             return None
         finally:
-            self.spawned.set()
-        engine = self.engine = Engine(model, proc)
+            if write_end is not None:
+                os.close(write_end)
+        engine = self.engine = Engine(model, proc, output, pipe)
         watcher = asyncio.create_task(self.watch(engine))
         self.watchers.add(watcher)
         watcher.add_done_callback(self.watchers.discard)
@@ -636,7 +667,22 @@ class Host:
         self.logged = 0
         self.state, self.model, self.engine = "starting", model, None
         log(f"starting the engine for {model}")
-        engine = await self.spawn(model)
+        # Until the process exists a kill has nothing to kill, so it waits for this.
+        self.spawned.clear()
+        try:
+            if await self.port_taken():
+                where = f"{self.config.host}:{self.config.port}"
+                self.note(
+                    f"{where} is already taken; not starting the engine for {model}"
+                )
+                return self.fail()
+            engine = await self.spawn(model)
+        except OSError as err:
+            # The port could not be looked at: no descriptor left, say.
+            self.note(f"cannot start the engine for {model}: {err}")
+            return self.fail()
+        finally:
+            self.spawned.set()
         if engine is None:
             return self.fail()
         # If the launcher is told to stop meanwhile, run() stops this engine too.
@@ -653,8 +699,7 @@ class Host:
             engine.asked_to_stop = True
             with contextlib.suppress(ProcessLookupError):
                 engine.proc.kill()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(engine.done.wait(), KILL_WAIT)
+        await self.reap(engine)
         if engine.killed_by_request:
             # Not a failure of the engine, so no backoff.
             self.settle("idle")
@@ -681,6 +726,35 @@ class Host:
             return True
         return False
 
+    async def port_taken(self) -> bool:
+        """Whether anything accepts connections where the engine is to listen: a helper process the old
+        engine left behind, say. A full backlog counts, because it times out. An error that says nothing
+        about the port (no descriptor left, no route) is raised."""
+        try:
+            async with asyncio.timeout(1):
+                _, writer = await asyncio.open_connection(
+                    self.config.host, self.config.port
+                )
+        except ConnectionRefusedError:
+            return False
+        except (ConnectionError, TimeoutError):
+            return True
+        writer.close()
+        return True
+
+    async def reap(self, engine: Engine) -> bool:
+        """Wait for an engine that was sent SIGKILL to be seen to exit. If it is not (a process stuck in the
+        driver can take long), nothing else starts until it is."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(engine.done.wait(), self.times["KILL"])
+        if not engine.done.is_set() and self.stuck is not engine:
+            self.stuck = engine
+            self.note(
+                f"the engine for {engine.model} is still running {self.times['KILL']:g} s after SIGKILL; "
+                "no other engine is started until it is gone"
+            )
+        return engine.done.is_set()
+
     async def stop(self, engine: Engine) -> None:
         """SIGTERM, then SIGKILL after the grace period."""
         engine.asked_to_stop = True
@@ -694,10 +768,9 @@ class Host:
                 log(f"the engine for {engine.model} ignored SIGTERM for {grace}")
                 with contextlib.suppress(ProcessLookupError):
                     engine.proc.kill()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(engine.done.wait(), KILL_WAIT)
+                await self.reap(engine)
         if self.engine is engine:
-            self.settle("idle")
+            self.settle("idle" if engine.done.is_set() else "failed")
 
     async def kill(self) -> bool:
         self.kills += 1
@@ -705,12 +778,17 @@ class Host:
         await self.spawned.wait()
         engine = self.engine
         if engine is None or engine.done.is_set():
+            if self.stuck is not None:
+                raise Reject(504, "engine_not_gone")
             return False
         engine.asked_to_stop = engine.killed_by_request = True
         with contextlib.suppress(ProcessLookupError):
             engine.proc.kill()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(engine.done.wait(), KILL_WAIT)
+        if not await self.reap(engine):
+            # As stop() leaves it when an engine will not go: not ready, and nothing is passed on to it.
+            if self.engine is engine:
+                self.settle("failed")
+            raise Reject(504, "engine_not_gone")
         return True
 
     # Talking to the engine
