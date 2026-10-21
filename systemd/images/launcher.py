@@ -496,17 +496,20 @@ class Host:
 
     async def watch(self, engine: Engine) -> None:
         reader = asyncio.create_task(self.read_output(engine))
-        status = await engine.proc.wait()
-        # What is left in the pipe. Something else may hold it open.
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(reader, 1)
-        if not engine.asked_to_stop:
-            starting = self.engine is engine and self.state == "starting"
-            before = " before it listened" if starting else ""
-            self.note(describe_exit(status) + before)
-        if self.engine is engine and self.state == "ready":
-            self.settle("idle")
-        engine.done.set()
+        try:
+            status = await engine.proc.wait()
+            # What is left in the pipe. Something else may hold it open.
+            with contextlib.suppress(TimeoutError, OSError):
+                await asyncio.wait_for(reader, 1)
+            if not engine.asked_to_stop:
+                starting = self.engine is engine and self.state == "starting"
+                before = " before it listened" if starting else ""
+                self.note(describe_exit(status) + before)
+            if self.engine is engine and self.state == "ready":
+                self.settle("idle")
+        finally:
+            # Whatever went wrong above, whoever waits for the engine must be let go.
+            engine.done.set()
 
     # Starting and stopping
     async def ensure(self, model: str) -> bytes | None:
@@ -560,7 +563,7 @@ class Host:
         if engine is None:
             return self.fail()
         # If the launcher is told to stop meanwhile, run() stops this engine too.
-        if await self.listening(engine):
+        if await self.listening(engine) and not engine.done.is_set():
             self.failed_at = None
             self.settle("ready")
             where = f"{self.config.host}:{self.config.port}"
@@ -669,8 +672,8 @@ class Host:
                 await asyncio.wait_for(engine.done.wait(), 1)
             if engine.done.is_set():
                 return self.gone()
-            body = {"code": "engine_unreachable", "last_error": list(self.errors)}
-            return encode(502, body)
+            problem = {"code": "engine_unreachable", "last_error": list(self.errors)}
+            return encode(502, problem)
         return encode(status, payload, content_type)
 
     # One request
