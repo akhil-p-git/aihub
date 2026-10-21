@@ -1,0 +1,12 @@
+[Unit]
+Description=aihub image engine socket (%t/aihub-images/engine.sock)
+
+[Socket]
+ListenStream=%t/aihub-images/engine.sock
+# Only this user may connect, and the directory (also the GPU lock file) is theirs alone.
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+
+[Install]
+WantedBy=sockets.target
