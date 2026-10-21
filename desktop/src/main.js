@@ -17,7 +17,7 @@ const COOKIE = "aihub_t";
 const GUARDED_URLS = ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"];
 // The only thing the page may ask for: the copy buttons of code blocks write to the clipboard.
 const ALLOWED_PERMISSIONS = new Set(["clipboard-sanitized-write"]);
-// The colour of the page behind its first paint (theme-color in the app's index.html).
+// The colour the window opens with and the page has behind its first paint (theme-color in the app's index.html).
 const PAPER = { light: "#f8fafd", dark: "#0c151d" };
 
 // A development run keeps its own data directory (and with it its own single-instance lock and port).
@@ -107,7 +107,6 @@ function createWindow() {
     height: 800,
     minWidth: 360,
     minHeight: 480,
-    show: false, // shown once the loading page has painted, so the window never opens blank
     autoHideMenuBar: true,
     backgroundColor: nativeTheme.shouldUseDarkColors ? PAPER.dark : PAPER.light,
     webPreferences: {
@@ -118,7 +117,6 @@ function createWindow() {
       devTools: !app.isPackaged,
     },
   });
-  window.once("ready-to-show", () => window.show());
   lockDown(window.webContents);
   return window;
 }
