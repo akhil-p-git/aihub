@@ -10,6 +10,7 @@ live in this repo; they are in `~/.config/aihub/`.
 - `config/` example settings and env files (`*.example`)
 - `systemd/` user units, symlinked into `~/.config/systemd/user/`
 - `scripts/` install, vendoring, benchmark and preflight scripts
+- `desktop/` the Linux desktop app: an Electron shell around the web chat, its tests, and the scripts that build and package it
 - `tests/` Python tests; `tests/js/` browser-module unit tests; `tests/e2e/` browser end-to-end tests
 - `state/` runtime data (gitignored): the chat database, Open WebUI's data
 - `docs/` model notes
@@ -78,6 +79,82 @@ Chromium; Firefox, Safari and iOS have not.
 - Python lock: `uv.lock` with `exclude-newer` two weeks back; JavaScript is formatted with Prettier (`.prettierrc.json`).
 - A throwaway instance on another port with its own data: set `AIHUB_WEB_CONFIG` (a file with `port: 8788`) and
   `AIHUB_STATE_DIR`, then `PYTHONPATH=app .venv/bin/python -m aihub_web`.
+
+## Desktop app (Linux x86_64, this PC)
+The web chat in a window of its own: an Electron shell (`desktop/`) starts the same backend as a child process on a
+random loopback port and shows it. The page, the models and the settings are the web chat's; nothing is reimplemented.
+
+**Build** (no sudo; the first three steps fetch pinned downloads, `dist:linux` uses no network):
+
+    cd desktop
+    npm ci                                  # the pinned Electron package, without its binary
+    node node_modules/electron/install.js   # the binary: fetched once into ~/.cache/electron and checked against checksums.json
+    npm run build:backend                   # desktop/payload/linux-x64: CPython 3.12 and the locked dependencies, about 52 MiB
+    npm run dist:linux                      # desktop/dist/linux-unpacked/: the app, about 334 MiB, built in under a second
+
+Run `desktop/dist/linux-unpacked/aihub-desktop`. The packaged app holds a frozen copy of the backend, so after a change
+under `app/` run `build:backend` and `dist:linux` again. `npm start` runs the shell from the checkout instead, for
+development (it does the Electron install step itself): it uses the repo's `.venv` and keeps its data in
+`~/.config/aihub-desktop-dev/`.
+
+**Keys and data.** The provider keys are read from `~/.config/aihub/aihub.env`, the file the service uses; the app never
+writes it. With no keys, or empty ones, it starts on the local Ollama model, as the service does. Its own data is in
+`~/.config/aihub-desktop/`: `state/chats.db` (its chat history, kept apart from the service's `state/web/chats.db`),
+an optional `web.yaml` (the same settings as the service's), `desktop.json` (the port of the last run, which it tries
+first), `pycache/`, `logs/backend.log` (the previous run's log is kept as `backend.log.1`) and Chromium's profile. To carry
+the service's history over, stop the service and copy `state/web/chats.db` to `~/.config/aihub-desktop/state/`.
+
+**What differs from the browser page.**
+- Every launch picks a new random token. The backend refuses `/api/` requests that lack the `aihub_t` cookie, which only the
+  app's own window holds, so another program on this machine cannot use the app's port (it gets 401). The service sets no
+  token and stays open to the local user, as before.
+- One window. Closing it quits the app and stops the backend; if the app is killed, the backend stops within a second.
+  A second launch focuses the first window.
+- A link to another site opens in the default browser, and nothing else opens in the window. There are no developer tools.
+- It renders in software. On this machine Chromium's GPU process crashes at times with the NVIDIA driver (the comment in
+  `desktop/src/main.js` has the details), so the app holds no GPU memory and no `/dev/nvidia*` file.
+
+**Resources**, measured at rest with the chat open: 9 processes, about 335 MiB of memory (PSS; 55 MiB of it the backend),
+no GPU memory, and the chat shows 1.1 s after launch.
+
+**The backend's side of the contract.** All of it is optional, and the service uses none of it:
+`AIHUB_PORT` (0 picks a free port; it overrides `port` in `web.yaml`), `AIHUB_LAUNCH_TOKEN` (when set, `/api/` needs the
+`aihub_t` cookie with that value), and `AIHUB_EXIT_ON_STDIN_EOF=1` (the backend stops, as `systemctl stop` would, when its
+stdin ends, which is how it follows the app). Once it accepts connections it prints `{"event":"ready","port":N}` on stdout;
+exit status 3 means it never started and 1 a bad setting.
+
+**A menu entry** is optional. Save this as `~/.local/share/applications/dev.akhil-p.aihub.desktop` (the path in `Exec`
+must be absolute; there is no custom icon, so Electron's is used):
+
+    [Desktop Entry]
+    Type=Application
+    Name=aihub
+    Comment=Chat with local, free and paid models
+    Exec=/home/akhil/work/Dev/aihub/desktop/dist/linux-unpacked/aihub-desktop
+    Terminal=false
+    Categories=Network;Chat;
+    StartupWMClass=dev.akhil-p.aihub
+
+**If it does not start.** Started with a stripped environment (`env -i`, a cron job), the app needs `XAUTHORITY` as well as
+the display variables: on KDE Wayland it runs through XWayland, which refuses a client without it, and Chromium then
+crashes at start ("Authorization required, but no authorization protocol specified", one core dump each time). From the
+menu or a terminal of the session it needs nothing extra.
+
+**Uninstall.** Delete `desktop/dist/`, `desktop/payload/`, `desktop/.cache/` and `desktop/node_modules/` (git ignores
+them), `~/.config/aihub-desktop/` (this deletes the app's chat history) and `~/.config/aihub-desktop-dev/`, the
+`.desktop` file, and `~/.cache/electron/` (Electron's download cache, which other Electron projects share). The keys file
+belongs to the service as well and stays.
+
+**Rebuild checklist.** Electron `44.6.0` is pinned exactly in `desktop/package.json`; to move, `npm install --save-dev
+--save-exact electron@X` in `desktop/` (its `.npmrc` sets `min-release-age=14`), then `npm test`. The Python is
+python-build-standalone `20261003` (CPython 3.12.15): to move, change `PBS_TAG`, `PYTHON_VERSION` and `ARCHIVE_SHA256` in
+`desktop/scripts/build-backend.mjs` (the sha256 is in the release's `SHA256SUMS`). The Python dependencies come from
+`uv.lock`. `cd desktop && npm test` runs the shell's tests.
+
+**Known limit.** A request that is already past the token check when the backend dies could reach a program that takes
+the freed port in the few milliseconds before the app notices, and it would carry the dead backend's cookie. That cookie
+is worthless to the next backend, because every start has a new token, but only a check of the peer's process would
+close the window.
 
 ## Open WebUI (installed, still running, localhost only)
 Superseded by the web chat above, and kept until you decide to remove it
