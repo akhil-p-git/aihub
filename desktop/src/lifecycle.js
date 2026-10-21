@@ -60,7 +60,8 @@ export class Lifecycle {
    * binds the freed port.
    */
   allows(url) {
-    return this.#origin !== null && allowsRequest(url, this.#origin) && this.#backend.isAlive();
+    const origin = this.origin;
+    return origin !== null && allowsRequest(url, origin);
   }
 
   /** From here on the app is leaving: a backend that ends is expected to, and no dialog follows. */
