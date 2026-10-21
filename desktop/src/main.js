@@ -29,8 +29,9 @@ app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-des
 // That comes and goes: the same build crashed on some launches and not on others. Chromium starts the GPU process
 // three times before it gives up, and each crash leaves a 4 to 5 MB core dump on /. No switch that keeps GPU rendering
 // avoided it (--disable-gpu-compositing, ANGLE on EGL, the ozone flags and --disable-gpu-sandbox were tried). A text
-// chat does not need the GPU, and with this switch the app opens no NVIDIA device and holds no GPU memory, which
-// local image generation can use instead. It goes around the driver's refusal; it does not remove it.
+// chat does not need the GPU, and with this switch the app keeps no /dev/nvidia* file open and nvidia-smi lists no GPU
+// memory for it (it still opens the render node /dev/dri/renderD128), which local image generation can use instead.
+// It goes around the driver's refusal; it does not remove it.
 app.commandLine.appendSwitch("disable-gpu");
 
 // No host name resolves except the backend's address (see policy.js): a link the pointer only touches is not looked up.
