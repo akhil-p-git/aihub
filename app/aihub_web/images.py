@@ -1,20 +1,38 @@
 """Making images: checks on what the engine returns, one lock for the GPU, and jobs that outlive their request."""
 
+import asyncio
+import fcntl
+import logging
+import os
 import re
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+
+import httpx2
+
+from .config import OllamaConfig
+
+log = logging.getLogger(__name__)
 
 # Shapes are all 1024-class: the same pixel count as the 768 px square for Wide and Tall.
 SHAPES = {"square": (1024, 1024), "wide": (1024, 576), "tall": (576, 1024)}
 MAX_PROMPT_CHARS = 2000
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 IMAGE_STORE_CAP = 2 * 1024**3
+# How long an image waits for the GPU, and how often it looks again.
+LOCK_WAIT = 120.0
+LOCK_TICK = 0.25
+# How long Ollama gets to let go of its models before an image is refused.
+UNLOAD_WAIT = 5.0
 
 # What the user is told, per error code. The wording is the one the UI is written against.
 MESSAGES = {
     "vram_busy": "The GPU is short of memory ({free} MB free). Close GPU-heavy apps or choose Wide or Tall, then retry.",
     "vram_busy_unknown": "The GPU is short of memory. Close GPU-heavy apps or choose Wide or Tall, then retry.",
     "cuda_unavailable": "The GPU didn't respond. If this keeps happening, restart the PC.",
+    "gpu_paused": "The GPU is making an image, so local models are paused until it finishes. Cloud models still work.",
+    "gpu_busy": "The GPU stayed busy for {minutes:g} minutes with other replies or images. Try again in a moment.",
+    "ollama_busy": "A local model ({name}) is still loaded and won't unload. Wait for its reply to finish, then retry.",
 }
 
 
@@ -25,6 +43,10 @@ class ImageError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class Busy(Exception):
+    """The GPU can't take this right now. The message says why and is shown as written."""
 
 
 def _plain_webp_error(reason: str) -> ImageError:
@@ -132,3 +154,148 @@ def classify(
     quote = _quote(errors[0]) if errors else ""
     detail = f": {quote}{'' if quote[-1:] in '.…!?' else '.'}" if quote else "."
     return default, _PREFIX[default] + detail
+
+
+class GpuLease:
+    """A held lock on the GPU. Release it; letting go of the last reference releases it too, as a backstop."""
+
+    __slots__ = ("_fd",)
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)
+
+    def __del__(self) -> None:
+        if self._fd is not None:
+            log.warning("GPU lock released by garbage collection")
+            self.release()
+
+
+class GpuLock:
+    """One advisory flock on the engine's socket directory, shared by every process that uses the GPU.
+
+    An image takes it exclusively and local Ollama replies take it shared, so a reply never starts while
+    an image is being made and an image waits for running replies to end. Every lease has a descriptor
+    of its own, so two leases in one process conflict like two processes do. The kernel drops the lock
+    when a process dies, however it dies.
+    """
+
+    def __init__(self, directory: str | os.PathLike[str]) -> None:
+        self._directory = directory
+
+    def _open(self) -> int:
+        return os.open(self._directory, os.O_RDONLY | os.O_DIRECTORY)
+
+    def _flock(self, how: int) -> GpuLease | None:
+        fd = self._open()
+        try:
+            fcntl.flock(fd, how | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        except BaseException:
+            os.close(fd)
+            raise
+        return GpuLease(fd)
+
+    def share(self) -> GpuLease | None:
+        """For a local reply: a lease, or Busy while an image is being made. None where there is no directory
+        to lock, because then there is no image engine to make room for either."""
+        try:
+            lease = self._flock(fcntl.LOCK_SH)
+        except OSError:
+            return None
+        if lease is None:
+            raise Busy(MESSAGES["gpu_paused"])
+        return lease
+
+    def try_exclusive(self) -> GpuLease | None:
+        """For an image: a lease if the GPU is free right now, else None."""
+        return self._flock(fcntl.LOCK_EX)
+
+    async def exclusive(
+        self,
+        *,
+        wait: float = LOCK_WAIT,
+        tick: float = LOCK_TICK,
+        on_wait: Callable[[], None] | None = None,
+    ) -> GpuLease:
+        """Wait up to `wait` seconds for the GPU, calling `on_wait` once if it isn't free at the first look."""
+        fd = self._open()
+        loop = asyncio.get_running_loop()
+        try:
+            give_up = loop.time() + wait
+            told = False
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return GpuLease(fd)
+                except BlockingIOError:
+                    pass
+                if not told:
+                    told = True
+                    if on_wait:
+                        on_wait()
+                if loop.time() >= give_up:
+                    raise ImageError(
+                        "gpu_busy", MESSAGES["gpu_busy"].format(minutes=wait / 60)
+                    )
+                await asyncio.sleep(tick)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+async def _resident(client: httpx2.AsyncClient, cfg: OllamaConfig) -> list[str] | None:
+    """Names of the Ollama models that hold VRAM, or None when Ollama can't say."""
+    try:
+        reply = await client.get(f"{cfg.url}/api/ps", timeout=3.0)
+        models = reply.json().get("models") if reply.status_code == 200 else None
+    except (httpx2.HTTPError, ValueError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+    return [
+        str(entry.get("model") or entry.get("name"))
+        for entry in models
+        if isinstance(entry, dict) and (entry.get("size_vram") or 0) > 0
+    ]
+
+
+async def unload_ollama(
+    client: httpx2.AsyncClient,
+    cfg: OllamaConfig,
+    *,
+    settle: float = UNLOAD_WAIT,
+    tick: float = LOCK_TICK,
+) -> None:
+    """Make room on the GPU: ask Ollama to unload every model that holds VRAM, and wait until none does.
+
+    Ollama defers an unload while a model is mid-reply, so if one is still there after `settle` seconds
+    the image is refused (ollama_busy) rather than started into a GPU that can't hold it. An Ollama that
+    is down, or doesn't answer sensibly, is skipped: it has nothing loaded that we could unload.
+    """
+    resident = await _resident(client, cfg)
+    if not resident:
+        return
+    for name in resident:
+        try:
+            await client.post(
+                f"{cfg.url}/api/generate",
+                json={"model": name, "keep_alive": 0},
+                timeout=10.0,
+            )
+        except httpx2.HTTPError:
+            pass  # the check below decides whether it mattered
+    loop = asyncio.get_running_loop()
+    give_up = loop.time() + settle
+    while resident := await _resident(client, cfg):
+        if loop.time() >= give_up:
+            raise ImageError(
+                "ollama_busy", MESSAGES["ollama_busy"].format(name=resident[0])
+            )
+        await asyncio.sleep(tick)

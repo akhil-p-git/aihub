@@ -1,13 +1,25 @@
 """Image generation: the WebP check, failure classification, the engine client, the GPU lock and the jobs."""
 
+import asyncio
 import base64
 import json
+import os
 import struct
+import time
 from pathlib import Path
 
 import httpx2
 import pytest
-from aihub_web.images import MAX_IMAGE_BYTES, ImageError, classify, validate_webp
+from aihub_web.config import OllamaConfig
+from aihub_web.images import (
+    MAX_IMAGE_BYTES,
+    Busy,
+    GpuLock,
+    ImageError,
+    classify,
+    unload_ollama,
+    validate_webp,
+)
 from aihub_web.providers import ImageRequest
 from aihub_web.providers.images import (
     MAX_REPLY_BYTES,
@@ -20,10 +32,13 @@ from helpers import (
     FIXTURES,
     SHAPE_SIZES,
     FakeEngine,
+    FakeOllama,
     completed,
     engine_errors,
     failed,
     generating,
+    handler_for,
+    holding,
     queued,
     serve_engine,
     webp,
@@ -775,3 +790,241 @@ class TestEngineOverARealSocket:
             assert (await EngineClient(path).status()).state == "idle"
             assert await EngineClient(path).submit(image_request()) == "job_00000001"
             assert (await EngineClient(path).status()).state == "ready"
+
+
+def open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+class TestGpuLock:
+    def test_a_job_and_a_text_turn_cannot_hold_the_gpu_together(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        job = lock.try_exclusive()
+        assert job is not None
+        with pytest.raises(Busy, match="local models are paused"):
+            lock.share()
+        job.release()
+        turn = lock.share()
+        assert turn is not None
+        assert lock.try_exclusive() is None
+        turn.release()
+        assert lock.try_exclusive() is not None
+
+    def test_text_turns_share(self, socket_dir: Path) -> None:
+        lock = GpuLock(socket_dir)
+        first, second = lock.share(), lock.share()
+        assert first is not None and second is not None
+        first.release()
+        assert lock.try_exclusive() is None  # one is still replying
+        second.release()
+        assert lock.try_exclusive() is not None
+
+    def test_there_is_no_lock_to_take_where_there_is_no_directory(
+        self, socket_dir: Path
+    ) -> None:
+        """Without the engine's socket directory there is no engine either: a text turn just goes ahead."""
+        assert GpuLock(socket_dir / "absent").share() is None
+
+    def test_releasing_twice_is_harmless_and_frees_the_descriptor(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        before = open_fds()
+        lease = lock.try_exclusive()
+        assert open_fds() == before + 1
+        lease.release()
+        lease.release()
+        assert open_fds() == before
+
+    def test_a_lease_that_is_dropped_still_lets_go(
+        self, socket_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A text turn whose stream never started would otherwise hold the lock until restart."""
+        lock = GpuLock(socket_dir)
+        lock.share()  # the lease is dropped on the spot
+        assert lock.try_exclusive() is not None
+        assert "garbage collection" in caplog.text
+
+    @pytest.mark.anyio
+    async def test_an_image_waits_its_turn_and_is_told_when_it_starts_to_wait(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        text_turn = lock.share()
+        waits = []
+        task = asyncio.create_task(
+            lock.exclusive(wait=5, tick=0.01, on_wait=lambda: waits.append("waiting"))
+        )
+        await asyncio.sleep(0.1)
+        assert not task.done() and waits == ["waiting"]
+        text_turn.release()
+        lease = await asyncio.wait_for(task, 2)
+        assert waits == ["waiting"]  # said once, not at every retry
+        lease.release()
+
+    @pytest.mark.anyio
+    async def test_a_free_gpu_is_taken_without_a_word(self, socket_dir: Path) -> None:
+        waits = []
+        lease = await GpuLock(socket_dir).exclusive(
+            wait=5, tick=0.01, on_wait=waits.append
+        )
+        assert waits == []
+        lease.release()
+
+    @pytest.mark.anyio
+    async def test_waiting_gives_up_after_the_limit_and_leaves_no_descriptor(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        holder = lock.try_exclusive()
+        before = open_fds()
+        started = time.monotonic()
+        with pytest.raises(ImageError) as err:
+            await lock.exclusive(wait=0.2, tick=0.02)
+        assert err.value.code == "gpu_busy"
+        assert 0.15 < time.monotonic() - started < 1.5
+        assert open_fds() == before
+        holder.release()
+
+    @pytest.mark.anyio
+    async def test_a_cancelled_wait_leaves_no_descriptor(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        holder = lock.try_exclusive()
+        before = open_fds()
+        task = asyncio.create_task(lock.exclusive(wait=30, tick=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert open_fds() == before
+        holder.release()
+
+    @pytest.mark.anyio
+    async def test_a_second_process_holds_the_same_lock(self, socket_dir: Path) -> None:
+        lock = GpuLock(socket_dir)
+        with holding(socket_dir, "exclusive"):
+            assert lock.try_exclusive() is None
+            with pytest.raises(Busy):
+                lock.share()
+        # the holder was killed: the kernel dropped its lock with it
+        lease = lock.try_exclusive()
+        assert lease is not None
+        lease.release()
+
+    @pytest.mark.anyio
+    async def test_a_second_process_replying_blocks_images_but_not_other_replies(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        with holding(socket_dir, "shared"):
+            other_turn = lock.share()
+            assert other_turn is not None
+            other_turn.release()
+            assert lock.try_exclusive() is None
+            with pytest.raises(ImageError):
+                await lock.exclusive(wait=0.1, tick=0.02)
+
+    @pytest.mark.anyio
+    async def test_an_image_gets_the_gpu_the_moment_the_other_process_dies(
+        self, socket_dir: Path
+    ) -> None:
+        lock = GpuLock(socket_dir)
+        with holding(socket_dir, "exclusive") as child:
+            task = asyncio.create_task(lock.exclusive(wait=10, tick=0.02))
+            await asyncio.sleep(0.1)
+            assert not task.done()
+            child.kill()
+            lease = await asyncio.wait_for(task, 5)
+        lease.release()
+
+
+@pytest.mark.anyio
+class TestUnloadOllama:
+    @staticmethod
+    def client(ollama: FakeOllama | None, **kwargs) -> httpx2.AsyncClient:
+        handler = handler_for(ollama=ollama, **kwargs)
+        return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+    async def test_a_loaded_model_is_asked_to_leave_and_gone_before_the_job_goes_on(
+        self,
+    ) -> None:
+        ollama = FakeOllama("qwen3:8b")
+        await unload_ollama(self.client(ollama), OllamaConfig(), settle=1, tick=0.01)
+        assert ollama.posts() == [{"model": "qwen3:8b", "keep_alive": 0}]
+        assert ollama.resident == []
+        # asked, told to unload, then asked again to see that it went
+        assert [(m, p) for m, p, _ in ollama.calls] == [
+            ("GET", "/api/ps"),
+            ("POST", "/api/generate"),
+            ("GET", "/api/ps"),
+        ]
+
+    async def test_every_model_that_holds_vram_is_unloaded(self) -> None:
+        ollama = FakeOllama("qwen3:8b", "gemma3:4b")
+        ollama.resident.append(
+            {"name": "bge-m3", "model": "bge-m3", "size": 700_000_000, "size_vram": 0}
+        )
+        await unload_ollama(self.client(ollama), OllamaConfig(), settle=1, tick=0.01)
+        assert sorted(b["model"] for b in ollama.posts()) == ["gemma3:4b", "qwen3:8b"]
+
+    async def test_nothing_loaded_means_nothing_to_do(self) -> None:
+        ollama = FakeOllama()
+        await unload_ollama(self.client(ollama), OllamaConfig(), settle=1, tick=0.01)
+        assert [(m, p) for m, p, _ in ollama.calls] == [("GET", "/api/ps")]
+
+    async def test_a_model_that_will_not_leave_refuses_the_job(self) -> None:
+        ollama = FakeOllama("qwen3:8b", stubborn=("qwen3:8b",))
+        started = time.monotonic()
+        with pytest.raises(ImageError) as err:
+            await unload_ollama(
+                self.client(ollama), OllamaConfig(), settle=0.2, tick=0.02
+            )
+        assert err.value.code == "ollama_busy"
+        assert "qwen3:8b" in err.value.message
+        assert 0.15 < time.monotonic() - started < 2
+
+    async def test_a_model_that_leaves_late_is_waited_for(self) -> None:
+        ollama = FakeOllama("qwen3:8b", stubborn=("qwen3:8b",))
+        client = self.client(ollama)
+
+        async def finish_reply_soon() -> None:
+            await asyncio.sleep(0.1)
+            ollama.stubborn.clear()
+            ollama.resident.clear()
+
+        task = asyncio.create_task(finish_reply_soon())
+        await unload_ollama(client, OllamaConfig(), settle=2, tick=0.02)
+        await task
+
+    async def test_ollama_being_down_is_not_a_reason_to_refuse(self) -> None:
+        await unload_ollama(
+            self.client(None, ollama_up=False), OllamaConfig(), settle=0.1, tick=0.01
+        )
+
+    async def test_an_ollama_that_answers_badly_is_skipped(self) -> None:
+        for reply in (
+            httpx2.Response(500),
+            httpx2.Response(200, text="not json"),
+            httpx2.Response(200, json=[1]),
+        ):
+            client = httpx2.AsyncClient(
+                transport=httpx2.MockTransport(lambda request, r=reply: r)
+            )
+            await unload_ollama(client, OllamaConfig(), settle=0.1, tick=0.01)
+
+    async def test_the_configured_address_is_the_one_asked(self) -> None:
+        seen = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url))
+            return httpx2.Response(200, json={"models": []})
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        await unload_ollama(
+            client, OllamaConfig(url="http://127.0.0.1:9999"), settle=0.1, tick=0.01
+        )
+        assert seen == ["http://127.0.0.1:9999/api/ps"]

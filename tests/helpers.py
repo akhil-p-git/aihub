@@ -8,6 +8,8 @@ import json
 import os
 import re
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -30,9 +32,15 @@ KEYS = {"AIHUB_OPENROUTER_KEY": "sk-or-test", "AIHUB_ANTHROPIC_KEY": "sk-ant-tes
 
 
 def handler_for(
-    *, ollama_up: bool = True, openrouter_up: bool = True, calls: list | None = None
+    *,
+    ollama_up: bool = True,
+    openrouter_up: bool = True,
+    calls: list | None = None,
+    ollama: "FakeOllama | None" = None,
 ):
-    """A MockTransport handler for Ollama's model endpoints and OpenRouter's public model list."""
+    """A MockTransport handler for Ollama's model endpoints and OpenRouter's public model list.
+
+    With `ollama`, the endpoints that show and unload the loaded models go to that stand-in too."""
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         if calls is not None:
@@ -40,6 +48,8 @@ def handler_for(
         if request.url.host == "127.0.0.1":
             if not ollama_up:
                 raise httpx2.ConnectError("refused", request=request)
+            if ollama is not None and request.url.path in ("/api/ps", "/api/generate"):
+                return ollama.handle(request)
             if request.url.path == "/api/tags":
                 return httpx2.Response(200, json={"models": OLLAMA["tags"]})
             if request.url.path == "/api/show":
@@ -386,3 +396,66 @@ def serve_engine(engine: FakeEngine, path: str) -> Iterator[FakeEngine]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+class FakeOllama:
+    """Ollama's /api/ps and /api/generate: which models are loaded, and unloading them with keep_alive 0."""
+
+    def __init__(
+        self,
+        *resident: str,
+        stubborn: tuple[str, ...] = (),
+        size_vram: int = 5_000_000_000,
+    ) -> None:
+        self.resident = [
+            {"name": name, "model": name, "size": size_vram, "size_vram": size_vram}
+            for name in resident
+        ]
+        self.stubborn = set(
+            stubborn
+        )  # models that stay loaded when asked to leave, like one mid-reply
+        self.calls: list[tuple[str, str, object]] = []
+
+    def handle(self, request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content) if request.content else None
+        self.calls.append((request.method, request.url.path, body))
+        if request.url.path == "/api/ps":
+            return httpx2.Response(200, json={"models": self.resident})
+        if body.get("keep_alive") == 0 and body["model"] not in self.stubborn:
+            self.resident = [m for m in self.resident if m["name"] != body["model"]]
+        return httpx2.Response(
+            200, json={"model": body["model"], "done": True, "done_reason": "unload"}
+        )
+
+    def posts(self) -> list[object]:
+        return [body for method, path, body in self.calls if method == "POST"]
+
+
+HOLDER = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+fcntl.flock(fd, fcntl.LOCK_EX if sys.argv[2] == "exclusive" else fcntl.LOCK_SH)
+print("locked", flush=True)
+sys.stdin.read()  # holds the lock until stdin closes or the process is killed
+"""
+
+
+@contextlib.contextmanager
+def holding(directory: Path, mode: str = "exclusive") -> Iterator[subprocess.Popen]:
+    """Another process that holds the GPU lock on `directory`, like a second aihub or the bench script."""
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", HOLDER, str(directory), mode],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "locked"
+        yield child
+    finally:
+        child.kill()
+        child.wait()
+        for pipe in (child.stdin, child.stdout):
+            if pipe:
+                pipe.close()
