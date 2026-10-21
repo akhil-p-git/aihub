@@ -30,7 +30,7 @@ app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-des
 // three times before it gives up, and each crash leaves a 4 to 5 MB core dump on /. No switch that keeps GPU rendering
 // avoided it (--disable-gpu-compositing, ANGLE on EGL, the ozone flags and --disable-gpu-sandbox were tried). A text
 // chat does not need the GPU, and with this switch the app opens no NVIDIA device and holds no GPU memory, which
-// local image generation can use instead.
+// local image generation can use instead. It goes around the driver's refusal; it does not remove it.
 app.commandLine.appendSwitch("disable-gpu");
 
 // No host name resolves except the backend's address (see policy.js): a link the pointer only touches is not looked up.
