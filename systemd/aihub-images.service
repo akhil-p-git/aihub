@@ -22,7 +22,11 @@ ProtectHome=tmpfs
 BindReadOnlyPaths=%h/work/aihub-images %h/work/Dev/aihub/systemd/images
 PrivateDevices=yes
 BindPaths=/dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm -/dev/nvidia-uvm-tools
-TemporaryFileSystem=/dev/shm
+# Emptied: /run, because PrivateUsers keeps the user's groups, so the host's sockets there (the Docker API,
+# the system bus) would stay reachable; /var/log and the core dump directory, which ACLs let the user read
+# (journals, the memory of other processes); /dev/pts, which PrivateDevices binds from the host and which
+# holds the user's open terminals. The launcher's own socket arrives as an inherited descriptor.
+TemporaryFileSystem=/dev/shm /run:ro /var/log:ro /var/lib/systemd/coredump:ro /dev/pts:ro
 PrivatePIDs=yes
 PrivateIPC=yes
 NoNewPrivileges=yes

@@ -77,6 +77,23 @@ for path in .config .ssh .gnupg .secrets.env .claude; do
 done
 expect "files of the user's that the unit can see" "${secrets# }" ""
 
+# --- the host's sockets, logs, core dumps and terminals are out of sight ----------------------------------
+# PrivateUsers keeps the user's groups, so a unit that still had the host's /run could connect to
+# /run/docker.sock, and ACLs would let it read the journals and the core dumps of other processes.
+# PrivateDevices binds the host's devpts, which holds the user's open terminals. The launcher's own socket
+# reaches it as an inherited descriptor. A check that cannot look inside the unit's directories fails
+# instead of passing.
+docker_socket=unreadable
+if [ -d "$inside/run" ]; then
+    if [ -e "$inside/run/docker.sock" ]; then docker_socket=present; else docker_socket=absent; fi
+fi
+expect "/run/docker.sock inside the unit" "$docker_socket" "absent"
+expect "socket paths or errors under /run inside the unit" "$(find "$inside/run" -type s 2>&1 | wc -l)" "0"
+expect "entries of /var/log inside the unit" "$(ls -A "$inside/var/log" 2>&1 | tr '\n' ' ')" ""
+core_dumps=$inside/var/lib/systemd/coredump
+expect "entries of the core dump directory inside the unit" "$(ls -A "$core_dumps" 2>&1 | tr '\n' ' ')" ""
+expect "entries of /dev/pts inside the unit" "$(ls -A "$inside/dev/pts" 2>&1 | tr '\n' ' ')" ""
+
 # --- the process itself: no capabilities, no new privileges ------------------------------------------------
 proc_field() { awk -F'\t' -v key="$1:" '$1 == key { print $2 }' "/proc/$pid/status"; }
 expect "effective capabilities" "$(proc_field CapEff)" "0000000000000000"
@@ -88,6 +105,8 @@ for line in PrivateNetwork=yes PrivateDevices=yes PrivateUsers=yes PrivatePIDs=y
     NoNewPrivileges=yes ProtectSystem=strict ProtectHome=tmpfs; do
     expect "loaded $unit ${line%%=*}" "$(property "${line%%=*}")" "${line#*=}"
 done
+expect "loaded $unit TemporaryFileSystem" "$(property TemporaryFileSystem)" \
+    "/dev/shm /run:ro /var/log:ro /var/lib/systemd/coredump:ro /dev/pts:ro"
 # A hook runs outside the private network namespace (docs/adr/0001-image-engine.md).
 expect "loaded ExecStartPre and ExecStartPost" "$(property ExecStartPre)$(property ExecStartPost)" ""
 expect "loaded JoinsNamespaceOf" "$(property JoinsNamespaceOf)" ""

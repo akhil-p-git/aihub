@@ -33,7 +33,9 @@ HARDENING = {
     # devices
     "PrivateDevices": "yes",
     "BindPaths": "/dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm -/dev/nvidia-uvm-tools",
-    "TemporaryFileSystem": "/dev/shm",
+    "TemporaryFileSystem": (
+        "/dev/shm /run:ro /var/log:ro /var/lib/systemd/coredump:ro /dev/pts:ro"
+    ),
     # isolation
     "PrivatePIDs": "yes",
     "PrivateIPC": "yes",
@@ -64,9 +66,14 @@ HARDENING = {
 
 def parse_unit(path: Path) -> dict[str, list[tuple[str, str]]]:
     """Sections of a unit file, each a list of (key, value) in file order, so repeated keys survive."""
+    text = path.read_text()
+    # systemd ends a line at a NUL byte too and splitlines() does not, so a directive could hide behind one.
+    assert not re.search(r"[^\t\n\x20-\x7e]", text), (
+        f"{path.name}: tabs, newlines and printable ASCII only"
+    )
     sections: dict[str, list[tuple[str, str]]] = {}
     current = None
-    for number, raw in enumerate(path.read_text().splitlines(), 1):
+    for number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith(("#", ";")):
             continue
@@ -112,6 +119,21 @@ def test_the_engine_has_no_network_and_no_devices_but_the_gpu(service):
         "/dev/nvidia-uvm",
         "/dev/nvidia-uvm-tools",
     }
+
+
+def test_the_unit_sets_no_directive_that_these_tests_do_not_know(service):
+    # ReadOnlyPaths=/run, say, puts the host's /run back over the empty one, and the tests above look only at
+    # the directives they name. MemoryDenyWriteExecute and SystemCallFilter are left out on purpose: CUDA's JIT
+    # and driver ioctls have not been tried under them. A new directive goes into HARDENING with its check.
+    known = {
+        "Unit": {"Description", "StartLimitIntervalSec", "StartLimitBurst"},
+        "Service": set(HARDENING)
+        | {"Type", "ExecStart", "WorkingDirectory", "TimeoutStopSec", "Environment"},
+    }
+    assert set(service) == set(known)
+    for section, entries in service.items():
+        unknown = {key for key, _ in entries} - known[section]
+        assert not unknown, (section, sorted(unknown))
 
 
 @pytest.mark.parametrize(("key", "expected"), HARDENING.items())
