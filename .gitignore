@@ -8,8 +8,8 @@ node_modules
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-# the desktop app's build output, downloads and build tools (desktop/build/ stays tracked for icons)
+# the desktop app's generated folders: dist/ is the output of npm run dist:linux, payload/ the output of
+# npm run build:backend, and .cache/ holds the downloads of build-backend.mjs
 /desktop/dist/
 /desktop/payload/
-/desktop/.tools/
 /desktop/.cache/
