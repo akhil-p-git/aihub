@@ -123,14 +123,17 @@ no GPU memory, and the chat shows 1.1 s after launch.
 stdin ends, which is how it follows the app). Once it accepts connections it prints `{"event":"ready","port":N}` on stdout;
 exit status 3 means it never started and 1 a bad setting.
 
-**A menu entry** is optional. Save this as `~/.local/share/applications/dev.akhil-p.aihub.desktop` (the path in `Exec`
-must be absolute; there is no custom icon, so Electron's is used):
+**Installing it and a menu entry** are optional. To keep the app you run apart from the checkout, so that a rebuild or a
+branch change cannot touch it, copy it out: `rsync -a --delete desktop/dist/linux-unpacked/ ~/.local/opt/aihub-desktop/`
+(close the app first; the same command updates it after a rebuild). Then save this as
+`~/.local/share/applications/dev.akhil-p.aihub.desktop`. The path in `Exec` must be absolute, and there is no custom
+icon, so Electron's is used:
 
     [Desktop Entry]
     Type=Application
     Name=aihub
     Comment=Chat with local, free and paid models
-    Exec=/home/akhil/work/Dev/aihub/desktop/dist/linux-unpacked/aihub-desktop
+    Exec=/home/akhil/.local/opt/aihub-desktop/aihub-desktop
     Terminal=false
     Categories=Network;Chat;
     StartupWMClass=dev.akhil-p.aihub
@@ -141,8 +144,8 @@ crashes at start ("Authorization required, but no authorization protocol specifi
 menu or a terminal of the session it needs nothing extra.
 
 **Uninstall.** Delete `desktop/dist/`, `desktop/payload/`, `desktop/.cache/` and `desktop/node_modules/` (git ignores
-them), `~/.config/aihub-desktop/` (this deletes the app's chat history) and `~/.config/aihub-desktop-dev/`, the
-`.desktop` file, and `~/.cache/electron/` (Electron's download cache, which other Electron projects share). The keys file
+them), `~/.local/opt/aihub-desktop/` and the `.desktop` file if you installed them, `~/.config/aihub-desktop/` (this
+deletes the app's chat history) and `~/.config/aihub-desktop-dev/`, and `~/.cache/electron/` (Electron's download cache, which other Electron projects share). The keys file
 belongs to the service as well and stays.
 
 **Rebuild checklist.** Electron `44.6.0` is pinned exactly in `desktop/package.json`; to move, `npm install --save-dev
