@@ -19,11 +19,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   BuildError,
+  DOWNLOAD_TIMEOUT_MS,
   PBS_TAG,
   PYTHON_VERSION,
   TARGETS,
@@ -34,9 +35,11 @@ import {
   auditPayload,
   buildAtomically,
   canRunTarget,
+  downloadFile,
   exportRequirements,
   extract,
   failureReason,
+  fetchVerified,
   installDependencies,
   parseTarget,
   pbsAgeDays,
@@ -892,5 +895,226 @@ describe("extract", () => {
       (err) => err instanceof BuildError && /^tar failed \(exit \d+\)/.test(err.message) && !err.message.includes("\n"),
     );
     assert.deepEqual(listing(work), []);
+  });
+});
+
+// The network is replaced where the script calls it: the global fetch. A local https server would need a
+// certificate that fetch accepts, and nothing in this package provides a mock server for tests.
+describe("downloadFile", () => {
+  const url = "https://github.com/astral-sh/x/releases/download/1/archive.tar.gz";
+  const where = "github.com/astral-sh/x/releases/download/1/archive.tar.gz";
+  let dest;
+  beforeEach(() => {
+    dest = join(scratch, "archive.tar.gz.part-1");
+  });
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  /** Stands in for fetch: `handler(url, init)` makes the response. Returns the calls it received. */
+  function serve(handler) {
+    const seen = [];
+    mock.method(globalThis, "fetch", async (input, init) => {
+      seen.push({ url: String(input), init });
+      return handler(String(input), init);
+    });
+    return seen;
+  }
+  const redirect = (location, body = null) => new Response(body, { status: 302, headers: { location } });
+
+  it("writes the body of the response to the file", async () => {
+    const seen = serve(() => new Response("archive bytes"));
+    await downloadFile(url, dest);
+    assert.equal(readFileSync(dest, "utf8"), "archive bytes");
+    assert.deepEqual(
+      seen.map((call) => call.url),
+      [url],
+    );
+  });
+
+  it("times a download out after minutes, not never and not at once", () => {
+    assert.ok(DOWNLOAD_TIMEOUT_MS >= 60_000 && DOWNLOAD_TIMEOUT_MS <= 3_600_000, `${DOWNLOAD_TIMEOUT_MS} ms`);
+  });
+
+  it("gives fetch an AbortSignal.timeout of DOWNLOAD_TIMEOUT_MS, and handles redirects itself", async () => {
+    const timeout = mock.method(AbortSignal, "timeout"); // records the calls, still makes the real signal
+    const seen = serve(() => new Response("x"));
+    await downloadFile(url, dest);
+    const { init } = seen[0];
+    assert.ok(init.signal instanceof AbortSignal && !init.signal.aborted);
+    assert.deepEqual(
+      timeout.mock.calls.map((call) => call.arguments),
+      [[DOWNLOAD_TIMEOUT_MS]],
+    );
+    assert.equal(init.redirect, "manual", "so that every redirect can be checked to be https");
+  });
+
+  it(
+    "gives up on a download that stalls, after the timeout it was given, and leaves no file",
+    { timeout: 5000 },
+    async () => {
+      serve(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            if (!init.signal) reject(new Error("fetch was called without a signal"));
+            else init.signal.addEventListener("abort", () => reject(init.signal.reason));
+          }),
+      );
+      await assert.rejects(
+        downloadFile(url, dest, 50),
+        (err) =>
+          err instanceof BuildError && new RegExp(`^download timed out after \\d+ s: ${where}$`).test(err.message),
+      );
+      assert.ok(!existsSync(dest));
+    },
+  );
+
+  it("follows redirects to another https address, absolute or relative, and writes the final body", async () => {
+    let released = 0;
+    const body = () => new ReadableStream({ cancel: () => void (released += 1) });
+    const seen = serve((from) => {
+      if (from === url) return redirect("https://objects.example.com/blob?sig=secret", body());
+      if (from.startsWith("https://objects.example.com/blob")) return redirect("/elsewhere/blob", body());
+      return new Response("final bytes");
+    });
+    await downloadFile(url, dest);
+    assert.equal(released, 2, "the body of each redirect response is released");
+    assert.deepEqual(
+      seen.map((call) => call.url),
+      [url, "https://objects.example.com/blob?sig=secret", "https://objects.example.com/elsewhere/blob"],
+    );
+    assert.equal(readFileSync(dest, "utf8"), "final bytes");
+  });
+
+  it("refuses a redirect to http, without the query in the message, and writes nothing", async () => {
+    // What fetch itself does when it is left to follow redirects: it would fetch the http address.
+    serve((_from, init) =>
+      init.redirect === "manual"
+        ? redirect("http://mirror.example.com/blob?sig=secret")
+        : new Response("bytes that came over http"),
+    );
+    await assert.rejects(
+      downloadFile(url, dest),
+      (err) =>
+        err instanceof BuildError &&
+        err.message === "refusing a http URL, only https is allowed: mirror.example.com/blob",
+    );
+    assert.ok(!existsSync(dest));
+  });
+
+  it("stops after five redirects", async () => {
+    const seen = serve(() => redirect(url));
+    await assert.rejects(downloadFile(url, dest), /more than 5 redirects from github\.com/);
+    assert.equal(seen.length, 6);
+  });
+
+  it("reports an HTTP error status and leaves no file", async () => {
+    serve(() => new Response("not found", { status: 404 }));
+    await assert.rejects(downloadFile(url, dest), new RegExp(`^BuildError: download failed with HTTP 404: ${where}$`));
+    assert.ok(!existsSync(dest));
+  });
+
+  it("reports a failed connection by its code", async () => {
+    serve(() => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    });
+    await assert.rejects(
+      downloadFile(url, dest),
+      new RegExp(`^BuildError: download failed \\(ECONNREFUSED\\): ${where}$`),
+    );
+  });
+
+  it("removes the partial file when the body breaks off half way", async () => {
+    const body = new ReadableStream({
+      start: (controller) => controller.enqueue(new TextEncoder().encode("part")),
+      pull: (controller) => controller.error(new Error("socket hang up")),
+    });
+    serve(() => new Response(body));
+    await assert.rejects(
+      downloadFile(url, dest),
+      new RegExp(`^BuildError: download failed \\(socket hang up\\): ${where}$`),
+    );
+    assert.ok(!existsSync(dest));
+  });
+});
+
+describe("fetchVerified", () => {
+  const bytes = Buffer.from("pretend archive ".repeat(500));
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const url = "https://example.com/dist/archive.tar.gz";
+  let file;
+  let downloads;
+  let said;
+  beforeEach(() => {
+    file = join(scratch, "downloads", "archive.tar.gz");
+    downloads = [];
+    said = [];
+  });
+
+  /** A download that writes `content` to the part file, and notes where the final file stood at that moment. */
+  const writes = (content) => async (from, to) => {
+    downloads.push({ from, to, finalExisted: existsSync(file) });
+    writeFileSync(to, content);
+  };
+  const fetchIt = (download) => fetchVerified({ url, file, sha256, download, report: (message) => said.push(message) });
+  const folder = () => readdirSync(dirname(file)).sort();
+
+  it("downloads into a part file beside the final one and moves it there once its hash matches", async () => {
+    assert.equal(await fetchIt(writes(bytes)), file);
+    assert.equal(downloads.length, 1);
+    assert.equal(downloads[0].from, url);
+    assert.equal(dirname(downloads[0].to), dirname(file));
+    assert.match(downloads[0].to, /archive\.tar\.gz\.part-\d+$/);
+    assert.equal(downloads[0].finalExisted, false);
+    assert.deepEqual(readFileSync(file), bytes);
+    assert.deepEqual(folder(), ["archive.tar.gz"]);
+    assert.match(said.join("\n"), /downloaded archive\.tar\.gz \(.* MiB\) in .* s and verified its sha256/);
+  });
+
+  it("keeps a cached file whose hash matches and downloads nothing", async () => {
+    mkdirSync(dirname(file));
+    writeFileSync(file, bytes);
+    assert.equal(await fetchIt(writes(Buffer.from("must not be used"))), file);
+    assert.equal(downloads.length, 0);
+    assert.deepEqual(readFileSync(file), bytes);
+    assert.match(said.join("\n"), /archive\.tar\.gz is in the cache and matches its sha256/);
+  });
+
+  it("deletes a cached file whose hash does not match, says so, and downloads it again", async () => {
+    mkdirSync(dirname(file));
+    writeFileSync(file, "a damaged download");
+    await fetchIt(writes(bytes));
+    assert.equal(downloads.length, 1);
+    assert.equal(downloads[0].finalExisted, false, "the damaged file was gone before the download began");
+    assert.deepEqual(readFileSync(file), bytes);
+    assert.match(said[0], /cached archive\.tar\.gz did not match its sha256 and was deleted/);
+  });
+
+  it("refuses a download whose hash does not match: no file at the final path, no part file", async () => {
+    await assert.rejects(fetchIt(writes(Buffer.from("something else"))), /sha256 mismatch/);
+    assert.deepEqual(folder(), []);
+  });
+
+  it("leaves no part file when the download itself fails half way", async () => {
+    const dies = async (_from, to) => {
+      writeFileSync(to, bytes.subarray(0, 100));
+      throw new BuildError("connection reset");
+    };
+    await assert.rejects(fetchIt(dies), /connection reset/);
+    assert.deepEqual(folder(), []);
+  });
+
+  it("removes the part files of runs that are gone, but not those of a run that is going or of another file", async () => {
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid; // a process id that is free again
+    const going = process.ppid; // the process that started this one is still there
+    const parts = [`archive.tar.gz.part-${gone}`, `archive.tar.gz.part-${going}`, `other.tar.gz.part-${gone}`];
+    lay(dirname(file), parts);
+    await fetchIt(writes(bytes));
+    assert.deepEqual(folder(), ["archive.tar.gz", `archive.tar.gz.part-${going}`, `other.tar.gz.part-${gone}`]);
+  });
+
+  it("needs no report function", async () => {
+    await fetchVerified({ url, file, sha256, download: writes(bytes) });
+    assert.deepEqual(readFileSync(file), bytes);
   });
 });

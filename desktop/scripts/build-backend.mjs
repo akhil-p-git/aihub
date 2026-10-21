@@ -52,7 +52,7 @@ export const MAX_PBS_AGE_DAYS = 45;
 
 const PYTHON_MINOR = "3.12";
 const RELEASE_URL = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}`;
-const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+export const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_REDIRECTS = 5;
 
 // triple: the archive's platform and the value of uv's --python-platform.
@@ -201,24 +201,28 @@ export async function downloadFile(url, dest, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
   }
 }
 
-/** The verified archive in the download cache; fetched only when the cache has no file with the right sha256. */
-async function fetchArchive(target) {
-  const { sha256 } = TARGETS[target];
-  const name = archiveName(target);
-  const file = join(downloadsDir, name);
-  mkdirSync(downloadsDir, { recursive: true });
-  for (const entry of readdirSync(downloadsDir)) {
-    if (entry.startsWith(`${name}.part-`) && isAbandoned(entry)) rmSync(join(downloadsDir, entry), { force: true });
+/**
+ * Makes sure `file` holds the download of `url` with the given sha256, and returns its path. A file already there
+ * with that hash is kept. Anything else is replaced by a download into a part file beside it, which is renamed
+ * only after its hash has been checked, so a file that failed the check, or a download that was cut off, is never
+ * found at `file`, whether the run ends well, fails or is interrupted. `report` is told what happened.
+ */
+export async function fetchVerified({ url, file, sha256, download = downloadFile, report = () => {} }) {
+  const name = basename(file);
+  const folder = dirname(file);
+  mkdirSync(folder, { recursive: true });
+  for (const entry of readdirSync(folder)) {
+    if (entry.startsWith(`${name}.part-`) && isAbandoned(entry)) rmSync(join(folder, entry), { force: true });
   }
 
   if (existsSync(file)) {
     try {
       await verifyArchive(file, sha256);
-      log(target, `${name} is in the cache and matches its sha256`);
+      report(`${name} is in the cache and matches its sha256`);
       return file;
     } catch (err) {
       if (!(err instanceof BuildError)) throw err;
-      log(target, `the cached ${name} did not match its sha256 and was deleted; downloading it again`);
+      report(`the cached ${name} did not match its sha256 and was deleted; downloading it again`);
     }
   }
 
@@ -226,15 +230,25 @@ async function fetchArchive(target) {
   const forget = onInterrupt(() => rmSync(part, { force: true }));
   try {
     const started = Date.now();
-    await downloadFile(archiveUrl(target), part);
+    await download(url, part);
     await verifyArchive(part, sha256);
     renameSync(part, file);
-    log(target, `downloaded ${name} (${mib(statSync(file).size)}) in ${seconds(started)} and verified its sha256`);
+    report(`downloaded ${name} (${mib(statSync(file).size)}) in ${seconds(started)} and verified its sha256`);
   } finally {
     forget();
     rmSync(part, { force: true });
   }
   return file;
+}
+
+/** The target's archive in the download cache: fetched only when the cache has no file with the pinned sha256. */
+function fetchArchive(target) {
+  return fetchVerified({
+    url: archiveUrl(target),
+    file: join(downloadsDir, archiveName(target)),
+    sha256: TARGETS[target].sha256,
+    report: (message) => log(target, message),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
