@@ -101,3 +101,22 @@ async def make_service(tmp_path: Path, *, clock: "Clock | None" = None, **config
         cfg, store, catalog, providers, today=lambda: TODAY, monotonic=clock or Clock()
     )
     return service, store, providers
+
+
+SHAPE_SIZES = {"square": (1024, 1024), "wide": (1024, 576), "tall": (576, 1024)}
+
+
+def webp(shape: str = "square") -> bytes:
+    """A small real WebP of that shape, as the engine writes it with metadata off: one lossy VP8 chunk.
+
+    ffmpeg's libwebp encoder wrote these (cwebp is not installed); its RIFF layout is the same as what
+    WebPEncodeRGB returns, which is all sd-server writes when embed_image_metadata is false.
+    """
+    return (FIXTURES / "images" / f"{shape}.webp").read_bytes()
+
+
+def engine_errors(scenario: str) -> list[str]:
+    """Real [E]/[W] lines from the image lab's logs (see engine-errors.json for where each came from)."""
+    return json.loads((FIXTURES / "images" / "engine-errors.json").read_text())[
+        scenario
+    ]["lines"]
