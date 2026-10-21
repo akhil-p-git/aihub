@@ -22,7 +22,9 @@ from aihub_web.catalog import Catalog
 from aihub_web.chat import ChatService
 from aihub_web.config import Config
 from aihub_web.db import Store
+from aihub_web.images import GpuLock, ImageJobs, Pacing
 from aihub_web.providers import Finish, Text
+from aihub_web.providers.images import EngineClient
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OLLAMA = json.loads((FIXTURES / "ollama_models.json").read_text())
@@ -105,20 +107,60 @@ class Clock:
         self.now += seconds + days * 86_400
 
 
-async def make_service(tmp_path: Path, *, clock: "Clock | None" = None, **config):
-    """A ChatService over a real store and the stubbed model catalog, with a FakeProvider per provider."""
+# Image jobs that look at the lock, Ollama and the engine every 10 ms and give up in seconds.
+FAST_PACING = Pacing(tick=0.01, lock_wait=2.0, unload_wait=0.3)
+
+
+async def make_service(
+    tmp_path: Path,
+    *,
+    clock: "Clock | None" = None,
+    images: "FakeEngine | None" = None,
+    socket: str | None = None,
+    ollama: "FakeOllama | None" = None,
+    pacing: Pacing = FAST_PACING,
+    # A job that hangs because of a mistake in a test ends after 30 s instead of minutes.
+    deadline=lambda est_s: 30.0,
+    **config,
+):
+    """A ChatService over a real store and the stubbed model catalog, with a FakeProvider per provider.
+
+    With `images` (a FakeEngine) and `socket` (a trusted one, from the bound_socket fixture) image
+    generation is set up against that engine; the jobs are `service.images`."""
     providers = {
         "openrouter": FakeProvider(Text("ok"), Finish("stop")),
         "ollama": FakeProvider(Text("ok"), Finish("stop")),
         "anthropic": FakeProvider(Text("ok"), Finish("stop")),
     }
+    if images is not None:
+        assert socket, "image generation needs a socket"
+        config["images"] = {"socket": socket}
     cfg = Config(state_dir=tmp_path, **config)
-    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler_for()))
+    client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handler_for(ollama=ollama))
+    )
     store = Store(tmp_path / "chats.db")
     catalog = Catalog(cfg, client, environ=KEYS, today=lambda: TODAY)
     await catalog.refresh()
+    jobs = None
+    if images is not None:
+        jobs = ImageJobs(
+            store,
+            EngineClient(socket, transport=images.transport()),
+            GpuLock(Path(socket).parent),
+            client,
+            cfg.ollama,
+            pacing=pacing,
+            deadline_for=deadline,
+        )
     service = ChatService(
-        cfg, store, catalog, providers, today=lambda: TODAY, monotonic=clock or Clock()
+        cfg,
+        store,
+        catalog,
+        providers,
+        today=lambda: TODAY,
+        monotonic=clock or Clock(),
+        images=jobs,
     )
     return service, store, providers
 

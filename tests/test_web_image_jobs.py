@@ -26,6 +26,9 @@ from aihub_web.images import (
 )
 from aihub_web.providers.images import EngineClient
 from helpers import (
+    FAST_PACING as FAST,
+)
+from helpers import (
     HOLD,
     Clock,
     FakeEngine,
@@ -40,9 +43,6 @@ from helpers import (
     queued,
     webp,
 )
-
-# Looks at the lock, Ollama and the engine every 10 ms instead of every 250, and gives up sooner.
-FAST = Pacing(tick=0.01, lock_wait=2.0, unload_wait=0.3)
 
 
 def plan_for(chat_id: str, **fields) -> ImagePlan:
@@ -92,7 +92,7 @@ async def rig(
     ollama: FakeOllama | None = None,
     transport: httpx2.AsyncBaseTransport | None = None,
     pacing: Pacing = FAST,
-    deadline: Callable[[float], float] = deadline_for,
+    deadline: Callable[[float], float] = lambda est_s: 30.0,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> AsyncIterator[Rig]:
     timeline: list = []

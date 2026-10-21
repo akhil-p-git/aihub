@@ -1,9 +1,11 @@
 import asyncio
+import gc
 from decimal import Decimal
 from pathlib import Path
 
 import httpx2
 import pytest
+from aihub_web import chat as chat_module
 from aihub_web.catalog import Catalog
 from aihub_web.chat import (
     ApiError,
@@ -17,12 +19,26 @@ from aihub_web.chat import (
 from aihub_web.config import Config, Limits
 from aihub_web.db import Message, Store
 from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
-from helpers import HANG, TODAY, Clock, handler_for, make_service
+from helpers import (
+    HANG,
+    HOLD,
+    TODAY,
+    Clock,
+    FakeEngine,
+    FakeOllama,
+    finished,
+    generating,
+    handler_for,
+    holding,
+    make_service,
+)
 from pydantic import ValidationError
 
 FREE = "openrouter/google/gemma-4-31b-it:free"  # no reasoning switch
 LOCAL = "ollama/qwen3:8b"  # off / on
 HAIKU = "anthropic/claude-haiku-5-5"
+IMAGE = "images/zimage"
+FAST_IMAGE = "images/klein4b"
 
 
 async def run(service: ChatService, **body) -> list[dict]:
@@ -507,3 +523,659 @@ class TestCost:
         assert cost_of(free, Usage(1000, 500)) is None
         assert cost_of(haiku, None) is None
         assert cost_of(haiku, Usage(None, 500)) is None
+
+
+async def drained(service: ChatService, turn) -> list[dict]:
+    return [event async for event in service.stream(turn)]
+
+
+def gpu_is_free(service: ChatService) -> bool:
+    lease = service.images.gpu.try_exclusive()
+    if lease:
+        lease.release()
+    return lease is not None
+
+
+@pytest.mark.anyio
+class TestImageTurns:
+    async def test_a_prompt_makes_one_image_reply(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, providers = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        events = await run(service, text="a red fox in snow", model=IMAGE)
+
+        kinds = [e["t"] for e in events]
+        assert kinds[0] == "chat" and kinds[-1] == "done"
+        assert set(kinds[1:-1]) == {"progress"}
+        chat = events[0]["chat"]
+        assert (chat["title"], chat["model"], chat["effort"]) == (
+            "a red fox in snow",
+            IMAGE,
+            None,
+        )
+        assert events[0]["user"]["content"] == "a red fox in snow"
+        stored = store.messages(chat["id"])
+        assert [(m.role, m.status, m.content) for m in stored] == [
+            ("user", "done", "a red fox in snow"),
+            ("assistant", "done", ""),
+        ]
+        assert final(events) == stored[1].to_json()
+        [image] = stored[1].images
+        assert (image["w"], image["h"], image["steps"], image["model"]) == (
+            1024,
+            1024,
+            8,
+            IMAGE,
+        )
+        [body] = engine.submitted
+        assert body["prompt"] == "a red fox in snow"
+        assert (body["width"], body["height"]) == (1024, 1024)
+        assert body["sample_params"]["sample_steps"] == 8
+        assert "sample_method" not in body["sample_params"]
+        assert not any(provider.requests for provider in providers.values())
+        await service.images.shutdown()
+
+    async def test_the_fast_model_sends_its_sampler_and_fewer_steps(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine(model="klein4b")
+        service, _, _ = await make_service(tmp_path, images=engine, socket=bound_socket)
+        await run(service, text="a lighthouse", model=FAST_IMAGE)
+        [body] = engine.submitted
+        assert body["sample_params"]["sample_steps"] == 4
+        assert body["sample_params"]["sample_method"] == "euler"
+        assert engine.calls[1] == ("POST", "/e/klein4b/sdcpp/v1/img_gen")
+        await service.images.shutdown()
+
+    @pytest.mark.parametrize(
+        ("shape", "size", "estimate"),
+        [
+            (None, (1024, 1024), 23),
+            ("square", (1024, 1024), 23),
+            ("wide", (1024, 576), 12),
+            ("tall", (576, 1024), 12),
+        ],
+    )
+    async def test_the_shape_picks_the_size_and_the_time_limit(
+        self, tmp_path: Path, bound_socket: str, shape, size, estimate
+    ) -> None:
+        engine, asked = FakeEngine(), []
+        service, _, _ = await make_service(
+            tmp_path,
+            images=engine,
+            socket=bound_socket,
+            deadline=lambda est: asked.append(est) or 30.0,
+        )
+        events = await run(service, text="a fox", model=IMAGE, shape=shape)
+        assert (engine.submitted[0]["width"], engine.submitted[0]["height"]) == size
+        assert asked == [estimate]
+        image = final(events)["images"][0]
+        assert (image["w"], image["h"]) == size
+        assert final(events)["usage"]["shape"] == (shape or "square")
+        await service.images.shutdown()
+
+    async def test_every_image_gets_a_seed_the_server_chose(
+        self, tmp_path: Path, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bounds = []
+        monkeypatch.setattr(
+            chat_module.secrets, "randbelow", lambda n: bounds.append(n) or 1234
+        )
+        engine = FakeEngine()
+        service, _, _ = await make_service(tmp_path, images=engine, socket=bound_socket)
+        events = await run(service, text="a fox", model=IMAGE)
+        assert bounds == [2**31]
+        assert engine.submitted[0]["seed"] == 1234
+        assert final(events)["images"][0]["seed"] == 1234
+        await service.images.shutdown()
+
+    async def test_only_the_newest_text_is_the_prompt(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="tell me about foxes", model=FREE)
+        chat_id = first[0]["chat"]["id"]
+        await run(service, chat_id=chat_id, text="now draw one", model=IMAGE)
+        assert engine.submitted[0]["prompt"] == "now draw one"
+        assert store.get_chat(chat_id).model == IMAGE
+        await service.images.shutdown()
+
+    async def test_a_chat_in_image_mode_stays_in_it(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, providers = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        chat_id = (await run(service, text="one", model=IMAGE, shape="wide"))[0][
+            "chat"
+        ]["id"]
+        again = await run(service, chat_id=chat_id, text="two")
+        assert final(again)["images"][0]["model"] == IMAGE
+        assert (engine.submitted[1]["width"], engine.submitted[1]["height"]) == (
+            1024,
+            1024,
+        )  # the shape is not remembered: square unless asked
+        assert [m.role for m in store.messages(chat_id)] == ["user", "assistant"] * 2
+        assert not providers["openrouter"].requests
+        await service.images.shutdown()
+
+    async def test_an_overlong_prompt_is_refused_before_anything_is_stored(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="x" * 2001, model=IMAGE))
+        assert (err.value.status, err.value.code) == (413, "prompt_too_long")
+        assert "2,000" in err.value.message
+        assert store.list_chats() == []
+        turn = service.prepare(
+            ChatRequest(text="x" * 2000, model=IMAGE)
+        )  # exactly the limit
+        await drained(service, turn)
+        await service.images.shutdown()
+
+    async def test_a_full_image_store_refuses_new_images(
+        self, tmp_path: Path, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        chat_id = (await run(service, text="one", model=IMAGE))[0]["chat"]["id"]
+        used = store.image_bytes_total()
+        assert used > 0
+        monkeypatch.setattr(chat_module, "IMAGE_STORE_CAP", used)
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="two", chat_id=chat_id))
+        assert (err.value.status, err.value.code) == (507, "image_store_full")
+        assert (
+            err.value.message
+            == "Image storage is full (2 GiB). Delete old chats to make room."
+        )
+        assert len(store.messages(chat_id)) == 2  # the refused prompt was not stored
+        monkeypatch.setattr(chat_module, "IMAGE_STORE_CAP", used + 1)
+        await run(service, text="two", chat_id=chat_id)
+        await service.images.shutdown()
+
+    async def test_the_text_cap_does_not_apply_to_the_text_of_an_image_prompt(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, _ = await make_service(
+            tmp_path,
+            images=FakeEngine(),
+            socket=bound_socket,
+            limits=Limits(max_message_chars=10),
+        )
+        await run(service, text="longer than ten characters", model=IMAGE)
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="x" * 11, model=FREE))
+        assert err.value.code == "too_long"
+        await service.images.shutdown()
+
+    async def test_one_chat_one_image_and_one_other_may_wait(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = service.prepare(ChatRequest(text="one", model=IMAGE))
+        for kwargs in (
+            {"chat_id": first.chat.id},
+            {"chat_id": first.chat.id, "shape": "wide"},
+        ):
+            with pytest.raises(ApiError) as err:
+                service.prepare(ChatRequest(text="again", **kwargs))
+            assert (err.value.status, err.value.code) == (429, "busy_gpu")
+            assert err.value.message == "An image is already being made in this chat."
+        assert (
+            len(store.messages(first.chat.id)) == 1
+        )  # the refused prompts were not stored
+
+        second = service.prepare(ChatRequest(text="two", model=IMAGE))  # waits its turn
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="three", model=IMAGE))
+        assert (err.value.status, err.value.code) == (429, "busy_gpu")
+        assert err.value.message == "Another image is already waiting."
+        assert len(store.list_chats()) == 2  # no chat was created for the refused one
+
+        engine.release()
+        for turn in (first, second):
+            assert (await drained(service, turn))[-1]["t"] == "done"
+        await service.images.shutdown()
+
+    async def test_regenerating_replaces_the_image_and_the_old_bytes_go(
+        self, tmp_path: Path, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seeds = iter([1, 2])
+        monkeypatch.setattr(chat_module.secrets, "randbelow", lambda n: next(seeds))
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=IMAGE, shape="wide")
+        chat_id = first[0]["chat"]["id"]
+        old = final(first)["images"][0]["id"]
+        again = await run(
+            service,
+            chat_id=chat_id,
+            regenerate_for=first[0]["user"]["id"],
+            shape="tall",
+        )
+        assert again[0]["user"] is None
+        assert [m.role for m in store.messages(chat_id)] == ["user", "assistant"]
+        assert store.get_image(chat_id, old) is None
+        new = final(again)["images"][0]
+        assert (new["w"], new["h"], new["seed"]) == (576, 1024, 2)
+        assert [b["prompt"] for b in engine.submitted] == ["a red fox"] * 2
+        await service.images.shutdown()
+
+    async def test_a_regenerate_that_is_turned_away_keeps_the_reply_it_would_replace(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        holding_the_gpu = service.prepare(ChatRequest(text="another", model=IMAGE))
+        waiting = service.prepare(ChatRequest(text="a third", model=IMAGE))
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(chat_id=chat_id, regenerate_for=first[0]["user"]["id"])
+            )
+        assert err.value.code == "busy_gpu"
+        assert [m.role for m in store.messages(chat_id)] == ["user", "assistant"]
+        assert store.image_bytes_total() > 0
+        engine.release()
+        await drained(service, holding_the_gpu)
+        await drained(service, waiting)
+        await service.images.shutdown()
+
+    async def test_regenerating_an_old_exchange_is_still_refused(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        first = await run(service, text="one", model=IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        await run(service, chat_id=chat_id, text="two")
+        before = [m.id for m in store.messages(chat_id)]
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(chat_id=chat_id, regenerate_for=first[0]["user"]["id"])
+            )
+        assert (err.value.status, err.value.code) == (409, "stale_chat")
+        assert [m.id for m in store.messages(chat_id)] == before
+        assert not service.images.pending(chat_id)
+        await service.images.shutdown()
+
+    async def test_closing_the_stream_does_not_stop_the_image(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        turn = service.prepare(ChatRequest(text="a red fox", model=IMAGE))
+        events = service.stream(turn)
+        assert (await anext(events))["t"] == "chat"
+        assert (await anext(events))["phase"] == "sampling"
+        await events.aclose()  # the browser went away
+        engine.release()
+        for _ in range(500):
+            if len(store.messages(turn.chat.id)) == 2:
+                break
+            await asyncio.sleep(0.01)
+        reply = store.messages(turn.chat.id)[-1]
+        assert (reply.status, bool(reply.images)) == ("done", True)
+        assert engine.kills == 0
+        await service.images.shutdown()
+
+    async def test_stop_ends_the_stream_with_a_stopped_reply(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 8)])
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        turn = service.prepare(ChatRequest(text="a red fox", model=IMAGE))
+        events = service.stream(turn)
+        await anext(events)
+        await anext(events)
+        assert service.images.stop(turn.chat.id)
+        rest = [event async for event in events]
+        assert rest[-1]["t"] == "done" and rest[-1]["message"]["status"] == "stopped"
+        assert store.messages(turn.chat.id)[-1].images is None
+        await service.images.shutdown()
+
+    async def test_image_replies_are_not_counted_against_the_reply_limit(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        service, _, _ = await make_service(
+            tmp_path,
+            images=engine,
+            socket=bound_socket,
+            limits=Limits(max_concurrent=1),
+        )
+        running = service.prepare(ChatRequest(text="a fox", model=IMAGE))
+        await run(service, text="and a text reply meanwhile", model=FREE)
+        engine.release()
+        await drained(service, running)
+        await service.images.shutdown()
+
+
+@pytest.mark.anyio
+class TestImagesAreOptional:
+    async def test_without_a_socket_no_image_model_exists(self, tmp_path: Path) -> None:
+        service, store, _ = await make_service(tmp_path)
+        assert service.images is None
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="a fox", model=IMAGE))
+        assert (err.value.status, err.value.code) == (400, "unknown_model")
+        assert store.list_chats() == []
+
+    async def test_without_a_socket_a_shape_is_refused(self, tmp_path: Path) -> None:
+        service, _, _ = await make_service(tmp_path)
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="hi", model=FREE, shape="wide"))
+        assert err.value.status == 422
+
+    async def test_an_engine_that_is_not_set_up_is_refused_with_the_fix(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=str(socket_dir / "absent.sock")
+        )
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="a fox", model=IMAGE))
+        assert (err.value.status, err.value.code) == (409, "model_unavailable")
+        assert err.value.message == (
+            "Z-Image Turbo isn't available: Image engine isn't set up. See README, Images."
+        )
+        assert store.list_chats() == []
+
+    async def test_a_new_chat_never_starts_on_an_image_model(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, providers = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        await run(service, text="hi")
+        assert providers["openrouter"].requests[-1].model.id == FREE
+
+    @pytest.mark.parametrize("model", [FREE, LOCAL, HAIKU])
+    async def test_a_shape_only_belongs_to_image_models(
+        self, tmp_path: Path, bound_socket: str, model: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="hi", model=model, shape="wide"))
+        assert (err.value.status, err.value.code) == (422, "invalid")
+        assert err.value.message == "shape/reference only apply to image models"
+        assert store.list_chats() == []
+
+
+class TestImageRequestShape:
+    @pytest.mark.parametrize("shape", [None, "square", "wide", "tall"])
+    def test_the_three_shapes_and_none(self, shape) -> None:
+        assert ChatRequest(text="x", shape=shape).shape == shape
+
+    @pytest.mark.parametrize("shape", ["huge", "Square", "", "1024x1024", 3])
+    def test_nothing_else_is_a_shape(self, shape) -> None:
+        with pytest.raises(ValidationError):
+            ChatRequest(text="x", shape=shape)
+
+
+def stored(role: str, content: str = "", status: str = "done", images=None) -> Message:
+    return Message(
+        "", "c", 0, role, content, None, None, None, None, status, None, 0, images
+    )
+
+
+def picture(
+    model: str = "images/zimage", w: int = 1024, h: int = 576, seed: int = 7
+) -> dict:
+    return {
+        "id": "0123456789abcdef",
+        "w": w,
+        "h": h,
+        "seed": seed,
+        "steps": 8,
+        "model": model,
+        "ref": None,
+    }
+
+
+class TestImageHistory:
+    def test_text_models_are_told_an_image_was_made_never_shown_it(self) -> None:
+        history = build_history(
+            [
+                stored("user", "a red fox"),
+                stored("assistant", images=[picture()]),
+                stored("user", "make it blue"),
+            ],
+            {"images/zimage": "Z-Image Turbo"},
+        )
+        assert history == [
+            {"role": "user", "content": "a red fox"},
+            {
+                "role": "assistant",
+                "content": "[Image made with Z-Image Turbo from the prompt above, 1024x576, seed 7]",
+            },
+            {"role": "user", "content": "make it blue"},
+        ]
+
+    def test_a_model_that_is_no_longer_configured_is_named_by_its_id(self) -> None:
+        [_, reply] = build_history(
+            [
+                stored("user", "a fox"),
+                stored("assistant", images=[picture("images/gone")]),
+            ]
+        )
+        assert reply["content"].startswith(
+            "[Image made with images/gone from the prompt above"
+        )
+
+    def test_replies_with_neither_words_nor_an_image_are_still_skipped(self) -> None:
+        history = build_history(
+            [
+                stored("user", "a"),
+                stored("assistant", status="error"),
+                stored("user", "b"),
+                stored("assistant", status="stopped"),
+                stored("assistant", "   "),
+                stored("user", "c"),
+            ]
+        )
+        assert history == [{"role": "user", "content": "a\n\nb\n\nc"}]
+
+    def test_words_and_pictures_in_one_reply_are_both_kept(self) -> None:
+        [_, reply] = build_history(
+            [
+                stored("user", "a"),
+                stored("assistant", "Here you go.", images=[picture()]),
+            ]
+        )
+        assert reply["content"].startswith("Here you go.")
+
+
+@pytest.mark.anyio
+class TestImageHistoryInPractice:
+    async def test_the_next_text_turn_sends_the_stand_in(
+        self, tmp_path: Path, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(chat_module.secrets, "randbelow", lambda n: 99)
+        service, _, providers = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=IMAGE, shape="wide")
+        chat_id = first[0]["chat"]["id"]
+        await run(service, chat_id=chat_id, text="what did you draw?", model=FREE)
+        sent = providers["openrouter"].requests[-1].messages
+        assert [m["role"] for m in sent] == ["user", "assistant", "user"]
+        assert sent[1]["content"] == (
+            "[Image made with Z-Image Turbo from the prompt above, 1024x576, seed 99]"
+        )
+        await service.images.shutdown()
+
+
+@pytest.mark.anyio
+class TestSharingTheGpu:
+    async def test_a_local_reply_is_refused_while_an_image_is_made(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        running = service.prepare(ChatRequest(text="a fox", model=IMAGE))
+        chats_before = len(store.list_chats())
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(text="hello", model=LOCAL))
+        assert (err.value.status, err.value.code) == (429, "busy_gpu")
+        assert err.value.message == (
+            "The GPU is making an image, so local models are paused until it finishes. "
+            "Cloud models still work."
+        )
+        assert (
+            len(store.list_chats()) == chats_before
+        )  # nothing of the refused turn was stored
+        # cloud models carry on
+        for model in (FREE, HAIKU):
+            assert (await run(service, text="hi", model=model))[-1]["t"] == "done"
+        engine.release()
+        await drained(service, running)
+        assert (await run(service, text="hello again", model=LOCAL))[-1]["t"] == "done"
+        await service.images.shutdown()
+
+    async def test_a_local_reply_holds_the_gpu_until_its_stream_has_ended(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, providers = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        providers["ollama"].script = [Text("par"), HANG]
+        reply = service.stream(service.prepare(ChatRequest(text="hi", model=LOCAL)))
+        await anext(reply)
+        await anext(reply)  # "par"
+        assert not gpu_is_free(service)
+        image = service.prepare(ChatRequest(text="a fox", model=IMAGE))
+        assert service.images.pending(image.chat.id)["phase"] == "waiting"
+        await asyncio.sleep(0.1)
+        assert not store.messages(image.chat.id)[
+            1:
+        ]  # still waiting for the reply to end
+        await reply.aclose()
+        assert (await drained(service, image))[-1]["t"] == "done"
+        await service.images.shutdown()
+
+    @pytest.mark.parametrize("ending", ["finishes", "fails", "is closed"])
+    async def test_the_gpu_is_free_again_however_a_local_reply_ends(
+        self, tmp_path: Path, bound_socket: str, ending: str
+    ) -> None:
+        service, _, providers = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        providers["ollama"].script = {
+            "finishes": [Text("ok"), Finish("stop")],
+            "fails": [ProviderError("down")],
+            "is closed": [Text("par"), HANG],
+        }[ending]
+        turn = service.prepare(ChatRequest(text="hi", model=LOCAL))
+        assert turn.lease is not None and not gpu_is_free(service)
+        events = service.stream(turn)
+        await anext(events)
+        if ending == "is closed":
+            await anext(events)
+            await events.aclose()
+        else:
+            async for _ in events:
+                pass
+        assert gpu_is_free(service)
+
+    async def test_a_turn_that_is_refused_after_the_gpu_was_taken_gives_it_back(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        chat_id = (await run(service, text="q", model=LOCAL))[0]["chat"]["id"]
+        await run(service, chat_id=chat_id, text="q2")
+        old_user = store.messages(chat_id)[0].id
+        with pytest.raises(ApiError) as err:
+            service.prepare(ChatRequest(chat_id=chat_id, regenerate_for=old_user))
+        assert err.value.code == "stale_chat"
+        assert gpu_is_free(service)
+
+    async def test_a_turn_that_is_never_streamed_gives_the_gpu_back_when_dropped(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        turn = service.prepare(ChatRequest(text="hi", model=LOCAL))
+        assert not gpu_is_free(service)
+        del turn
+        gc.collect()
+        assert gpu_is_free(service)
+
+    async def test_cloud_models_never_take_the_gpu(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        for model in (FREE, HAIKU):
+            turn = service.prepare(ChatRequest(text="hi", model=model))
+            assert turn.lease is None and gpu_is_free(service)
+
+    async def test_a_second_process_making_an_image_pauses_local_replies_here(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        with holding(Path(bound_socket).parent, "exclusive"):
+            with pytest.raises(ApiError) as err:
+                service.prepare(ChatRequest(text="hi", model=LOCAL))
+            assert err.value.code == "busy_gpu"
+            assert (await run(service, text="hi", model=FREE))[-1]["t"] == "done"
+        assert (await run(service, text="hi", model=LOCAL))[-1]["t"] == "done"
+
+    async def test_without_image_generation_a_local_reply_takes_no_lock(
+        self, tmp_path: Path
+    ) -> None:
+        service, _, _ = await make_service(tmp_path)
+        turn = service.prepare(ChatRequest(text="hi", model=LOCAL))
+        assert turn.lease is None
+
+    async def test_the_images_are_unloaded_from_ollama_before_the_engine_is_used(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        ollama = FakeOllama("qwen3:8b")
+        service, _, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket, ollama=ollama
+        )
+        await run(service, text="a fox", model=IMAGE)
+        assert ollama.resident == []
+        await service.images.shutdown()

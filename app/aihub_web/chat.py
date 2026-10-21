@@ -3,19 +3,30 @@
 import asyncio
 import logging
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .catalog import Catalog, ModelInfo
 from .config import Config
 from .db import Chat, Message, Store
+from .images import (
+    IMAGE_STORE_CAP,
+    MAX_PROMPT_CHARS,
+    SHAPES,
+    Busy,
+    GpuLease,
+    ImageJobs,
+    ImagePlan,
+    Job,
+)
 from .providers import (
     Finish,
     GenRequest,
@@ -53,6 +64,8 @@ class ChatRequest(BaseModel):
     # Answer this user message again. Naming it, not just asking for "again", lets a window that is behind
     # be refused instead of deleting a newer reply.
     regenerate_for: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
+    # The shape of an image; image models only. None means square.
+    shape: Literal["square", "wide", "tall"] | None = None
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
@@ -85,6 +98,18 @@ class Turn:
     effort: str | None
     request: GenRequest
     dropped: int  # earlier messages left out to fit the context
+    # The GPU, shared, for a reply by a local model: an image in the making needs it whole.
+    lease: GpuLease | None = None
+
+
+@dataclass(slots=True)
+class ImageTurn:
+    """An image to make. Its job is already running: the stream only watches it."""
+
+    chat: Chat
+    user: Message | None
+    model: ModelInfo
+    job: Job
 
 
 def derive_title(text: str) -> str:
@@ -99,22 +124,40 @@ def estimate_tokens(text: str) -> int:
     return len(text) // CHARS_PER_TOKEN + 1
 
 
-def build_history(messages: list[Message]) -> list[dict[str, str]]:
+def _stand_in(image: Mapping[str, object], names: Mapping[str, str]) -> str:
+    name = names.get(str(image["model"]), image["model"])
+    return f"[Image made with {name} from the prompt above, {image['w']}x{image['h']}, seed {image['seed']}]"
+
+
+def build_history(
+    messages: list[Message], image_names: Mapping[str, str] | None = None
+) -> list[dict[str, str]]:
     """Alternating turns for the provider.
 
     Failed and empty replies are skipped, so a retry never resends them, and adjacent turns by the same
-    role are merged because providers want strict alternation.
+    role are merged because providers want strict alternation. A reply that is an image is described in
+    words, with the name of the model that made it (`image_names` maps model ids to names): text models
+    are told an image was made, never shown it.
     """
+    names = image_names or {}
     turns: list[dict[str, str]] = []
     for message in messages:
-        if message.role == "assistant" and (
+        content = message.content
+        if message.role == "assistant" and message.images:
+            content = "\n".join(
+                filter(
+                    None,
+                    [content.strip(), *(_stand_in(i, names) for i in message.images)],
+                )
+            )
+        elif message.role == "assistant" and (
             message.status == "error" or not message.content.strip()
         ):
             continue
         if turns and turns[-1]["role"] == message.role:
-            turns[-1]["content"] += "\n\n" + message.content
+            turns[-1]["content"] += "\n\n" + content
         else:
-            turns.append({"role": message.role, "content": message.content})
+            turns.append({"role": message.role, "content": content})
     while turns and turns[0]["role"] != "user":
         turns.pop(0)
     return turns
@@ -180,6 +223,7 @@ class ChatService:
         *,
         today: Callable[[], date] = date.today,
         monotonic: Callable[[], float] = time.monotonic,
+        images: ImageJobs | None = None,
     ) -> None:
         self._cfg = cfg
         self._store = store
@@ -188,13 +232,42 @@ class ChatService:
         self._today = today
         self._monotonic = monotonic
         self._gate = asyncio.Semaphore(cfg.limits.max_concurrent)
+        # Set where image generation is: the jobs, and with them the GPU lock.
+        self.images = images
 
-    def prepare(self, body: ChatRequest) -> Turn:
+    def prepare(self, body: ChatRequest) -> Turn | ImageTurn:
         """Everything that can be refused is refused here, before any bytes are streamed."""
         chat = self._store.get_chat(body.chat_id) if body.chat_id else None
         if body.chat_id and not chat:
             raise ApiError(404, "no_chat", "That chat no longer exists.")
         model = self._resolve_model(body.model or (chat.model if chat else None))
+        if model.output == "image":
+            return self._prepare_image(body, chat, model)
+        if body.shape:
+            raise ApiError(422, "invalid", "shape/reference only apply to image models")
+        lease = self._share_the_gpu(model)
+        try:
+            turn = self._prepare_text(body, chat, model)
+        except BaseException:
+            if lease:
+                lease.release()
+            raise
+        turn.lease = lease
+        return turn
+
+    def _share_the_gpu(self, model: ModelInfo) -> GpuLease | None:
+        """A local reply takes part of the GPU, which an image in the making needs whole, so it is refused
+        while one is made. Cloud models never need it."""
+        if self.images is None or model.provider != "ollama":
+            return None
+        try:
+            return self.images.gpu.share()
+        except Busy as err:
+            raise ApiError(429, "busy_gpu", str(err)) from err
+
+    def _prepare_text(
+        self, body: ChatRequest, chat: Chat | None, model: ModelInfo
+    ) -> Turn:
         effort = self._resolve_effort(
             model, body.effort or (chat.effort if chat else None)
         )
@@ -226,7 +299,8 @@ class ChatService:
             )
 
         turns, dropped = fit_history(
-            build_history(self._store.messages(chat.id)), self._budget(model)
+            build_history(self._store.messages(chat.id), self._image_names()),
+            self._budget(model),
         )
         if not turns:
             raise ApiError(409, "nothing_to_answer", "There is no message to answer.")
@@ -253,9 +327,12 @@ class ChatService:
             raise ApiError(
                 409,
                 "model_unavailable",
-                f"{model.name} isn't available: {model.reason}.",
+                f"{model.name} isn't available: {(model.reason or '').rstrip('.')}.",
             )
         return model
+
+    def _image_names(self) -> dict[str, str]:
+        return {f"images/{m.id}": m.name for m in self._cfg.images.models}
 
     @staticmethod
     def _resolve_effort(model: ModelInfo, effort: str | None) -> str | None:
@@ -279,13 +356,106 @@ class ChatService:
         if messages[-1].role == "assistant":
             self._store.delete_message(messages[-1].id)
 
+    def _prepare_image(
+        self, body: ChatRequest, chat: Chat | None, model: ModelInfo
+    ) -> ImageTurn:
+        """Check everything, store the prompt and start the job, which runs on without the request."""
+        jobs = self.images
+        assert jobs is not None, "an image model is only listed where images are set up"
+        if body.regenerate_for:
+            newest = next(
+                (
+                    m
+                    for m in reversed(self._store.messages(chat.id))
+                    if m.role == "user"
+                ),
+                None,
+            )
+            if newest is None:
+                raise ApiError(
+                    409, "nothing_to_answer", "There is no message to answer."
+                )
+            prompt = newest.content.strip()
+        else:
+            prompt = (body.text or "").strip()
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ApiError(
+                413,
+                "prompt_too_long",
+                f"Image prompts are limited to {MAX_PROMPT_CHARS:,} characters.",
+            )
+        if self._store.image_bytes_total() >= IMAGE_STORE_CAP:
+            raise ApiError(
+                507,
+                "image_store_full",
+                "Image storage is full (2 GiB). Delete old chats to make room.",
+            )
+        try:
+            jobs.admit(chat.id if chat else None)
+        except Busy as err:
+            raise ApiError(429, "busy_gpu", str(err)) from err
+
+        user = None
+        if body.regenerate_for:
+            self._drop_last_reply(chat, body.regenerate_for)
+        else:
+            if not chat:
+                chat = self._store.create_chat(derive_title(prompt), model.id, None)
+            user = self._store.add_message(chat.id, "user", prompt)
+        if (chat.model, chat.effort) != (model.id, None):
+            chat = (
+                self._store.update_chat(chat.id, {"model": model.id, "effort": None})
+                or chat
+            )
+        shape = body.shape or "square"
+        config = next(m for m in self._cfg.images.models if m.id == model.native)
+        plan = ImagePlan(
+            chat.id,
+            model.id,
+            model.native,
+            prompt,
+            shape,
+            *SHAPES[shape],
+            secrets.randbelow(2**31),
+            config.steps,
+            config.sample_method,
+            getattr(config.est_s, shape),
+        )
+        return ImageTurn(chat, user, model, jobs.start(plan))
+
     def _budget(self, model: ModelInfo) -> int:
         usable = int((model.ctx or 8192) * CONTEXT_SHARE)
         if model.provider == "ollama":
             return usable
         return min(usable, self._cfg.limits.cloud_context_tokens)
 
-    async def stream(self, turn: Turn) -> AsyncIterator[dict[str, object]]:
+    def stream(self, turn: Turn | ImageTurn) -> AsyncIterator[dict[str, object]]:
+        if isinstance(turn, ImageTurn):
+            return self._stream_image(turn)
+        return self._stream_text(turn)
+
+    async def _stream_image(self, turn: ImageTurn) -> AsyncIterator[dict[str, object]]:
+        """Events for the browser: the chat, then the job's progress, then how it ended.
+
+        The job owns the work. Leaving here, however that happens, only stops the listening, so nothing
+        in this method may await while it is being closed.
+        """
+        queue = turn.job.subscribe()
+        try:
+            yield {
+                "t": "chat",
+                "chat": turn.chat.to_json(),
+                "user": turn.user.to_json() if turn.user else None,
+            }
+            while True:
+                event = await queue.get()
+                yield event
+                if event["t"] != "progress":
+                    return
+        finally:
+            turn.job.unsubscribe(queue)
+
+    async def _stream_text(self, turn: Turn) -> AsyncIterator[dict[str, object]]:
         """Events for the browser. The reply is stored exactly once, whether it finishes, fails or is cut off."""
         text: list[str] = []
         thinking: list[str] = []
@@ -336,6 +506,8 @@ class ChatService:
             status = "stopped"  # the reader went away or pressed Stop
             raise
         finally:
+            if turn.lease:
+                turn.lease.release()
             timing.end = self._monotonic()
             if timing.think_from is not None and timing.think_to is None:
                 timing.think_to = timing.end
