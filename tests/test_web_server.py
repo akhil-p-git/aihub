@@ -404,6 +404,9 @@ class TestLaunchToken:
             ("GET", "/api/chats"),
             ("PUT", "/api/settings"),
             ("DELETE", "/api/chats"),
+            ("PATCH", "/api/settings"),
+            ("HEAD", "/api/health"),
+            ("OPTIONS", "/api/chats"),
             ("GET", "/api/nope"),
             ("GET", "/api/"),
         ]:
@@ -441,6 +444,12 @@ class TestLaunchToken:
         self, guarded: TestClient, path: str
     ) -> None:
         assert guarded.get(path).status_code == 200
+
+    @pytest.mark.parametrize("path", ["/api", "/apidocs", "/static/api/health"])
+    def test_a_path_that_only_looks_like_the_api_is_not_guarded(
+        self, guarded: TestClient, path: str
+    ) -> None:
+        assert guarded.get(path).status_code == 404
 
     def test_the_host_check_still_comes_first(self, guarded: TestClient) -> None:
         foreign = {"host": "evil.example:8787"}
