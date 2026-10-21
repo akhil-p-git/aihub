@@ -477,6 +477,20 @@ class TestWhenItGoesWrong:
                 "message": "The image engine stopped unexpectedly. Retry starts it again.",
             }
 
+    @pytest.mark.parametrize("status", [502, 504])
+    async def test_a_launcher_that_cannot_get_an_answer_from_the_engine_means_a_crash(
+        self, tmp_path: Path, socket_dir: Path, status: int
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append(
+            [
+                generating(1, 4),
+                (status, {"code": "engine_unreachable", "last_error": []}),
+            ]
+        )
+        async with rig(tmp_path, socket_dir, engine=engine) as r:
+            assert (await self.run_to_the_end(r))["code"] == "engine_crashed"
+
     async def test_a_broken_connection_while_polling_is_a_crash_too(
         self, tmp_path: Path, socket_dir: Path
     ) -> None:

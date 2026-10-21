@@ -619,7 +619,8 @@ class TestEngineClient:
         [
             (429, "engine_busy"),
             (500, "engine_protocol"),
-            (502, "engine_protocol"),
+            (502, "engine_io"),
+            (504, "engine_io"),
             (302, "engine_protocol"),
         ],
     )

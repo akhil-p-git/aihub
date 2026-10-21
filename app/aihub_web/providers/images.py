@@ -91,6 +91,13 @@ def _fail(status: int, data: object, *, job: bool) -> EngineError:
         return EngineError("engine_gone", lines=_log_lines(body.get("last_error")))
     if status == 404 and body.get("code") == "unknown_model":
         return EngineError("unknown_model")
+    if status in (502, 504):
+        # The launcher could not talk to the engine, or it did not answer: the engine is broken.
+        return EngineError(
+            "engine_io",
+            "The image engine did not answer properly.",
+            _log_lines(body.get("last_error")),
+        )
     text = body.get("error")
     if status == 400:
         return EngineError("bad_request", text[:300] if isinstance(text, str) else "")
