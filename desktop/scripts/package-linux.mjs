@@ -17,8 +17,9 @@
 //
 // Everything is built in desktop/dist/.linux-unpacked-<pid> and checked there. Only then does it replace
 // desktop/dist/linux-unpacked, so a failed or interrupted run never leaves a half-made app and the earlier one stays
-// as it was. If two runs overlap, each builds a whole output and the one that moves its folder into place last gets an
-// error from the rename instead of replacing the first: the output is complete either way.
+// as it was. If two runs overlap, each builds a whole output; usually the later swap simply replaces the earlier
+// output, and a run that loses the race gets an error from the rename and removes its old folder. A whole output is
+// what ends up in place either way.
 //
 // It needs npm ci in desktop/ (which brings Electron's binary) and npm run build:backend. The commit string in
 // package.json is the first 12 characters of HEAD, with -dirty added when git shows changes under desktop/ or app/,
@@ -124,6 +125,8 @@ export function checkElectron(desktop = desktopDir) {
     throw new PackageError(`devDependencies.electron must be an exact version, not ${pinned}`);
   }
   const fix = "run npm ci in desktop/";
+  // npm ci installs the package but not the binary: node_modules/electron/install.js fetches it (npm start runs it).
+  const install = "run node node_modules/electron/install.js in desktop/";
   const root = join(desktop, "node_modules", "electron");
   const installed = readJson(join(root, "package.json"))?.version;
   if (installed === undefined) throw new PackageError(`node_modules/electron is not installed: ${fix}`);
@@ -133,20 +136,22 @@ export function checkElectron(desktop = desktopDir) {
   const dist = join(root, "dist");
   const binary = join(dist, "electron");
   if (!existsSync(binary)) {
-    const alt = "or node node_modules/electron/install.js there if install scripts are off";
-    throw new PackageError(`node_modules/electron/dist/electron is missing: ${fix}, ${alt}`);
+    throw new PackageError(`node_modules/electron/dist/electron is missing: ${install} (npm ci does not fetch it)`);
   }
   let shipped;
   try {
-    shipped = readFileSync(join(dist, "version"), "utf8").trim();
+    // Electron's own install.js ignores a leading v in this file, so this does too.
+    shipped = readFileSync(join(dist, "version"), "utf8").trim().replace(/^v/, "");
   } catch {
-    throw new PackageError(`node_modules/electron/dist/version is missing: ${fix}`);
+    throw new PackageError(`node_modules/electron/dist/version is missing: ${install}`);
   }
   if (shipped !== pinned) {
-    throw new PackageError(`node_modules/electron/dist/version says ${shipped}, not ${pinned}: ${fix}`);
+    throw new PackageError(`node_modules/electron/dist/version says ${shipped}, not ${pinned}: ${install}`);
   }
-  if (!isExecutable(binary)) throw new PackageError("node_modules/electron/dist/electron is not executable");
-  if (!isElf(binary)) throw new PackageError("node_modules/electron/dist/electron is not an ELF binary");
+  // install.js counts a distribution with the right version file as installed, so a damaged binary has to go first.
+  const repair = `remove node_modules/electron/dist, then ${install}`;
+  if (!isExecutable(binary)) throw new PackageError(`node_modules/electron/dist/electron is not executable: ${repair}`);
+  if (!isElf(binary)) throw new PackageError(`node_modules/electron/dist/electron is not an ELF binary: ${repair}`);
   return { pkg, version: pinned, dist };
 }
 
@@ -163,6 +168,38 @@ export function checkPayload(payload = join(desktopDir, "payload", TARGET)) {
   if (!isElf(join(payload, interpreter))) throw new PackageError(`${name}/${interpreter} is not an ELF binary`);
 }
 
+/** Throws when the payload's aihub_web differs from app/aihub_web: the backend would not be the code at HEAD. */
+export function checkPayloadIsCurrent(
+  source = join(repoRoot, "app", "aihub_web"),
+  payload = join(desktopDir, "payload", TARGET),
+) {
+  if (!existsSync(source)) return;
+  const copy = join(payload, "lib", "python3.12", "site-packages", "aihub_web");
+  const files = (root) => {
+    const out = new Map();
+    const visit = (rel) => {
+      for (const entry of readdirSync(join(root, rel), { withFileTypes: true })) {
+        const path = rel ? `${rel}/${entry.name}` : entry.name;
+        if (entry.name === "__pycache__" || path.endsWith(".pyc")) continue;
+        if (entry.isDirectory()) visit(path);
+        else out.set(path, readFileSync(join(root, path)));
+      }
+    };
+    visit("");
+    return out;
+  };
+  const want = files(source);
+  const have = existsSync(copy) ? files(copy) : new Map();
+  const differ = [...want.keys(), ...have.keys()].filter(
+    (path) => !want.get(path)?.equals(have.get(path) ?? Buffer.alloc(0)) || want.has(path) !== have.has(path),
+  );
+  if (differ.length) {
+    throw new PackageError(
+      `payload/${TARGET} holds a different aihub_web than app/ (${differ[0]}): run npm run build:backend in desktop/`,
+    );
+  }
+}
+
 /** The package.json of the packaged app: the named fields of `pkg`, then the commit string. */
 export function appPackageJson(pkg, commit) {
   const app = {};
@@ -175,10 +212,12 @@ export function appPackageJson(pkg, commit) {
 
 function runGit(repo) {
   return (args) =>
-    execFileSync("git", ["-C", repo, ...args], {
+    // No GIT_* variables (GIT_DIR would point git at another repository), no optional index write, no fsmonitor.
+    execFileSync("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-C", repo, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 10_000,
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_"))),
     });
 }
 
@@ -191,7 +230,7 @@ function realOrResolved(path) {
 }
 
 /**
- * HEAD's first 12 characters, with -dirty when git lists a change under desktop/ or app/ (files that git ignores,
+ * HEAD's first 12 characters, with -dirty when git lists a change under desktop/ or app/, or in uv.lock or pyproject.toml (the payload is built from them) (files that git ignores,
  * such as desktop/dist, do not count), or unknown when there is no git, the directory is not a repository of its
  * own (a parent's HEAD would be the wrong answer), or git answers with something that is not a hash.
  */
@@ -200,7 +239,17 @@ export function commitString(repo = repoRoot, run = runGit(repo)) {
     if (realOrResolved(run(["rev-parse", "--show-toplevel"]).trim()) !== realOrResolved(repo)) return "unknown";
     const head = run(["rev-parse", "HEAD"]).trim();
     if (!/^[0-9a-f]{40,64}$/.test(head)) return "unknown";
-    const dirty = run(["status", "--porcelain", "--", "desktop", "app"]).trim() !== "";
+    const dirty =
+      run([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        "desktop",
+        "app",
+        "uv.lock",
+        "pyproject.toml",
+      ]).trim() !== "";
     return head.slice(0, 12) + (dirty ? "-dirty" : "");
   } catch {
     return "unknown";
@@ -213,6 +262,8 @@ export function commitString(repo = repoRoot, run = runGit(repo)) {
 const byName = (a, b) => (a.name < b.name ? -1 : 1);
 // The mode of a copy: that of the original, without the write bit for group and others.
 const copyMode = (mode) => mode & 0o7777 & ~0o022;
+// A directory keeps the owner's write access, or the script could not remove its own output (rmSync does not chmod).
+const dirMode = (mode) => copyMode(mode) | 0o700;
 
 function kindOf(stat) {
   if (stat.isFIFO()) return "FIFO";
@@ -228,7 +279,7 @@ function kindOf(stat) {
  * others, whatever the umask. Anything that is not a file, a directory or a symlink throws.
  */
 export function copyTree(src, dest) {
-  const mode = copyMode(lstatSync(src).mode);
+  const mode = dirMode(lstatSync(src).mode);
   if (existsSync(dest)) {
     if (readdirSync(dest).length > 0) throw new PackageError(`${dest} is not empty`);
   } else {
@@ -250,7 +301,7 @@ function copyEntries(src, dest, rel) {
     } else if (stat.isDirectory()) {
       mkdirSync(to, { mode: 0o700 });
       copyEntries(src, dest, path);
-      chmodSync(to, copyMode(stat.mode));
+      chmodSync(to, dirMode(stat.mode));
     } else if (stat.isFile()) {
       copyFileSync(from, to, constants.COPYFILE_EXCL);
       chmodSync(to, copyMode(stat.mode));
@@ -278,7 +329,7 @@ const inside = (root, path) => path === root || path.startsWith(root + sep);
  */
 export function auditOutput(root) {
   const base = resolve(root);
-  const realBase = realpathSync(base);
+  const realBase = realpathSync.native(base);
   const problems = [];
   if (lstatSync(base).mode & 0o022) problems.push("writable by group or others: the output folder itself");
   for (const { rel, stat } of walk(base)) {
@@ -292,7 +343,7 @@ export function auditOutput(root) {
       } else {
         let real;
         try {
-          real = realpathSync(full);
+          real = realpathSync.native(full);
         } catch {
           problems.push(`dangling symlink: ${rel} -> ${link}`);
         }
@@ -340,12 +391,16 @@ export function exitOnInterrupt() {
 // already started.
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-/** Whether the process that made a leftover is gone. Its pid ends the name: .linux-unpacked-<pid>. */
-function isAbandoned(name) {
-  const pid = /-(\d+)$/.exec(name)?.[1];
-  if (!pid) return true;
+/** The pid in the name of a leftover of this script, .linux-unpacked-<pid> or .old-linux-unpacked-<pid>, else null. */
+function leftoverPid(entry, name) {
+  const match = /^\.(?:old-)?(.+)-(\d+)$/.exec(entry);
+  return match !== null && match[1] === name ? Number(match[2]) : null;
+}
+
+/** Whether the process with this pid is gone. */
+function isGone(pid) {
   try {
-    process.kill(Number(pid), 0);
+    process.kill(pid, 0);
     return false;
   } catch (err) {
     return err.code !== "EPERM"; // EPERM: the process exists but belongs to someone else
@@ -371,9 +426,16 @@ export async function replaceOutput(finalDir, build) {
   const parent = dirname(finalDir);
   const name = basename(finalDir);
   mkdirSync(parent, { recursive: true });
+  // A run killed between its two renames left the earlier output as .old-<name>-<pid>: put it back first.
   for (const entry of readdirSync(parent)) {
-    const ours = entry.startsWith(`.${name}-`) || entry.startsWith(`.old-${name}-`);
-    if (ours && isAbandoned(entry)) rmSync(join(parent, entry), { recursive: true, force: true });
+    const pid = leftoverPid(entry, name);
+    if (pid !== null && entry.startsWith(".old-") && isGone(pid) && !present(finalDir))
+      renameSync(join(parent, entry), finalDir);
+  }
+  for (const entry of readdirSync(parent)) {
+    // Only an exact .linux-unpacked-<pid> is ours; any other name in dist/ belongs to someone else.
+    const pid = leftoverPid(entry, name);
+    if (pid !== null && isGone(pid)) rmSync(join(parent, entry), { recursive: true, force: true });
   }
 
   const work = join(parent, `.${name}-${process.pid}`);
@@ -392,12 +454,26 @@ export async function replaceOutput(finalDir, build) {
       renameSync(work, finalDir);
     } catch (err) {
       if (replaced && !present(finalDir)) renameSync(old, finalDir);
+      else rmSync(old, { recursive: true, force: true }); // another run put its output there; ours is not needed
       throw err;
     }
     rmSync(old, { recursive: true, force: true });
   } finally {
     rmSync(work, { recursive: true, force: true });
     forget();
+  }
+}
+
+/** Throws unless the finished output has its binary, the shell's main file and the payload's required files. */
+export function checkComplete(root, pkg) {
+  if (!isElf(join(root, BINARY))) throw new PackageError(`output check failed: ${BINARY} is not an ELF binary`);
+  if (!existsSync(join(root, "resources", "app", pkg.main))) {
+    throw new PackageError(`output check failed: resources/app/${pkg.main} is missing (is desktop/src empty?)`);
+  }
+  for (const rel of requiredFiles()) {
+    if (!existsSync(join(root, "resources", "backend", rel))) {
+      throw new PackageError(`output check failed: resources/backend/${rel} is missing`);
+    }
   }
 }
 
@@ -423,6 +499,7 @@ async function assemble(work, { desktop, dist, pkg, commit }) {
   copyTree(join(desktop, "payload", TARGET), join(work, "resources", "backend"));
   await tick();
   auditOutput(work);
+  checkComplete(work, pkg);
 }
 
 const mib = (bytes) => `${(bytes / 1048576).toFixed(1)} MiB`;
@@ -431,6 +508,7 @@ const count = (n, noun) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 async function run() {
   const { pkg, version, dist } = checkElectron();
   checkPayload();
+  checkPayloadIsCurrent();
   const commit = commitString();
   const finalDir = join(desktopDir, "dist", OUTPUT);
   await replaceOutput(finalDir, (work) => assemble(work, { desktop: desktopDir, dist, pkg, commit }));

@@ -7,11 +7,13 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  renameSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -176,7 +178,9 @@ function git(cwd, ...args) {
 /** Makes the parent of the fake desktop/ a git repository with one commit. Returns the full hash. */
 function gitInit(root) {
   put(root, ".gitignore", "/desktop/dist/\n/desktop/payload/\n/desktop/node_modules/\n");
-  put(root, "app/aihub_web/__main__.py");
+  cpSync(join(root, "desktop/payload/linux-x64/lib/python3.12/site-packages/aihub_web"), join(root, "app/aihub_web"), {
+    recursive: true,
+  });
   put(root, "README.md");
   git(root, "init", "-q");
   git(root, "add", ".");
@@ -202,7 +206,7 @@ describe("the command line and the host", () => {
   it("runs on Linux x86_64 and refuses everything else with status 2", () => {
     assert.doesNotThrow(() => assertHost("linux", "x64"));
     for (const [platform, arch] of [
-      ["darwin", "arm64"],
+      ["freebsd", "x64"],
       ["linux", "arm64"],
       ["win32", "x64"],
     ]) {
@@ -249,7 +253,7 @@ describe("the commit string", () => {
       const key = args.join(" ");
       if (key === "rev-parse --show-toplevel") return `${top}\n`;
       if (key === "rev-parse HEAD") return `${head}\n`;
-      if (key === "status --porcelain -- desktop app") return status;
+      if (key === "status --porcelain --untracked-files=all -- desktop app uv.lock pyproject.toml") return status;
       throw new Error(`unexpected git call: ${key}`);
     };
 
@@ -339,19 +343,30 @@ describe("the Electron distribution check", () => {
     failsWith(/must pin electron in devDependencies/);
   });
 
-  it("refuses a dist/version that disagrees with the package", () => {
+  it("refuses a dist/version that is wrong or missing, and says how to fetch the binary", () => {
     writeFileSync(join(dist(), "version"), "44.5.1");
-    failsWith(/dist\/version says 44\.5\.1, not 44\.6\.0: run npm ci/);
+    failsWith(/dist\/version says 44\.5\.1, not 44\.6\.0: run node node_modules\/electron\/install\.js in desktop\//);
+    rmSync(join(dist(), "version"));
+    failsWith(/dist\/version is missing: run node node_modules\/electron\/install\.js in desktop\//);
   });
 
-  it("refuses a missing, non-executable or non-ELF binary", () => {
+  it("accepts a dist/version with a leading v, as Electron's own installer does", () => {
+    writeFileSync(join(dist(), "version"), `v${PINNED}\n`);
+    assert.equal(checkElectron(desktop).version, PINNED);
+  });
+
+  it("refuses a missing, non-executable or non-ELF binary, and says what repairs each", () => {
+    const repair =
+      /: remove node_modules\/electron\/dist, then run node node_modules\/electron\/install\.js in desktop\//;
     chmodSync(join(dist(), "electron"), 0o644);
-    failsWith(/dist\/electron is not executable/);
+    failsWith(new RegExp(`dist/electron is not executable${repair.source}`));
     chmodSync(join(dist(), "electron"), 0o755);
     writeFileSync(join(dist(), "electron"), "#!/bin/sh\n");
-    failsWith(/dist\/electron is not an ELF binary/);
+    failsWith(new RegExp(`dist/electron is not an ELF binary${repair.source}`));
     rmSync(join(dist(), "electron"));
-    failsWith(/dist\/electron is missing: run npm ci in desktop\//);
+    failsWith(
+      /dist\/electron is missing: run node node_modules\/electron\/install\.js in desktop\/ \(npm ci does not fetch it\)/,
+    );
   });
 });
 
@@ -450,7 +465,7 @@ describe("copying a tree", () => {
     chmodSync(join(src, "ro"), 0o555);
     try {
       copyTree(src, join(scratch, "dst"));
-      assert.equal(octal(lstatSync(join(scratch, "dst", "ro")).mode), "555");
+      assert.equal(octal(lstatSync(join(scratch, "dst", "ro")).mode), "755", "the owner keeps write access");
       assert.equal(readFileSync(join(scratch, "dst", "ro", "file"), "utf8"), "f");
     } finally {
       chmodSync(join(src, "ro"), 0o755);
@@ -580,9 +595,12 @@ describe("replacing the output", () => {
     mkdirSync(join(scratch, "dist", `.${OUTPUT}-${process.ppid}`)); // the test runner is alive
     mkdirSync(join(scratch, "dist", `.${OUTPUT}-${process.pid}`)); // ours from an earlier run, the pid reused
     put(join(scratch, "dist", `.${OUTPUT}-${process.pid}`), "stale");
+    // Names that only look like leftovers belong to someone else, whatever follows the prefix.
+    const theirs = [`.${OUTPUT}-notes`, `.old-${OUTPUT}-`, `.${OUTPUT}-12abc`, `.${OUTPUT}`, `.keep-${OUTPUT}-${gone}`];
+    for (const name of theirs) put(join(scratch, "dist", name), "mine");
     mkdirSync(join(scratch, "dist", "unrelated"));
     await replaceOutput(final(), lay("x"));
-    assert.deepEqual(leftovers().sort(), [`.${OUTPUT}-${process.ppid}`, "unrelated"].sort());
+    assert.deepEqual(leftovers().sort(), [`.${OUTPUT}-${process.ppid}`, ...theirs, "unrelated"].sort());
   });
 });
 
@@ -803,7 +821,7 @@ describe("the script on a fake tree", () => {
     fails(
       runIn(desktop),
       1,
-      /^package-linux: node_modules\/electron\/dist\/electron is missing: run npm ci in desktop\//,
+      /^package-linux: node_modules\/electron\/dist\/electron is missing: run node node_modules\/electron\/install\.js in desktop\//,
     );
     assert.equal(existsSync(join(desktop, "dist")), false);
 
@@ -861,6 +879,62 @@ describe("the script on a fake tree", () => {
       restore();
     }
     assert.equal(runIn(desktop).status, 0, "and it works again once the cause is gone");
+  });
+
+  it("refuses a payload whose aihub_web is not the code in app/", () => {
+    const root = dirname(desktop);
+    gitInit(root);
+    assert.equal(runIn(desktop).status, 0);
+    put(root, "app/aihub_web/__main__.py", "changed\n");
+    fails(
+      runIn(desktop),
+      1,
+      /^package-linux: payload\/linux-x64 holds a different aihub_web than app\/ .*build:backend/,
+    );
+  });
+
+  it("calls a change to uv.lock dirty, and does not package a git-ignored file unnoticed", () => {
+    const root = dirname(desktop);
+    const full = gitInit(root);
+    put(root, "uv.lock", "a\n");
+    git(root, "add", ".");
+    git(root, "commit", "-q", "-m", "lock");
+    put(root, "uv.lock", "b\n");
+    assert.match(commitString(root), /-dirty$/);
+    assert.ok(full);
+  });
+
+  it("is not fooled by a link that leaves through another link", () => {
+    symlinkSync("..", join(dist(), "resources", "up"));
+    symlinkSync("up/../..", join(dist(), "resources", "chain"));
+    fails(runIn(desktop), 1, /symlink leaves the output: resources\/chain/);
+  });
+
+  it("refuses an empty src and puts nothing in place", () => {
+    assert.equal(runIn(desktop).status, 0);
+    const before = snapshot(outputOf(desktop));
+    rmSync(join(desktop, "src"), { recursive: true });
+    mkdirSync(join(desktop, "src"));
+    fails(runIn(desktop), 1, /resources\/app\/src\/main\.js is missing/);
+    assert.deepEqual(snapshot(outputOf(desktop)), before);
+  });
+
+  it("copes with a read-only directory in an input on every run", () => {
+    chmodSync(join(desktop, "src", "deep"), 0o555);
+    for (let i = 0; i < 3; i++) assert.equal(runIn(desktop).status, 0);
+    chmodSync(join(desktop, "src", "deep"), 0o755);
+    assert.deepEqual(readdirSync(join(desktop, "dist")), [OUTPUT]);
+  });
+
+  it("puts back the earlier output that a run killed between its renames left", () => {
+    assert.equal(runIn(desktop).status, 0);
+    const before = snapshot(outputOf(desktop));
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+    renameSync(outputOf(desktop), join(desktop, "dist", `.old-${OUTPUT}-${gone}`));
+    chmodSync(join(desktop, "src", "main.js"), 0o000); // the run fails while copying, after the restore
+    fails(runIn(desktop), 1, /main\.js/);
+    chmodSync(join(desktop, "src", "main.js"), 0o644);
+    assert.deepEqual(snapshot(outputOf(desktop)), before);
   });
 
   it("does not use the network, a shell or anything but git as a child process", () => {
