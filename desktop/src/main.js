@@ -8,10 +8,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, clipboard, dialog, Menu, nativeTheme, session, shell } from "electron";
 import { Backend } from "./backend.js";
-import { externalTarget, isBackendUrl, menuTemplate } from "./policy.js";
+import { allowsRequest, externalTarget, isBackendUrl, menuTemplate } from "./policy.js";
 
 const SRC = fileURLToPath(new URL(".", import.meta.url));
 const COOKIE = "aihub_t";
+// The requests the guard looks at, which are the ones that reach the network. The loading page (file:), devtools:
+// and data: URLs are not among them.
+const GUARDED_URLS = ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"];
 // The only thing the page may ask for: the copy buttons of code blocks write to the clipboard.
 const ALLOWED_PERMISSIONS = new Set(["clipboard-sanitized-write"]);
 // The colour of the page behind its first paint (theme-color in the app's index.html).
@@ -22,7 +25,9 @@ app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-des
 
 let backend = null;
 let win = null;
-let origin = null; // the backend origin the window shows
+// The origin of the backend the window may talk to. It is null before the first backend is up and from the moment
+// one has ended, and while it is null the window can reach nothing.
+let origin = null;
 let quitting = false;
 let backendStopped = false;
 let offering = false;
@@ -43,6 +48,11 @@ async function main() {
   ses.setSpellCheckerDictionaryDownloadURL("http://127.0.0.1:9/");
   ses.setPermissionRequestHandler((_contents, permission, callback) => callback(ALLOWED_PERMISSIONS.has(permission)));
   ses.setPermissionCheckHandler((_contents, permission) => ALLOWED_PERMISSIONS.has(permission));
+  // Only the backend that is up now may be asked for anything, and each hop of a redirect is a request like any
+  // other. A page that outlives its backend therefore cannot hand its cookie to whatever binds the port next.
+  ses.webRequest.onBeforeRequest({ urls: GUARDED_URLS }, (details, callback) => {
+    callback({ cancel: !allowsRequest(details.url, origin) });
+  });
 
   const { version, aihubCommit } = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8"));
   app.setAboutPanelOptions({
@@ -58,8 +68,15 @@ async function main() {
     resourcesPath: process.resourcesPath,
   });
   backend.on("exit", ({ code, signal }) => {
+    // The port is free from now on, and whatever binds it next must get nothing from this window. Nulling the
+    // origin stops every request at once; the cookie and the page follow before anybody is asked anything.
+    const gone = origin;
+    origin = null;
+    if (quitting) return;
     const how = signal ? `signal ${signal}` : `exit code ${code}`;
-    if (!quitting) offerRestart(`The aihub backend stopped (${how}).`, "").catch(fatal);
+    forgetBackend(gone)
+      .then(() => offerRestart(`The aihub backend stopped (${how}).`, ""))
+      .catch(fatal);
   });
 
   win = createWindow();
@@ -133,25 +150,49 @@ function contextMenu({ linkURL, isEditable, selectionText, editFlags }) {
   return Menu.buildFromTemplate(items);
 }
 
+function showLoadingPage() {
+  if (win && !win.isDestroyed()) win.loadFile(join(SRC, "loading.html")).catch(() => {});
+}
+
+/** Takes what the window held for the backend at `gone` (null if it held nothing): the page, and the cookie. */
+async function forgetBackend(gone) {
+  showLoadingPage();
+  if (gone !== null) await session.defaultSession.cookies.remove(gone, COOKIE);
+}
+
 /**
- * Shows the loading page, starts the backend, gives the window its cookie and loads the backend's page.
- * A restart goes through here as well, and loads the origin of the new backend: the port may have changed,
- * and reloading the old URL could reach whatever has taken that port since.
+ * Shows the loading page, starts the backend, gives the window the cookie for the token that backend was
+ * started with, and loads its page. A restart goes through here as well, and loads the origin of the new
+ * backend: the port may have changed, and reloading the old URL could reach whatever has taken that port since.
+ *
+ * The origin is set last, once the cookie is in place, so a start that fails leaves it null.
  */
 async function showBackend() {
-  win.loadFile(join(SRC, "loading.html")).catch(() => {});
+  showLoadingPage();
   const started = await backend.start();
   if (quitting) return;
-  origin = started.origin;
+  const stillUp = () => backend.origin === started.origin;
   await session.defaultSession.cookies.set({
-    url: origin,
+    url: started.origin,
     name: COOKIE,
     value: started.token,
     httpOnly: true,
     sameSite: "strict",
     // no expiry: the cookie ends with the session
   });
-  await win.loadURL(origin);
+  if (!stillUp()) {
+    // It ended while the cookie was being set, before the exit handler had an origin to forget.
+    await session.defaultSession.cookies.remove(started.origin, COOKIE);
+    throw new Error("The aihub backend stopped as soon as it was up.");
+  }
+  origin = started.origin;
+  try {
+    await win.loadURL(origin);
+  } catch (error) {
+    // The exit handler's loading page interrupts a page that is still loading when the backend ends.
+    if (!stillUp()) throw new Error("The aihub backend stopped while its page was loading.");
+    throw error;
+  }
 }
 
 /**
