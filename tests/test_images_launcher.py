@@ -1250,6 +1250,9 @@ class TestConcurrency:
         # engine's port, one for the probe but not for the two ends of the engine's output pipe. `noted`
         # begins the launcher's note, which says which of the two steps ran out.
         rig = launch(env={"AIHUB_IMAGES_BACKOFF_S": "1"})
+        # Until the launcher answers, the process is the shell that mounts sysfs, with fewer descriptors than
+        # Python needs to start. Counting then would set a limit that the launcher cannot live with.
+        assert rig.status()["state"] == "idle"
         pid = rig.host_pid()
         held = open_descriptors(pid)
         soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
