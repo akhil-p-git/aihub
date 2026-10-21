@@ -154,6 +154,25 @@ def cpu_ticks(pid: int) -> int:
     return int(fields[11]) + int(fields[12])
 
 
+def open_request(rig, model, prompt="a red fox") -> socket.socket:
+    """Connect and send a whole img_gen request, and leave the reply unread."""
+    body = json.dumps({"prompt": prompt, "width": 64, "height": 64}).encode()
+    conn = socket.socket(socket.AF_UNIX)
+    conn.settimeout(15)
+    conn.connect(rig.sock_path)
+    headers = ("Content-Type: application/json",)
+    conn.sendall(request("POST", f"/e/{model}/sdcpp/v1/img_gen", body, headers))
+    return conn
+
+
+def read_reply(conn: socket.socket) -> Reply:
+    raw = b""
+    while chunk := conn.recv(1 << 16):
+        raw += chunk
+    conn.close()
+    return parse_reply(raw)
+
+
 class Rig:
     """One launcher in its namespaces, the socket it was activated with, and the stand-in's records."""
 
@@ -966,6 +985,90 @@ class TestKill:
         # not held back by a backoff
         assert rig.submit("zimage").status == 202
         assert len(rig.starts()) == 2
+
+
+class TestWantedRequests:
+    """An img_gen is dropped when a kill or a hang-up overtakes it: nobody would poll its job, and the GPU would
+    be busy with it after aihub has let go of the GPU lock."""
+
+    def test_a_client_that_hangs_up_before_the_engine_starts_costs_no_start(
+        self, launch
+    ):
+        rig = launch()
+        open_request(rig, "slowload").close()
+        wait_for(lambda: "hung up" in rig.log(), "the launcher to notice", rig=rig)
+        assert rig.starts() == [] and rig.engine_requests() == []
+        assert rig.status()["state"] == "idle"
+
+    def test_a_client_that_hangs_up_while_the_engine_loads_gets_no_job(self, launch):
+        rig = launch()
+        conn = open_request(rig, "slowload")
+        wait_for(rig.starts, "the engine to begin loading", rig=rig)
+        conn.close()
+        wait_for(lambda: "hung up" in rig.log(), "the launcher to notice", rig=rig)
+        # the engine stays up, with nothing asked of it
+        assert rig.status() == {
+            "engine": "slowload",
+            "state": "ready",
+            "last_error": [],
+        }
+        assert rig.engine_requests() == []
+
+    def test_a_client_that_only_shuts_down_its_sending_side_is_still_answered(
+        self, launch
+    ):
+        rig = launch()
+        conn = open_request(rig, "zimage")
+        conn.shutdown(socket.SHUT_WR)
+        assert read_reply(conn).status == 202
+        assert "hung up" not in rig.log()
+
+    def test_a_kill_during_a_model_switch_stops_the_switch(self, launch):
+        rig = launch(env={"AIHUB_IMAGES_GRACE_S": "3"})
+        assert rig.submit("stubborn").status == 202
+        conn = open_request(rig, "zimage")
+        # the launcher has sent SIGTERM to the engine that ignores it, and waits out the grace period
+        wait_for(
+            lambda: rig.records("signals.log"), "SIGTERM to the old engine", rig=rig
+        )
+        assert rig.kill().json() == {"killed": True}
+        reply = read_reply(conn)
+        assert reply.status == 503 and reply.json() == {"code": "killed"}
+        assert len(rig.starts()) == 1 and rig.engines() == []
+        assert rig.status()["state"] == "idle"
+
+    def test_a_kill_that_overtakes_a_request_still_arriving_drops_it(self, launch):
+        rig = launch()
+        body = json.dumps({"prompt": "a red fox", "width": 64, "height": 64}).encode()
+        full = request(
+            "POST",
+            "/e/zimage/sdcpp/v1/img_gen",
+            body,
+            ("Content-Type: application/json",),
+        )
+        cut = len(full) - len(body) + 5  # the head and 5 bytes of the body
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(15)
+            conn.connect(rig.sock_path)
+            conn.sendall(full[:cut])
+            assert rig.kill().json() == {"killed": False}
+            conn.sendall(full[cut:])
+            reply = parse_reply(conn.recv(1 << 16))
+        assert reply.status == 503 and reply.json() == {"code": "killed"}
+        assert rig.starts() == []
+
+    def test_a_kill_reaches_a_request_that_waits_for_another_start(self, launch):
+        rig = launch()
+        first = open_request(rig, "slowload")
+        wait_for(rig.starts, "the engine to begin loading", rig=rig)
+        second = open_request(rig, "zimage")  # waits for the first start to be over
+        assert rig.kill().json() == {"killed": True}
+        assert read_reply(first).json()["code"] == "engine_failed_to_start"
+        reply = read_reply(second)
+        assert reply.status == 503 and reply.json() == {"code": "killed"}
+        assert len(rig.starts()) == 1
+        # a request made after the kill is not touched by it
+        assert rig.submit("zimage").status == 202
 
 
 class TestConcurrency:

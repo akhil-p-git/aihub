@@ -8,7 +8,8 @@ at most one engine alive, and exits after 5 idle minutes. The next connection st
 Each connection carries one request and one reply, both with "Connection: close". The routes are:
 
     GET  /launcher/status                       200 {engine, state, last_error}; never starts an engine
-    POST /launcher/kill                         200 {killed}; SIGKILL to the engine, answered once it is gone
+    POST /launcher/kill                         200 {killed}; SIGKILL to the engine, answered once it is gone.
+                                                An img_gen that was accepted before it is answered 503 killed
     POST /e/<model>/sdcpp/v1/img_gen            starts the engine for <model>, then forwards
     GET  /e/<model>/sdcpp/v1/jobs/<id>          forwarded when the engine for <model> is ready, else 410
     POST /e/<model>/sdcpp/v1/jobs/<id>/cancel   the same
@@ -18,9 +19,10 @@ engine a new one, made of the method, a path it builds from the route and, for i
 The engine's reply is checked as hard: one Content-Length, no chunking, a bounded head and body.
 
 Errors have a JSON body {code, ...}: 400 bad_request, 404 not_found or unknown_model, 408 request_timeout,
-411 length_required, 413 body_too_large, 415 unsupported_media_type, 431 head_too_large, 503 busy or
+411 length_required, 413 body_too_large, 415 unsupported_media_type, 431 head_too_large, 503 busy, killed or
 engine_failed_to_start (with last_error), 410 engine_gone (with last_error), 502 bad_engine_reply or
-engine_unreachable, 504 engine_timeout.
+engine_unreachable, 504 engine_timeout. An img_gen whose client has hung up before the engine was asked is
+dropped without an answer: no engine is started for it and no job is queued.
 
 The engine's [E] and [W] lines are kept (the last 20 are last_error) and the first 200 per start go to this
 process's stderr, which systemd sends to the journal. Everything else it prints is dropped. At the pin
@@ -50,6 +52,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import socket
 import sys
@@ -271,7 +274,7 @@ class TooLarge(Malformed):
 
 
 class Hangup(Exception):
-    """The peer closed before sending anything."""
+    """The client is gone, and there is nobody to answer."""
 
 
 class BadReply(Exception):
@@ -393,6 +396,14 @@ async def read_reply(reader: asyncio.StreamReader) -> tuple[int, str | None, byt
     return int(status[1]), content_type, body
 
 
+def hung_up(conn: socket.socket) -> bool:
+    """Whether the client has closed its socket. A client that only shut down its sending side after the
+    request (shutdown(SHUT_WR)) is still waiting for the answer, and does not count."""
+    poller = select.poll()
+    poller.register(conn, select.POLLIN)
+    return any(events & select.POLLHUP for _, events in poller.poll(0))
+
+
 def encode(
     status: int, payload: dict | bytes, content_type: str | None = "application/json"
 ) -> bytes:
@@ -500,6 +511,8 @@ class Host:
         self.stopping = asyncio.Event()
         # False while accept() is paused for lack of descriptors.
         self.accepting = True
+        # Counts POST /launcher/kill. An img_gen that was accepted before a kill is dropped.
+        self.kills = 0
 
     def settle(self, state: str) -> None:
         self.state = state
@@ -573,9 +586,11 @@ class Host:
             engine.done.set()
 
     # Starting and stopping
-    async def ensure(self, model: str) -> bytes | None:
-        """Make the engine for `model` ready. None when it is, otherwise the 503 to answer with."""
+    async def ensure(self, model: str, wanted) -> bytes | None:
+        """Make the engine for `model` ready. None when it is, otherwise the 503 to answer with. `wanted` raises
+        when the request is no longer wanted, and is asked after each wait."""
         async with self.lock:
+            wanted()
             engine = self.engine
             alive = engine is not None and not engine.done.is_set()
             if self.state == "ready" and alive and engine.model == model:
@@ -583,6 +598,7 @@ class Host:
             if alive:
                 # A request for another model. Never two engines at once.
                 await self.stop(engine)
+                wanted()
             since = (
                 None if self.failed_at is None else time.monotonic() - self.failed_at
             )
@@ -684,6 +700,7 @@ class Host:
             self.settle("idle")
 
     async def kill(self) -> bool:
+        self.kills += 1
         # A start that is creating the process has an engine to kill in a moment.
         await self.spawned.wait()
         engine = self.engine
@@ -763,14 +780,27 @@ class Host:
                 return (name, *match.groups())
         raise Reject(404, "not_found")
 
-    async def img_gen(self, reader, req: Request, model: str) -> bytes:
+    async def img_gen(
+        self, reader, conn: socket.socket, accepted: int, req: Request, model: str
+    ) -> bytes:
         if req.length is None:
             raise Reject(411, "length_required")
         if req.content_type is None or not JSON_TYPE.fullmatch(req.content_type):
             raise Reject(415, "unsupported_media_type")
+
+        def wanted() -> None:
+            """A kill since this connection was accepted ends the request, and so does a client that has
+            hung up: nobody would poll the job, and the GPU would work on it after aihub let go of it."""
+            if self.kills != accepted:
+                raise Reject(503, "killed")
+            if hung_up(conn):
+                log("a client hung up before its request was passed on; dropped")
+                raise Hangup()
+
         body = await self.from_client(read_body(reader, req))
-        if failure := await self.ensure(model):
+        if failure := await self.ensure(model, wanted):
             return failure
+        wanted()
         return await self.forward("POST", "/sdcpp/v1/img_gen", body, self.engine)
 
     async def job(self, name: str, model: str, job: str) -> bytes:
@@ -785,8 +815,11 @@ class Host:
         path = f"/sdcpp/v1/jobs/{job}/cancel"
         return await self.forward("POST", path, None, engine)
 
-    async def answer(self, reader: asyncio.StreamReader) -> bytes | None:
-        """Read one request and return the whole reply. None: the client left without a word."""
+    async def answer(
+        self, reader: asyncio.StreamReader, conn: socket.socket, accepted: int
+    ) -> bytes | None:
+        """Read one request and return the whole reply. None: the client left without a word. `accepted` is the
+        number of kills when its connection was accepted."""
         try:
             req = await self.from_client(read_request(reader))
             name, *ids = self.route(req)
@@ -795,14 +828,14 @@ class Host:
             if name == "kill":
                 return encode(200, {"killed": await self.kill()})
             if name == "img_gen":
-                return await self.img_gen(reader, req, *ids)
+                return await self.img_gen(reader, conn, accepted, req, *ids)
             return await self.job(name, *ids)
         except Reject as err:
             return encode(err.status, {"code": err.code})
         except Hangup:
             return None
 
-    async def serve(self, conn: socket.socket, busy: bool) -> None:
+    async def serve(self, conn: socket.socket, busy: bool, accepted: int) -> None:
         try:
             reader, writer = await asyncio.open_unix_connection(
                 sock=conn, limit=STREAM_LIMIT
@@ -816,7 +849,7 @@ class Host:
                 if busy:
                     reply = encode(503, {"code": "busy"})
                 else:
-                    reply = await self.answer(reader)
+                    reply = await self.answer(reader, conn, accepted)
             except (OSError, EOFError):
                 reply = None
             if reply is not None:
@@ -866,7 +899,7 @@ class Host:
         busy = self.active >= MAX_CONNECTIONS
         if not busy:
             self.active += 1
-        task = asyncio.create_task(self.serve(conn, busy))
+        task = asyncio.create_task(self.serve(conn, busy, self.kills))
         self.connections.add(task)
         task.add_done_callback(self.connections.discard)
 

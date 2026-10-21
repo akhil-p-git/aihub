@@ -11,7 +11,7 @@ The launcher starts it exactly as it would start sd-server. It listens on --list
         crash         abort (SIGABRT) before listening
         hang          never listen and never exit
         slow=SECONDS  "load the model" for that long before listening
-        stubborn      ignore SIGTERM, so that only SIGKILL stops it
+        stubborn      ignore SIGTERM (noting it in DIR/signals.log), so that only SIGKILL stops it
         noisy         write about 20,000 log lines and two huge ones before listening
 
 A keyword in the prompt of a job chooses how the job goes (the same style as tests/e2e/fake_providers.py):
@@ -211,7 +211,8 @@ def start_mode(mode: str) -> None:
         log("I", "loading model")
         time.sleep(float(value))
     elif name == "stubborn":
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # Note each SIGTERM in DIR/signals.log, so that a test can wait until the launcher has sent one.
+        signal.signal(signal.SIGTERM, lambda *_: record("signals.log", {"sig": "TERM"}))
     elif name == "noisy":
         flood()
     elif name:
