@@ -184,3 +184,5 @@ Superseded by the web chat above, and kept until you decide to remove it
 ## Not done yet
 Keys for OpenRouter, Anthropic and Discord, Tailscale access from phone and Mac, and the model benchmark in
 `docs/models.md` (`scripts/bench.py`, which refuses to run while another program is using the GPU).
+
+The project is under the MIT License (`LICENSE`). Vendored browser libraries and fonts keep their own licenses, which sit beside them in `app/aihub_web/static/lib/`.
