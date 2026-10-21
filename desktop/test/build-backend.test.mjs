@@ -15,6 +15,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -40,6 +41,7 @@ import {
   extract,
   failureReason,
   fetchVerified,
+  finishPayload,
   installDependencies,
   parseTarget,
   pbsAgeDays,
@@ -48,6 +50,7 @@ import {
   sha256File,
   shouldPrune,
   tarExtractArgs,
+  trimRecords,
   uvExportArgs,
   uvInstallArgs,
   verifyArchive,
@@ -618,6 +621,137 @@ describe("buildAtomically", () => {
     );
     await buildAtomically(join(parent, "linux-x64"), (work) => lay(work, ["bin/python3.12"]));
     assert.deepEqual(readdirSync(parent).sort(), [...kept.sort(), "linux-x64"]);
+  });
+});
+
+describe("trimRecords", () => {
+  const site = () => join(scratch, "site-packages");
+  const recordOf = (dist) => join(site(), `${dist}.dist-info`, "RECORD");
+
+  it("drops the lines of files that are gone, such as uv's console scripts, and nothing else", () => {
+    lay(site(), ["pkg/__init__.py", "pkg-1.0.dist-info/METADATA", "pkg-1.0.dist-info/RECORD"]);
+    writeFileSync(
+      recordOf("pkg-1.0"),
+      [
+        "bin/pkg,sha256=Zm9vYmFy,377",
+        "pkg/__init__.py,sha256=YmF6,0",
+        "pkg-1.0.dist-info/METADATA,sha256=cXV4,10",
+        "../../bin/pkg-extra,sha256=cXV1eA,5",
+        "pkg-1.0.dist-info/RECORD,,",
+        "",
+      ].join("\n"),
+    );
+    assert.equal(trimRecords(site()), 2);
+    assert.equal(
+      readFileSync(recordOf("pkg-1.0"), "utf8"),
+      [
+        "pkg/__init__.py,sha256=YmF6,0",
+        "pkg-1.0.dist-info/METADATA,sha256=cXV4,10",
+        "pkg-1.0.dist-info/RECORD,,",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("does not rewrite a RECORD in which every file is there", () => {
+    lay(site(), ["pkg/__init__.py", "pkg-1.0.dist-info/RECORD"]);
+    const text = "pkg/__init__.py,sha256=YmF6,0\npkg-1.0.dist-info/RECORD,,";
+    writeFileSync(recordOf("pkg-1.0"), text);
+    const past = new Date("2020-01-01T00:00:00Z");
+    utimesSync(recordOf("pkg-1.0"), past, past);
+    assert.equal(trimRecords(site()), 0);
+    assert.equal(readFileSync(recordOf("pkg-1.0"), "utf8"), text);
+    assert.equal(statSync(recordOf("pkg-1.0")).mtime.getTime(), past.getTime());
+  });
+
+  it("keeps the line endings of the lines that stay, and a line with a quoted path, which it does not parse", () => {
+    lay(site(), ["pkg/__init__.py", "pkg-1.0.dist-info/RECORD"]);
+    writeFileSync(
+      recordOf("pkg-1.0"),
+      'bin/pkg,sha256=Zm9v,1\r\npkg/__init__.py,sha256=YmF6,0\r\n"odd,name.py",sha256=cXV4,2\r\n',
+    );
+    assert.equal(trimRecords(site()), 1);
+    assert.equal(
+      readFileSync(recordOf("pkg-1.0"), "utf8"),
+      'pkg/__init__.py,sha256=YmF6,0\r\n"odd,name.py",sha256=cXV4,2\r\n',
+    );
+  });
+
+  it("looks only at the RECORD of each dist-info folder", () => {
+    lay(site(), ["a-1.dist-info/METADATA", "b-1.dist-info/RECORD", "notes/RECORD", "plain-file"]);
+    writeFileSync(recordOf("b-1"), "gone.py,sha256=Zm9v,1\n");
+    writeFileSync(join(site(), "notes", "RECORD"), "gone.py,sha256=Zm9v,1\n");
+    assert.equal(trimRecords(site()), 1);
+    assert.equal(readFileSync(recordOf("b-1"), "utf8"), "", "its only line was for a file that is gone");
+    assert.equal(readFileSync(join(site(), "notes", "RECORD"), "utf8"), "gone.py,sha256=Zm9v,1\n");
+  });
+});
+
+describe("finishPayload", () => {
+  const site = "lib/python3.12/site-packages";
+  const record = `${site}/uvicorn-0.54.0.dist-info/RECORD`;
+  const recordText = [
+    "bin/uvicorn,sha256=Zm9v,377",
+    "uvicorn-0.54.0.dist-info/METADATA,sha256=YmFy,10",
+    "uvicorn-0.54.0.dist-info/RECORD,,",
+    "",
+  ].join("\n");
+
+  /** A work folder as it is after uv and the copy of the app: what the archive holds, plus what the prune removes. */
+  function installed(tag) {
+    const work = join(scratch, "work");
+    lay(work, [
+      "bin/python3.12",
+      "bin/pip",
+      "include/python3.12/Python.h",
+      "lib/libpython3.12.so.1.0",
+      "lib/python3.12/os.py",
+      `${site}/pip/__init__.py`,
+      `${site}/.lock`,
+      `${site}/bin/uvicorn`,
+      `${site}/aihub_web/__main__.py`,
+      `${site}/aihub_web/static/index.html`,
+      `${site}/pydantic_core/_pydantic_core.cpython-312-${tag}.so`,
+      `${site}/yaml/_yaml.cpython-312-${tag}.so`,
+      `${site}/uvicorn-0.54.0.dist-info/METADATA`,
+      record,
+    ]);
+    writeFileSync(join(work, record), recordText);
+    return work;
+  }
+
+  it("prunes, drops the RECORD lines of what went, and checks what the app needs", () => {
+    const work = installed("x86_64-linux-gnu");
+    const { pruned, trimmed } = finishPayload(work, "linux-x64");
+    assert.equal(pruned.entries, 6, "bin/pip, include, libpython, pip, .lock, site-packages/bin");
+    assert.equal(trimmed, 1);
+    assert.equal(readFileSync(join(work, record), "utf8"), recordText.split("\n").slice(1).join("\n"));
+    assert.deepEqual(
+      listing(work).filter((path) => !path.startsWith(`${site}/`)),
+      ["bin", "bin/python3.12", "lib", "lib/python3.12", "lib/python3.12/os.py", "lib/python3.12/site-packages"],
+    );
+  });
+
+  it("does the same for a macOS target, with the module suffix of macOS", () => {
+    const work = installed("darwin");
+    assert.equal(finishPayload(work, "mac-arm64").trimmed, 1);
+    assert.ok(existsSync(join(work, `${site}/yaml/_yaml.cpython-312-darwin.so`)));
+  });
+
+  it("fails with the payload check's reason when something the app needs is missing", () => {
+    const work = installed("x86_64-linux-gnu");
+    rmSync(join(work, `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`));
+    assert.throws(
+      () => finishPayload(work, "linux-x64"),
+      (err) =>
+        err instanceof BuildError &&
+        err.message === `payload check failed: missing ${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
+    );
+  });
+
+  it("expects the module suffix of its own target", () => {
+    const work = installed("darwin");
+    assert.throws(() => finishPayload(work, "linux-x64"), /payload check failed: missing .*x86_64-linux-gnu\.so/);
   });
 });
 

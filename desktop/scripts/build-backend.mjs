@@ -14,8 +14,9 @@
 // happens in a work folder next to the result, which replaces desktop/payload/<target> only after every step
 // has passed, so a failed or interrupted run never leaves something that looks like a payload.
 //
-// No file from the archive or from a wheel is ever modified: the macOS payloads are code-signed later, and
-// stripping, lipo or install_name_tool would break the seals. Bytecode is not compiled either; the app runs
+// No binary from the archive or from a wheel is ever modified: the macOS payloads are code-signed later, and
+// stripping, lipo or install_name_tool would break the seals. The one text that is rewritten is each package's
+// RECORD, which loses the lines of the files that the prune removed. Bytecode is not compiled either; the app runs
 // Python with -X pycache_prefix so that nothing is written into the payload.
 //
 // It needs only Node, uv and tar, and uses nothing specific to GNU or Linux, so it is meant to run unchanged on a
@@ -40,6 +41,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -355,6 +357,28 @@ export function prune(root) {
   return { entries, bytes };
 }
 
+/**
+ * Removes from every dist-info/RECORD the lines of files that are not there any more. uv lists the console scripts
+ * it wrote to site-packages/bin in them and the prune removes that folder, so those lines name nothing, and each
+ * carries the hash of a script whose first line is the path of the work folder, which changes from build to
+ * build. A line with a quoted path (it holds a comma) is left as it is. Returns how many lines went.
+ */
+export function trimRecords(site) {
+  let dropped = 0;
+  for (const entry of readdirSync(site)) {
+    const record = join(site, entry, "RECORD");
+    if (!entry.endsWith(".dist-info") || !existsSync(record)) continue;
+    const lines = readFileSync(record, "utf8").split("\n");
+    const there = (line) =>
+      line === "" || line.startsWith('"') || lstatSync(join(site, line.split(",")[0]), { throwIfNoEntry: false });
+    const kept = lines.filter(there);
+    if (kept.length === lines.length) continue;
+    writeFileSync(record, kept.join("\n"));
+    dropped += lines.length - kept.length;
+  }
+  return dropped;
+}
+
 /** Throws unless the finished payload has the files in `required` and nothing it should not have. */
 export function auditPayload(payload, required = []) {
   const root = resolve(payload);
@@ -376,6 +400,17 @@ export function auditPayload(payload, required = []) {
     const more = problems.length > 5 ? ` (and ${problems.length - 5} more)` : "";
     throw new BuildError(`payload check failed: ${problems.slice(0, 5).join("; ")}${more}`);
   }
+}
+
+/**
+ * What follows the installation of the app and its dependencies: prune, drop the RECORD lines of what the prune
+ * removed, and check the result. Returns what the first two did. Throws when the check fails.
+ */
+export function finishPayload(work, target) {
+  const pruned = prune(work);
+  const trimmed = trimRecords(join(work, "lib", `python${PYTHON_MINOR}`, "site-packages"));
+  auditPayload(work, requiredFiles(target));
+  return { pruned, trimmed };
 }
 
 export function requiredFiles(target) {
@@ -638,9 +673,9 @@ async function buildTarget(target) {
     const packages = await installDependencies(target, work, requirements);
     log(target, `installed ${packages} locked packages for ${TARGETS[target].triple}`);
     log(target, `copied aihub_web (${copyApp(work)} files)`);
-    const pruned = prune(work);
+    const { pruned, trimmed } = finishPayload(work, target);
     log(target, `pruned ${pruned.entries} entries (${mib(pruned.bytes)})`);
-    auditPayload(work, requiredFiles(target));
+    log(target, `dropped ${count(trimmed, "line")} for pruned files from RECORD files`);
   });
 
   const { files, symlinks, bytes } = measure(finalDir);
