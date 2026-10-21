@@ -96,58 +96,45 @@ function listing(root, rel = "") {
 }
 
 /**
- * Stand-ins for a binary: the magic number of an ELF or a 64-bit Mach-O file, then the library names that the
- * loader would read from it, each as a NUL-terminated string (the form they have in .dynstr and in a dylib load
- * command).
+ * Stand-in for an ELF binary: its magic number, then the library names that the loader would read from it, each as
+ * a NUL-terminated string (the form they have in .dynstr).
  */
-const withNames = (magic, names) =>
-  Buffer.concat([Buffer.from(magic), ...names.map((name) => Buffer.from(`\0${name}\0`))]);
-const elf = (...names) => withNames([0x7f, 0x45, 0x4c, 0x46], names);
-const macho = (...names) => withNames([0xcf, 0xfa, 0xed, 0xfe], names);
+const elf = (...names) =>
+  Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), ...names.map((name) => Buffer.from(`\0${name}\0`))]);
 
 describe("the pin table", () => {
-  it("has linux-x64, mac-arm64 and mac-x64, each with a known triple and a 64-hex sha256", () => {
-    assert.deepEqual(Object.keys(TARGETS).sort(), ["linux-x64", "mac-arm64", "mac-x64"]);
-    assert.deepEqual(Object.fromEntries(Object.entries(TARGETS).map(([name, t]) => [name, t.triple])), {
-      "linux-x64": "x86_64-unknown-linux-gnu",
-      "mac-arm64": "aarch64-apple-darwin",
-      "mac-x64": "x86_64-apple-darwin",
-    });
-    for (const [name, target] of Object.entries(TARGETS)) assert.match(target.sha256, /^[0-9a-f]{64}$/, name);
-    assert.equal(new Set(Object.values(TARGETS).map((t) => t.sha256)).size, 3, "each archive has its own hash");
+  it("has the linux-x64 target only, with its triple and a 64-hex sha256", () => {
+    assert.deepEqual(Object.keys(TARGETS), ["linux-x64"]);
+    assert.equal(TARGETS["linux-x64"].triple, "x86_64-unknown-linux-gnu");
+    assert.match(TARGETS["linux-x64"].sha256, /^[0-9a-f]{64}$/);
   });
 
-  // A new release changes the tag, the version and the three hashes together, here and in the script.
+  // A new release changes the tag, the version and the hash together, here and in the script.
   it("pins CPython 3.12.15 from python-build-standalone release 20261003", () => {
     assert.equal(PYTHON_VERSION, "3.12.15");
     assert.equal(PBS_TAG, "20261003");
   });
 
-  it("holds the sha256 values that the release's SHA256SUMS file lists for the three archives", () => {
+  it("holds the sha256 value that the release's SHA256SUMS file lists for the Linux archive", () => {
     // https://github.com/astral-sh/python-build-standalone/releases/download/20261003/SHA256SUMS
-    assert.deepEqual(Object.fromEntries(Object.entries(TARGETS).map(([name, { sha256 }]) => [name, sha256])), {
-      "linux-x64": "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91",
-      "mac-arm64": "ad8d0c637c0a36b967b310e2c07254f4d2ca8cabaa7699e55ed6290aceb481a2",
-      "mac-x64": "562c30864ece2cb1d3e0ad66a1acd498611a47e5a10ce81b99158bef1ccbd355",
-    });
+    assert.equal(TARGETS["linux-x64"].sha256, "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91");
   });
 
-  it("names the install_only_stripped archive of the pinned release for each target", () => {
-    assert.deepEqual(Object.keys(TARGETS).map(archiveName), [
+  it("names the install_only_stripped archive of the pinned release", () => {
+    assert.equal(
+      archiveName("linux-x64"),
       "cpython-3.12.15+20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-      "cpython-3.12.15+20261003-aarch64-apple-darwin-install_only_stripped.tar.gz",
-      "cpython-3.12.15+20261003-x86_64-apple-darwin-install_only_stripped.tar.gz",
-    ]);
+    );
   });
 
   it("downloads over https from the release's asset path, with the + written as %2B", () => {
-    const url = new URL(archiveUrl("mac-arm64"));
+    const url = new URL(archiveUrl("linux-x64"));
     assert.equal(url.protocol, "https:");
     assert.equal(url.host, "github.com");
     assert.equal(
       url.pathname,
       "/astral-sh/python-build-standalone/releases/download/20261003/" +
-        "cpython-3.12.15%2B20261003-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "cpython-3.12.15%2B20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
     );
   });
 
@@ -222,17 +209,33 @@ describe("verifyArchive", () => {
 });
 
 describe("parseTarget", () => {
-  it("accepts each known target", () => {
-    for (const name of Object.keys(TARGETS)) assert.equal(parseTarget([name]), name);
+  it("accepts the one target", () => {
+    assert.equal(parseTarget(["linux-x64"]), "linux-x64");
   });
 
-  it("refuses a missing, unknown or extra argument with status 2 and says what is accepted", () => {
-    const names = ["toString", "__proto__", "constructor", "hasOwnProperty", ""]; // keys every object has
-    for (const args of [[], ["windows-x64"], ["linux-x64", "mac-x64"], ["--help"], ...names.map((name) => [name])]) {
+  it("refuses a missing or an extra argument with status 2 and the usage line", () => {
+    for (const args of [[], ["linux-x64", "linux-x64"]]) {
       assert.throws(
         () => parseTarget(args),
-        (err) => err instanceof BuildError && err.status === 2 && /linux-x64.*mac-arm64.*mac-x64/.test(err.message),
+        (err) =>
+          err instanceof BuildError &&
+          err.status === 2 &&
+          err.message === "usage: node scripts/build-backend.mjs <linux-x64>",
         JSON.stringify(args),
+      );
+    }
+  });
+
+  it("refuses an unknown target with status 2 and says what is accepted", () => {
+    const names = ["toString", "__proto__", "constructor", "hasOwnProperty", ""]; // keys every object has
+    for (const name of ["linux-arm64", "--help", ...names]) {
+      assert.throws(
+        () => parseTarget([name]),
+        (err) =>
+          err instanceof BuildError &&
+          err.status === 2 &&
+          err.message === `unknown target "${name}" (expected linux-x64)`,
+        JSON.stringify(name),
       );
     }
   });
@@ -275,8 +278,8 @@ describe("running the script", () => {
   }
   /** A node option that makes the process report another platform and CPU, as a data: module run before the script. */
   const pretendHost = (platform, arch) => {
-    const code = `Object.defineProperty(process, "platform", { value: "${platform}" });`;
-    return `--import=data:text/javascript,${encodeURIComponent(`${code} Object.defineProperty(process, "arch", { value: "${arch}" });`)}`;
+    const define = (name, value) => `Object.defineProperty(process, "${name}", { value: "${value}" });`;
+    return `--import=data:text/javascript,${encodeURIComponent(define("platform", platform) + define("arch", arch))}`;
   };
 
   it("exits 2 with a one-line reason on a machine that is not Linux x86_64, before it builds anything", () => {
@@ -292,15 +295,15 @@ describe("running the script", () => {
   });
 
   it("exits 2 with a one-line message for an unknown target", () => {
-    const run = spawnSync(process.execPath, [script, "windows-x64"], { encoding: "utf8" });
+    const run = runScript(["linux-arm64"]);
     assert.equal(run.status, 2, run.stderr);
     assert.equal(run.stdout, "");
-    assert.match(run.stderr, /unknown target "windows-x64"/);
+    assert.match(run.stderr, /unknown target "linux-arm64"/);
     assert.equal(run.stderr.trim().split("\n").length, 1);
   });
 
   it("exits 2 when no target is given", () => {
-    const run = spawnSync(process.execPath, [script], { encoding: "utf8" });
+    const run = runScript([]);
     assert.equal(run.status, 2, run.stderr);
     assert.match(run.stderr, /usage: node scripts\/build-backend\.mjs/);
   });
@@ -330,13 +333,11 @@ describe("shouldPrune", () => {
     "share/man/man1/python3.1",
     "share/terminfo/x/xterm",
     "lib/pkgconfig/python3.pc",
-    "lib/python3.12/config-3.12-darwin",
     "lib/python3.12/config-3.12-x86_64-linux-gnu/Makefile",
     // the shared libpython: a second copy of the interpreter, which bin/python3.12 does not link
     "lib/libpython3.12.so.1.0",
     "lib/libpython3.12.so",
     "lib/libpython3.so",
-    "lib/libpython3.12.dylib",
     "lib/libpython3.12.a",
     // stdlib packages the app never imports
     "lib/python3.12/ensurepip",
@@ -346,9 +347,9 @@ describe("shouldPrune", () => {
     "lib/python3.12/turtledemo/bytedesign.py",
     "lib/python3.12/tkinter/__init__.py",
     // extension modules with system library or Tcl/Tk dependencies
-    "lib/python3.12/lib-dynload/_dbm.cpython-312-darwin.so",
+    "lib/python3.12/lib-dynload/_dbm.cpython-312-x86_64-linux-gnu.so",
     "lib/python3.12/lib-dynload/_crypt.cpython-312-x86_64-linux-gnu.so",
-    "lib/python3.12/lib-dynload/_tkinter.cpython-312-darwin.so",
+    "lib/python3.12/lib-dynload/_tkinter.cpython-312-x86_64-linux-gnu.so",
     // Tcl/Tk itself
     "lib/tcl9.0",
     "lib/tcl9/9.0/http-2.10.0.tm",
@@ -357,7 +358,7 @@ describe("shouldPrune", () => {
     "lib/tdbc1.1.10/tdbc.tcl",
     "lib/thread3.0.6/pkgIndex.tcl",
     "lib/libtcl9.0.so",
-    "lib/libtcl9tk9.0.dylib",
+    "lib/libtcl9tk9.0.so",
     // pip and what uv --target leaves behind
     "lib/python3.12/site-packages/pip",
     "lib/python3.12/site-packages/pip/__init__.py",
@@ -401,9 +402,7 @@ describe("shouldPrune", () => {
   const sharedLibraries = [
     "lib/python3.12/lib-dynload/_ssl.cpython-312-x86_64-linux-gnu.so",
     "lib/python3.12/site-packages/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so",
-    "lib/python3.12/site-packages/pydantic_core/_pydantic_core.cpython-312-darwin.so",
     "lib/python3.12/site-packages/yaml/_yaml.cpython-312-x86_64-linux-gnu.so",
-    "lib/python3.12/site-packages/yaml/_yaml.cpython-312-darwin.so",
   ];
 
   it("matches everything the blueprint prunes", () => {
@@ -419,7 +418,7 @@ describe("shouldPrune", () => {
   });
 
   it("matches a shared library only when it is libpython, Tcl/Tk or the _dbm, _crypt or _tkinter module", () => {
-    const shared = /\.(so(\.\d+)*|dylib)$/;
+    const shared = /\.so(\.\d+)*$/;
     const allowed = /lib-dynload\/(_dbm|_crypt|_tkinter)[^/]*$|^lib\/lib(tcl|tk|python)[^/]*$/;
     for (const path of removed.filter((p) => shared.test(p))) assert.match(path, allowed);
   });
@@ -438,7 +437,7 @@ describe("prune", () => {
       "lib/python3.12/os.py",
       "lib/python3.12/__pycache__/os.cpython-312.pyc",
       "lib/python3.12/lib-dynload/.empty",
-      "lib/python3.12/lib-dynload/_dbm.cpython-312-darwin.so",
+      "lib/python3.12/lib-dynload/_dbm.cpython-312-x86_64-linux-gnu.so",
       "lib/python3.12/site-packages/.lock",
       "lib/python3.12/site-packages/bin/uvicorn",
       "lib/python3.12/site-packages/pkg/mod.py",
@@ -455,7 +454,7 @@ describe("prune", () => {
       "lib/libpython3.12.so",
       "lib/tcl9.0/init.tcl",
       "lib/python3.12/__pycache__/os.cpython-312.pyc",
-      "lib/python3.12/lib-dynload/_dbm.cpython-312-darwin.so",
+      "lib/python3.12/lib-dynload/_dbm.cpython-312-x86_64-linux-gnu.so",
       "lib/python3.12/site-packages/.lock",
       "lib/python3.12/site-packages/bin/uvicorn",
       "lib/python3.12/site-packages/pkg/__pycache__/mod.cpython-312.pyc",
@@ -516,24 +515,26 @@ describe("prune and the shared libraries it removes", () => {
     assert.deepEqual(listing(root()), before, "nothing was deleted");
   });
 
-  it("does the same for a Mach-O file that names the dylib by @rpath, and for an extension module", () => {
-    lay(root(), ["lib/libpython3.12.dylib", "lib/python3.12/os.py"]);
+  it("does the same for an extension module that links the library", () => {
+    lay(root(), [...withLibpython, "lib/python3.12/os.py"]);
     mkdirSync(join(root(), "lib/python3.12/site-packages/ext"), { recursive: true });
-    const module = join(root(), "lib/python3.12/site-packages/ext/_ext.cpython-312-darwin.so");
-    writeFileSync(module, macho("/usr/lib/libSystem.B.dylib", "@rpath/libpython3.12.dylib"));
+    const module = join(root(), "lib/python3.12/site-packages/ext/_ext.cpython-312-x86_64-linux-gnu.so");
+    writeFileSync(module, elf("libc.so.6", "libpython3.12.so.1.0"));
     assert.throws(
       () => prune(root()),
       (err) =>
         err instanceof BuildError &&
-        err.message.startsWith("lib/python3.12/site-packages/ext/_ext.cpython-312-darwin.so links libpython3.12.dylib"),
+        err.message.startsWith(
+          "lib/python3.12/site-packages/ext/_ext.cpython-312-x86_64-linux-gnu.so links libpython3.12.so.1.0",
+        ),
     );
-    assert.ok(existsSync(join(root(), "lib/libpython3.12.dylib")));
+    assert.ok(existsSync(join(root(), "lib/libpython3.12.so.1.0")));
   });
 
   it("lets files that stay mention a name without linking it", () => {
     lay(root(), [...withLibpython, "lib/python3.12/os.py"]);
     mkdirSync(join(root(), "bin"));
-    // a file that is not a binary, with the name in it as a loader would read it: only ELF and Mach-O files count
+    // a file that is not a binary, with the name in it as a loader would read it: only ELF files count
     writeFileSync(join(root(), "lib/python3.12/_sysconfigdata.py"), "LDLIBRARY\0libpython3.12.so.1.0\0\n");
     // a binary with a longer name that only starts the same, and one that links only what stays
     writeFileSync(join(root(), "bin/python3.12"), elf("libpython3.12.so.1.0.1", "libm.so.6"));
@@ -566,19 +567,12 @@ describe("requiredFiles", () => {
     `${site}/aihub_web/static/index.html`,
   ];
 
-  it("lists the interpreter, the app and the two compiled dependencies of each target, and no libpython", () => {
+  it("lists the interpreter, the app and the two compiled dependencies, and no libpython", () => {
     assert.deepEqual(requiredFiles("linux-x64"), [
       ...common,
       `${site}/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so`,
       `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
     ]);
-    for (const target of ["mac-arm64", "mac-x64"]) {
-      assert.deepEqual(requiredFiles(target), [
-        ...common,
-        `${site}/pydantic_core/_pydantic_core.cpython-312-darwin.so`,
-        `${site}/yaml/_yaml.cpython-312-darwin.so`,
-      ]);
-    }
   });
 });
 
@@ -701,7 +695,7 @@ describe("buildAtomically", () => {
       lay(work, ["bin/python3.12"]);
       throw new BuildError("the build broke");
     };
-    await assert.rejects(buildAtomically(join(parent, "mac-x64"), broken), /the build broke/);
+    await assert.rejects(buildAtomically(join(parent, "other-x64"), broken), /the build broke/);
     assert.deepEqual(readdirSync(parent), [], "a failed first build leaves nothing, not even a work folder");
 
     const final = join(parent, "linux-x64");
@@ -721,7 +715,7 @@ describe("buildAtomically", () => {
       ".build-linux-x64-nopid",
     ];
     const kept = [
-      `.build-mac-x64-${gone}-0123abcd`,
+      `.build-other-x64-${gone}-0123abcd`,
       `.build-linux-x64-${process.pid}-0123abcd`,
       ".build-linux-x64-1-0123abcd",
     ];
@@ -808,7 +802,7 @@ describe("finishPayload", () => {
   ].join("\n");
 
   /** A work folder as it is after uv and the copy of the app: what the archive holds, plus what the prune removes. */
-  function installed(tag) {
+  function installed() {
     const work = join(scratch, "work");
     lay(work, [
       "bin/python3.12",
@@ -821,8 +815,8 @@ describe("finishPayload", () => {
       `${site}/bin/uvicorn`,
       `${site}/aihub_web/__main__.py`,
       `${site}/aihub_web/static/index.html`,
-      `${site}/pydantic_core/_pydantic_core.cpython-312-${tag}.so`,
-      `${site}/yaml/_yaml.cpython-312-${tag}.so`,
+      `${site}/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so`,
+      `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
       `${site}/uvicorn-0.54.0.dist-info/METADATA`,
       record,
     ]);
@@ -831,7 +825,7 @@ describe("finishPayload", () => {
   }
 
   it("prunes, drops the RECORD lines of what went, and checks what the app needs", () => {
-    const work = installed("x86_64-linux-gnu");
+    const work = installed();
     const { pruned, trimmed } = finishPayload(work, "linux-x64");
     assert.equal(pruned.entries, 6, "bin/pip, include, libpython, pip, .lock, site-packages/bin");
     assert.equal(trimmed, 1);
@@ -842,14 +836,8 @@ describe("finishPayload", () => {
     );
   });
 
-  it("does the same for a macOS target, with the module suffix of macOS", () => {
-    const work = installed("darwin");
-    assert.equal(finishPayload(work, "mac-arm64").trimmed, 1);
-    assert.ok(existsSync(join(work, `${site}/yaml/_yaml.cpython-312-darwin.so`)));
-  });
-
   it("fails with the payload check's reason when something the app needs is missing", () => {
-    const work = installed("x86_64-linux-gnu");
+    const work = installed();
     rmSync(join(work, `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`));
     assert.throws(
       () => finishPayload(work, "linux-x64"),
@@ -857,11 +845,6 @@ describe("finishPayload", () => {
         err instanceof BuildError &&
         err.message === `payload check failed: missing ${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
     );
-  });
-
-  it("expects the module suffix of its own target", () => {
-    const work = installed("darwin");
-    assert.throws(() => finishPayload(work, "linux-x64"), /payload check failed: missing .*x86_64-linux-gnu\.so/);
   });
 });
 
@@ -1031,27 +1014,20 @@ describe("the uv and tar arguments", () => {
   });
 
   it("installs only hashed wheels, copied, for the target's platform and Python 3.12", () => {
-    const triples = [
-      ["linux-x64", "x86_64-unknown-linux-gnu"],
-      ["mac-arm64", "aarch64-apple-darwin"],
-      ["mac-x64", "x86_64-apple-darwin"],
-    ];
-    for (const [target, triple] of triples) {
-      const args = uvInstallArgs(target, "/work/site");
-      assert.deepEqual(args.slice(0, 2), ["pip", "install"], target);
-      assert.equal(valueOf(args, "--link-mode"), "copy", target);
-      assert.equal(valueOf(args, "--target"), "/work/site", target);
-      assert.equal(valueOf(args, "--python-platform"), triple, target);
-      assert.equal(valueOf(args, "--python-version"), "3.12", target);
-      assert.equal(valueOf(args, "--only-binary"), ":all:", target);
-      assert.equal(valueOf(args, "-r"), "-", `${target}: the requirements come on stdin`);
-      for (const flag of ["--require-hashes", "--no-python-downloads"]) assert.ok(args.includes(flag), flag);
-    }
+    const args = uvInstallArgs("linux-x64", "/work/site");
+    assert.deepEqual(args.slice(0, 2), ["pip", "install"]);
+    assert.equal(valueOf(args, "--link-mode"), "copy");
+    assert.equal(valueOf(args, "--target"), "/work/site");
+    assert.equal(valueOf(args, "--python-platform"), "x86_64-unknown-linux-gnu");
+    assert.equal(valueOf(args, "--python-version"), "3.12");
+    assert.equal(valueOf(args, "--only-binary"), ":all:");
+    assert.equal(valueOf(args, "-r"), "-", "the requirements come on stdin");
+    for (const flag of ["--require-hashes", "--no-python-downloads"]) assert.ok(args.includes(flag), flag);
   });
 
   it("names an interpreter for uv only when it is given one", () => {
-    assert.ok(!uvInstallArgs("mac-arm64", "/work/site").includes("--python"));
-    assert.ok(!uvInstallArgs("mac-arm64", "/work/site", null).includes("--python"));
+    assert.ok(!uvInstallArgs("linux-x64", "/work/site").includes("--python"));
+    assert.ok(!uvInstallArgs("linux-x64", "/work/site", null).includes("--python"));
     assert.equal(
       valueOf(uvInstallArgs("linux-x64", "/work/site", "/work/bin/python3.12"), "--python"),
       "/work/bin/python3.12",
@@ -1071,13 +1047,7 @@ describe("the uv and tar arguments", () => {
   it("can run a target's interpreter only on the platform and CPU it was built for", () => {
     assert.equal(canRunTarget("linux-x64", "linux", "x64"), true);
     assert.equal(canRunTarget("linux-x64", "linux", "arm64"), false);
-    assert.equal(canRunTarget("linux-x64", "darwin", "x64"), false);
-    assert.equal(canRunTarget("mac-arm64", "darwin", "arm64"), true);
-    assert.equal(canRunTarget("mac-arm64", "darwin", "x64"), false);
-    assert.equal(canRunTarget("mac-x64", "darwin", "x64"), true);
-    // Rosetta would run it on an Apple silicon Mac; the script does not rely on that.
-    assert.equal(canRunTarget("mac-x64", "darwin", "arm64"), false);
-    assert.equal(canRunTarget("mac-x64", "linux", "x64"), false);
+    assert.equal(canRunTarget("linux-x64", "freebsd", "x64"), false);
   });
 });
 
@@ -1174,16 +1144,10 @@ describe("running uv", () => {
     assert.equal(packages, 2, "pip's own dist-info is not a locked package");
   });
 
-  it("leaves the choice of interpreter to uv for a target that this machine cannot run", async () => {
-    const other = process.platform === "darwin" ? "linux-x64" : "mac-arm64";
-    await installDependencies(other, workFolder(), "x\n");
-    assert.ok(!call().args.includes("--python"));
-  });
-
   it("turns uv's failure into one line, with what to do when it found no Python", async () => {
     process.env.STUB_UV_MODE = "no-interpreter";
     await assert.rejects(
-      installDependencies("mac-arm64", workFolder(), "x\n"),
+      installDependencies("linux-x64", workFolder(), "x\n"),
       (err) =>
         err instanceof BuildError &&
         !err.message.includes("\n") &&

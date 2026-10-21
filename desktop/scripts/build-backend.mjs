@@ -1,6 +1,6 @@
 // Builds the Python that the packaged desktop app starts its backend with: desktop/payload/<target>/.
 //
-//   node scripts/build-backend.mjs <linux-x64|mac-arm64|mac-x64>
+//   node scripts/build-backend.mjs <linux-x64>
 //
 // The result is laid out as the app finds it under resources/backend/:
 //
@@ -14,13 +14,13 @@
 // happens in a work folder next to the result, which replaces desktop/payload/<target> only after every step
 // has passed, so a failed or interrupted run never leaves something that looks like a payload.
 //
-// No binary from the archive or from a wheel is ever modified: the macOS payloads are code-signed later, and
-// stripping, lipo or install_name_tool would break the seals. The one text that is rewritten is each package's
-// RECORD, which loses the lines of the files that the prune removed. Bytecode is not compiled either; the app runs
-// Python with -X pycache_prefix so that nothing is written into the payload.
+// No binary from the archive or from a wheel is ever modified (no strip, no patchelf), so the payload holds the
+// bytes of the pinned archive and of the hashed wheels. The one text that is rewritten is each package's RECORD,
+// which loses the lines of the files that the prune removed. Bytecode is not compiled either; the app runs Python
+// with -X pycache_prefix so that nothing is written into the payload.
 //
 // It needs only Node, uv and tar, and runs only on Linux x86_64. To move to another release, change PBS_TAG,
-// PYTHON_VERSION and the three sha256 values (they are in the release's SHA256SUMS file).
+// PYTHON_VERSION and the sha256 value (it is in the release's SHA256SUMS file).
 //
 // Exit status: 0 on success, 2 for a bad command line or a machine that is not Linux x86_64, 1 for any other
 // failure (one line on stderr says why).
@@ -67,18 +67,6 @@ export const TARGETS = Object.freeze({
     host: Object.freeze({ platform: "linux", arch: "x64" }),
     extension: "x86_64-linux-gnu",
   }),
-  "mac-arm64": Object.freeze({
-    triple: "aarch64-apple-darwin",
-    sha256: "ad8d0c637c0a36b967b310e2c07254f4d2ca8cabaa7699e55ed6290aceb481a2",
-    host: Object.freeze({ platform: "darwin", arch: "arm64" }),
-    extension: "darwin",
-  }),
-  "mac-x64": Object.freeze({
-    triple: "x86_64-apple-darwin",
-    sha256: "562c30864ece2cb1d3e0ad66a1acd498611a47e5a10ce81b99158bef1ccbd355",
-    host: Object.freeze({ platform: "darwin", arch: "x64" }),
-    extension: "darwin",
-  }),
 });
 
 const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -103,8 +91,7 @@ export function parseTarget(args) {
   const names = Object.keys(TARGETS);
   if (args.length !== 1) throw new BuildError(`usage: node scripts/build-backend.mjs <${names.join("|")}>`, 2);
   if (!Object.hasOwn(TARGETS, args[0])) {
-    const list = `${names.slice(0, -1).join(", ")} or ${names.at(-1)}`;
-    throw new BuildError(`unknown target "${args[0]}" (expected ${list})`, 2);
+    throw new BuildError(`unknown target "${args[0]}" (expected ${names.join(" or ")})`, 2);
   }
   return args[0];
 }
@@ -264,19 +251,19 @@ function fetchArchive(target) {
 
 // Paths are relative to the payload, with "/" separators. A matching entry is removed with everything below it.
 //
-// The shared libpython is a second copy of the interpreter: libpython3.12.so.1.0 and its two symlinks on Linux,
-// libpython3.12.dylib on macOS, about as large as bin/python3.12 itself (31 MiB and 17 MiB). The interpreter
-// contains libpython and exports the C API to extension modules; readelf -d and llvm-otool -L show that it links
-// only system libraries. prune() checks that on every build and refuses to delete a library that a binary which
-// stays names, so a release that links the interpreter to it fails the build here, not the app on a Mac. The
-// pinned archives hold no static libpython (.a); the pattern would also remove one at lib/.
+// The shared libpython is a second copy of the interpreter: lib/libpython3.12.so.1.0, a symlink to it and a 20 KiB
+// lib/libpython3.so, about as large as bin/python3.12 itself (31 MiB against 30 MiB). The interpreter contains
+// libpython and exports the C API to extension modules; readelf -d shows that it needs only system libraries.
+// prune() checks that on every build and refuses to delete a library that a binary which stays names, so a release
+// that links the interpreter to it fails the build here, not the app at launch. The pinned archive holds no static
+// libpython (.a); the pattern would also remove one at lib/.
 const PRUNE_PATTERNS = [
   // Every launcher but the interpreter: pip, idle, pydoc, 2to3, the python and python3 symlinks, *-config.
   /^bin\/(?!python3\.12$)/,
   // C headers, man pages and terminfo, pkg-config files.
   /^(include|share|lib\/pkgconfig)(\/|$)/,
   // The shared and static libpython copies.
-  /^lib\/libpython[\d.]*(\.a|\.so[\d.]*|\.dylib)$/,
+  /^lib\/libpython[\d.]*(\.a|\.so[\d.]*)$/,
   // Build configuration and stdlib packages the app never imports.
   /^lib\/python3\.12\/(config-3\.12-[^/]+|ensurepip|idlelib|lib2to3|pydoc_data|tkinter|turtledemo)(\/|$)/,
   // The extension modules for crypt, dbm and Tcl/Tk, which the app never imports.
@@ -310,14 +297,14 @@ function bytesIn(path) {
   return readdirSync(path).reduce((sum, name) => sum + bytesIn(join(path, name)), 0);
 }
 
-const SHARED_LIBRARY = /^lib.*\.(so(\.\d+)*|dylib)$/;
-// The first four bytes of an ELF file and of a Mach-O file (thin, in either byte order, or fat).
-const NATIVE_MAGIC = new Set(["7f454c46", "feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"]);
+const SHARED_LIBRARY = /^lib.*\.so(\.\d+)*$/;
+// The first four bytes of an ELF file.
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
 
 /**
- * Throws, before anything is deleted, when an ELF or Mach-O file that stays has the name of a shared library that
- * goes in its bytes. The loader looks a library up by the name in DT_NEEDED or in a dylib load command, which is a
- * NUL-terminated string in the file, so a link shows up as that name followed by a NUL.
+ * Throws, before anything is deleted, when an ELF file that stays has the name of a shared library that goes in its
+ * bytes. The loader looks a library up by the name in DT_NEEDED, which is a NUL-terminated string in the file, so a
+ * link shows up as that name followed by a NUL.
  */
 function assertNoLinkToPruned(root) {
   const tree = [...walk(root)];
@@ -328,7 +315,7 @@ function assertNoLinkToPruned(root) {
   for (const { rel, dirent } of tree) {
     if (!dirent.isFile() || shouldPrune(rel)) continue;
     const bytes = readFileSync(join(root, rel));
-    if (!NATIVE_MAGIC.has(bytes.subarray(0, 4).toString("hex"))) continue;
+    if (!bytes.subarray(0, 4).equals(ELF_MAGIC)) continue;
     const name = going.find((library) => bytes.includes(`${library}\0`));
     if (name) {
       throw new BuildError(
@@ -626,10 +613,9 @@ export function uvInstallArgs(target, site, python = null) {
 
 export async function installDependencies(target, work, requirements) {
   const site = join(work, "lib", `python${PYTHON_MINOR}`, "site-packages");
-  // uv needs some interpreter to ask about the host. The target's own is used when this machine can run it, so a
-  // Mac with only Node and uv installed can build its own architecture; for the other targets uv finds one on the
-  // machine (UV_PYTHON picks it). uv may not download one: with no interpreter at all it would fetch a CPython
-  // that nothing here pins.
+  // uv needs some interpreter to ask about the host. The target's own is used when this machine can run it; for
+  // any other target uv finds one on the machine (UV_PYTHON picks it). uv may not download one: with no interpreter
+  // at all it would fetch a CPython that nothing here pins.
   const python = canRunTarget(target) ? join(work, "bin", `python${PYTHON_MINOR}`) : null;
   const args = uvInstallArgs(target, site, python);
   // Run from the temp folder, not from inside the repository: uv would read the repository's pyproject.toml
