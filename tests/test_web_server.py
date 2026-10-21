@@ -388,6 +388,16 @@ class TestLaunchToken:
         headers = {"cookie": f"theme=dark; aihub_t={TOKEN}; sidebar=open"}
         assert guarded.get("/api/health", headers=headers).status_code == 200
 
+    def test_a_value_wider_than_latin_1_is_refused_not_a_server_error(
+        self, guarded: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Starlette's cookie parser yields nothing wider than latin-1 today. If it ever did, the
+        comparison must stay a mismatch (401) and not become an encoding error (500)."""
+        monkeypatch.setattr(
+            "aihub_web.security.cookie_parser", lambda _: {"aihub_t": "t€ken"}
+        )
+        assert guarded.get("/api/health", headers=cookie(TOKEN)).status_code == 401
+
     def test_every_api_path_and_method_needs_it(self, guarded: TestClient) -> None:
         for method, path in [
             ("POST", "/api/chat"),
