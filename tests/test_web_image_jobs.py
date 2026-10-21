@@ -115,12 +115,17 @@ async def rig(
         deadline_for=deadline,
         monotonic=monotonic,
     )
+    before = asyncio.all_tasks()
     try:
         yield Rig(jobs, store, engine, ollama, lock, timeline, socket_dir)
     finally:
         await jobs.shutdown()
+        await asyncio.sleep(0.05)  # work that was told to stop gets to unwind
+        strays = [task for task in asyncio.all_tasks() - before if not task.done()]
         await client.aclose()
         store.close()
+        # Whatever a job started, it must have finished or cancelled: nothing runs on for a job that is over.
+        assert not strays, strays
 
 
 async def collect(job: Job, timeout: float = 10.0) -> list[dict]:
