@@ -45,6 +45,7 @@ def test_the_port_comes_from_the_environment_when_it_is_set(tmp_path: Path) -> N
     assert load_config(path, {}).port == 9000
     assert load_config(path, {"AIHUB_PORT": "9100"}).port == 9100
     assert load_config(path, {"AIHUB_PORT": "0"}).port == 0
+    assert load_config(path, {"AIHUB_PORT": "65535"}).port == 65535
     assert load_config(tmp_path / "absent.yaml", {"AIHUB_PORT": "9100"}).port == 9100
 
 
