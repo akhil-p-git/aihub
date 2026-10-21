@@ -1,0 +1,21 @@
+{
+  "engine": "../bin/sd-server",
+  "common_args": [
+    "--listen-ip", "127.0.0.1",
+    "--listen-port", "18234",
+    "--offload-to-cpu",
+    "--max-vram", "3"
+  ],
+  "models": {
+    "zimage": [
+      "--diffusion-model", "z-image-turbo/z_image_turbo-Q5_0.gguf",
+      "--llm", "z-image-turbo/Qwen3-4B-Q4_K_M.gguf",
+      "--vae", "z-image-turbo/ae.safetensors"
+    ],
+    "klein4b": [
+      "--diffusion-model", "flux2-klein-4b/flux-2-klein-4b-Q8_0.gguf",
+      "--llm", "flux2-klein-4b/Qwen3-4B-Q4_K_M.gguf",
+      "--vae", "flux2-klein-4b/flux2-vae.safetensors"
+    ]
+  }
+}
