@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import httpx2
 from aihub_web.db import Store
+from helpers import FakeEngine, generating, serve_engine
 
 ROOT = Path(__file__).parents[1]
 
@@ -108,3 +110,80 @@ def test_stopping_the_service_mid_reply_keeps_the_partial_reply(tmp_path: Path) 
         assert len(reply.content) >= len(streamed.rstrip())
     finally:
         store.close()
+
+
+def test_stopping_the_service_mid_image_saves_the_image_as_stopped(
+    tmp_path: Path, socket_dir: Path
+) -> None:
+    """The jobs are cancelled by the shutdown and saved as stopped, and the engine is left to finish alone."""
+    socket_path = str(socket_dir / "engine.sock")
+    engine = FakeEngine()
+    engine.scripts.append([generating(1, 8)])  # an image that never finishes by itself
+    app_port, nothing_listens = free_port(), free_port()
+    config = tmp_path / "web.yaml"
+    config.write_text(
+        f"port: {app_port}\n"
+        f'ollama: {{ url: "http://127.0.0.1:{nothing_listens}" }}\n'
+        f'openrouter: {{ url: "http://127.0.0.1:{nothing_listens}/api/v1" }}\n'
+        f'images: {{ socket: "{socket_path}" }}\n'
+    )
+    log = (tmp_path / "app.log").open("w")
+    with serve_engine(engine, socket_path):
+        app = subprocess.Popen(
+            [sys.executable, "-m", "aihub_web"],
+            env={
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": str(ROOT / "app"),
+                "AIHUB_WEB_CONFIG": str(config),
+                "AIHUB_STATE_DIR": str(tmp_path / "state"),
+            },
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_until_up(f"http://127.0.0.1:{app_port}/api/health", app)
+            with (
+                httpx2.Client(
+                    base_url=f"http://127.0.0.1:{app_port}", timeout=30
+                ) as client,
+                client.stream(
+                    "POST",
+                    "/api/chat",
+                    json={"text": "a red fox", "model": "images/zimage"},
+                ) as response,
+            ):
+                lines = response.iter_lines()
+                json.loads(next(lines))  # the chat
+                assert json.loads(next(lines))["phase"] == "sampling"
+                app.send_signal(
+                    signal.SIGTERM
+                )  # what `systemctl restart aihub-web` sends
+                with contextlib.suppress(httpx2.RemoteProtocolError):
+                    for _ in lines:
+                        pass
+            assert app.wait(timeout=20) in (0, -signal.SIGTERM)
+        finally:
+            if app.poll() is None:
+                app.kill()
+            app.wait()
+            log.close()
+
+    # A stream that is idle when the grace period ends is cancelled by uvicorn, which logs that with a
+    # traceback (a text reply that is waiting on its model does the same). Nothing else may go wrong.
+    output = (tmp_path / "app.log").read_text()
+    raised = re.findall(r"^[\w.]+(?:Error|Exception|Exit): .*$", output, re.MULTILINE)
+    assert set(raised) <= {
+        "asyncio.exceptions.CancelledError: Task cancelled, timeout graceful shutdown exceeded"
+    }, output
+    store = Store(tmp_path / "state" / "chats.db")
+    try:
+        [chat] = store.list_chats()
+        user, reply = store.messages(chat.id)
+        assert (user.content, reply.status, reply.images) == (
+            "a red fox",
+            "stopped",
+            None,
+        )
+    finally:
+        store.close()
+    assert (engine.kills, engine.cancels) == (0, [])

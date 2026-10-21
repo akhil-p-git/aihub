@@ -1,9 +1,14 @@
+import json
+import re
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
 
 import pytest
-from aihub_web.db import Store
+from aihub_web.db import ImageRow, Store
+
+FIXTURES = Path(__file__).parent / "fixtures" / "images"
 
 DAY = 86_400
 
@@ -246,3 +251,327 @@ class TestFile:
         again = Store(path, clock)
         assert again.get_chat(chat_id) is not None
         again.close()
+
+
+def image(data: bytes = b"RIFF\0\0\0\0WEBPpixels", **fields) -> ImageRow:
+    """The database keeps the bytes as they are, so any bytes will do."""
+    return ImageRow(
+        **{
+            "width": 1024,
+            "height": 576,
+            "seed": 7,
+            "steps": 8,
+            "model": "images/zimage",
+            **fields,
+        },
+        data=data,
+    )
+
+
+def make_image_chat(store: Store, data: bytes = b"RIFF\0\0\0\0WEBPpixels"):
+    chat_id = make_chat(store, "fox", "a red fox")
+    reply = store.add_message(
+        chat_id, "assistant", "", model="images/zimage", images=[image(data)]
+    )
+    return chat_id, reply
+
+
+class TestImages:
+    def test_an_image_reply_keeps_its_metadata_and_its_bytes(
+        self, store: Store
+    ) -> None:
+        chat_id = make_chat(store)
+        reply = store.add_message(
+            chat_id, "assistant", "", model="images/zimage", images=[image(b"webp-1")]
+        )
+        [stored] = reply.images
+        assert re.fullmatch(r"[0-9a-f]{16}", stored["id"])
+        assert stored == {
+            "id": stored["id"],
+            "w": 1024,
+            "h": 576,
+            "seed": 7,
+            "steps": 8,
+            "model": "images/zimage",
+            "ref": None,
+        }
+        user, again = store.messages(chat_id)
+        assert user.images is None
+        assert again.images == reply.images
+        assert store.get_image(chat_id, stored["id"]) == ("image/webp", b"webp-1")
+
+    def test_messages_carry_metadata_never_the_bytes(self, store: Store) -> None:
+        chat_id, _ = make_image_chat(store, b"x" * 50_000)
+        reply = store.messages(chat_id)[-1].to_json()
+        assert len(json.dumps(reply)) < 1000
+        assert set(reply["images"][0]) == {
+            "id",
+            "w",
+            "h",
+            "seed",
+            "steps",
+            "model",
+            "ref",
+        }
+
+    def test_a_text_reply_has_no_images(self, store: Store) -> None:
+        chat_id = make_chat(store)
+        reply = store.add_message(chat_id, "assistant", "words")
+        assert reply.images is None and reply.to_json()["images"] is None
+        assert store.messages(chat_id)[-1].images is None
+
+    def test_an_image_can_only_be_read_through_its_own_chat(self, store: Store) -> None:
+        mine, reply = make_image_chat(store)
+        other = make_chat(store, "other")
+        image_id = reply.images[0]["id"]
+        assert store.get_image(mine, image_id) is not None
+        assert store.get_image(other, image_id) is None
+        assert store.get_image(mine, "0123456789abcdef") is None
+        assert store.get_image("0123456789abcdef", image_id) is None
+
+    def test_the_stored_bytes_add_up(self, store: Store) -> None:
+        assert store.image_bytes_total() == 0
+        make_image_chat(store, b"a" * 1000)
+        chat_id, reply = make_image_chat(store, b"b" * 2500)
+        assert store.image_bytes_total() == 3500
+        store.delete_message(reply.id)
+        assert store.image_bytes_total() == 1000
+        store.delete_chat(chat_id)
+        assert store.image_bytes_total() == 1000
+
+    def test_a_reply_and_its_images_are_stored_together_or_not_at_all(
+        self, store: Store
+    ) -> None:
+        chat_id = make_chat(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.add_message(
+                chat_id, "assistant", "", images=[image(), image(width=None)]
+            )
+        assert [m.role for m in store.messages(chat_id)] == ["user"]
+        assert store.image_bytes_total() == 0
+
+    def test_an_edit_remembers_the_image_it_started_from(self, store: Store) -> None:
+        chat_id, first = make_image_chat(store)
+        reference = first.images[0]["id"]
+        edit = store.add_message(
+            chat_id, "assistant", "", images=[image(ref=reference)]
+        )
+        assert edit.images[0]["ref"] == reference
+        assert store.messages(chat_id)[-1].images[0]["ref"] == reference
+
+    def test_images_come_back_in_the_order_they_were_stored(self, store: Store) -> None:
+        chat_id = make_chat(store)
+        store.add_message(
+            chat_id, "assistant", "", images=[image(seed=1), image(seed=2)]
+        )
+        [reply] = store.messages(chat_id)[1:]
+        assert [i["seed"] for i in reply.images] == [1, 2]
+
+    def test_only_webp_can_be_stored(self, tmp_path: Path) -> None:
+        path = tmp_path / "chats.db"
+        s = Store(path)
+        make_image_chat(s)
+        s.close()
+        raw = sqlite3.connect(path)
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            raw.execute("UPDATE images SET mime = 'image/png'")
+        raw.close()
+
+
+def seeded_deletions(clock: Clock):
+    """Each way a chat or reply can be deleted, as a function of (store, chat id, reply)."""
+
+    def expire(s: Store, chat_id: str, reply) -> None:
+        clock.advance(days=31)
+        s.purge_expired(30)
+
+    return {
+        "delete_chat": lambda s, chat_id, reply: s.delete_chat(chat_id),
+        "delete_all": lambda s, chat_id, reply: s.delete_all(),
+        "purge_expired": expire,
+        "delete_message": lambda s, chat_id, reply: s.delete_message(reply.id),
+    }
+
+
+DELETIONS = ["delete_chat", "delete_all", "purge_expired", "delete_message"]
+
+
+class TestImageRetention:
+    @pytest.mark.parametrize("how", DELETIONS)
+    def test_every_delete_path_takes_the_image_rows_with_it(
+        self, store: Store, clock: Clock, how: str
+    ) -> None:
+        chat_id, reply = make_image_chat(store, b"gone" * 100)
+        seeded_deletions(clock)[how](store, chat_id, reply)
+        assert store.image_bytes_total() == 0
+        assert store.get_image(chat_id, reply.images[0]["id"]) is None
+
+    @pytest.mark.parametrize("how", ["delete_chat", "delete_message"])
+    def test_deleting_one_chat_or_reply_leaves_other_images_alone(
+        self, store: Store, clock: Clock, how: str
+    ) -> None:
+        keep_chat, keep = make_image_chat(store, b"keep" * 100)
+        chat_id, reply = make_image_chat(store, b"gone" * 100)
+        seeded_deletions(clock)[how](store, chat_id, reply)
+        assert store.get_image(keep_chat, keep.images[0]["id"]) == (
+            "image/webp",
+            b"keep" * 100,
+        )
+        assert store.image_bytes_total() == 400
+
+    def test_expiry_takes_only_the_images_of_expired_chats(
+        self, store: Store, clock: Clock
+    ) -> None:
+        old_chat, old = make_image_chat(store, b"old!" * 100)
+        clock.advance(days=20)
+        fresh_chat, fresh = make_image_chat(store, b"new!" * 100)
+        clock.advance(days=11)
+        assert store.purge_expired(30) == 1
+        assert store.get_image(old_chat, old.images[0]["id"]) is None
+        assert store.get_image(fresh_chat, fresh.images[0]["id"]) is not None
+
+    @pytest.mark.parametrize("how", DELETIONS)
+    def test_deleted_image_bytes_are_gone_from_the_file_and_the_wal(
+        self, tmp_path: Path, clock: Clock, how: str
+    ) -> None:
+        path = tmp_path / "chats.db"
+        s = Store(path, clock)
+        # Many pages of it, so most of the image sits in overflow pages. The search string is short
+        # because each overflow page starts with a pointer that breaks up anything longer than a page.
+        marker = b"pixel-marker-5c0de-"
+        chat_id, reply = make_image_chat(s, b"RIFF\0\0\0\0WEBP" + marker * 1000)
+        wal = tmp_path / "chats.db-wal"
+        assert marker in path.read_bytes() + wal.read_bytes()
+        seeded_deletions(clock)[how](s, chat_id, reply)
+        raw = path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+        s.close()
+        assert marker not in raw
+
+
+def user_version(raw: sqlite3.Connection) -> int:
+    return raw.execute("PRAGMA user_version").fetchone()[0]
+
+
+def rows_of(path: Path) -> dict[str, list[tuple]]:
+    """Every row of the version 1 tables, read without going through the app."""
+    raw = sqlite3.connect(path)
+    try:
+        return {
+            table: raw.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            for table in ("chats", "messages", "settings")
+        }
+    finally:
+        raw.close()
+
+
+def schema_of(path: Path) -> list[tuple]:
+    raw = sqlite3.connect(path)
+    try:
+        return raw.execute(
+            "SELECT name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+    finally:
+        raw.close()
+
+
+def v1_copy(tmp_path: Path, name: str = "chats.db") -> Path:
+    path = tmp_path / name
+    shutil.copy(FIXTURES / "chats-v1.db", path)
+    return path
+
+
+class TestMigration:
+    """chats-v1.db is a real version 1 file: the db.py of commit 77f7456 wrote it in a temporary directory.
+
+    It holds 3 chats (done, stopped and failed replies, thinking, usage, a long message with accents) and
+    8 messages, plus the standing instructions.
+    """
+
+    def test_the_fixture_really_is_a_version_1_file(self, tmp_path: Path) -> None:
+        raw = sqlite3.connect(v1_copy(tmp_path))
+        tables = {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert user_version(raw) == 1
+        assert tables == {"chats", "messages", "settings"}
+        assert [
+            raw.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            for t in ("chats", "messages", "settings")
+        ] == [3, 8, 1]
+        raw.close()
+
+    def test_opening_it_adds_the_images_table_and_keeps_every_row(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        before = rows_of(v1_copy(tmp_path, "untouched.db"))
+        path = v1_copy(tmp_path)
+        Store(path, clock).close()
+        assert rows_of(path) == before
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == 2
+        assert {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'images%'"
+            )
+        } == {"images", "images_message", "images_chat"}
+        assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        raw.close()
+
+    def test_an_upgraded_database_stores_and_serves_images(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        s = Store(v1_copy(tmp_path), clock)
+        trip = next(c for c in s.list_chats() if c.title == "Plan the trip")
+        reply = s.add_message(
+            trip.id, "assistant", "", images=[image(b"after-the-upgrade")]
+        )
+        assert s.get_image(trip.id, reply.images[0]["id"]) == (
+            "image/webp",
+            b"after-the-upgrade",
+        )
+        assert len(s.messages(trip.id)) == 5
+        s.delete_chat(trip.id)
+        assert s.image_bytes_total() == 0
+        assert len(s.list_chats()) == 2
+        s.close()
+
+    def test_an_upgraded_file_has_the_schema_of_a_new_one(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        fresh = tmp_path / "fresh.db"
+        Store(fresh, clock).close()
+        upgraded = v1_copy(tmp_path)
+        Store(upgraded, clock).close()
+        assert schema_of(upgraded) == schema_of(fresh)
+        raw = sqlite3.connect(fresh)
+        assert user_version(raw) == 2
+        raw.close()
+
+    def test_opening_a_version_2_file_again_changes_nothing(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        Store(path, clock).close()
+        schema, rows = schema_of(path), rows_of(path)
+        Store(path, clock).close()
+        assert (schema_of(path), rows_of(path)) == (schema, rows)
+
+    def test_rolling_back_by_hand_keeps_the_cascade(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        """PRAGMA user_version = 1 lets the old code open the file; it ignores the images table, and the
+        foreign key still removes the rows when the old code deletes a chat."""
+        path = tmp_path / "chats.db"
+        s = Store(path, clock)
+        make_image_chat(s)
+        s.close()
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA user_version = 1")
+        raw.execute("PRAGMA foreign_keys = ON")
+        raw.execute("DELETE FROM chats")
+        assert raw.execute("SELECT count(*) FROM images").fetchone()[0] == 0
+        raw.close()

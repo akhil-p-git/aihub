@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 from datetime import date
 from decimal import Decimal
@@ -14,6 +15,7 @@ from aihub_web.catalog import (
     ollama_model,
     openrouter_efforts,
     openrouter_model,
+    trusted_socket,
 )
 from aihub_web.config import Config, OllamaConfig
 from helpers import KEYS, OLLAMA, OPENROUTER, TODAY, handler_for
@@ -336,3 +338,199 @@ class TestCatalog:
         await catalog.refresh()
         assert catalog.get("ollama/qwen3:8b").name == "qwen3:8b"
         assert catalog.get("ollama/nope") is None
+
+
+IMAGES_UNAVAILABLE = "Image engine isn't set up. See README, Images."
+
+
+class TestTrustedSocket:
+    def test_a_socket_in_a_private_directory_we_own(self, bound_socket: str) -> None:
+        assert trusted_socket(bound_socket)
+
+    def test_a_missing_socket_is_not_trusted(self, socket_dir: Path) -> None:
+        assert not trusted_socket(str(socket_dir / "engine.sock"))
+        assert not trusted_socket(str(socket_dir / "absent" / "engine.sock"))
+
+    @pytest.mark.parametrize("mode", [0o750, 0o705, 0o755, 0o777])
+    def test_a_directory_others_can_reach_is_not_trusted(
+        self, bound_socket: str, mode: int
+    ) -> None:
+        directory = Path(bound_socket).parent
+        directory.chmod(mode)
+        try:
+            assert not trusted_socket(bound_socket)
+        finally:
+            directory.chmod(0o700)
+
+    def test_a_regular_file_is_not_a_socket(self, socket_dir: Path) -> None:
+        path = socket_dir / "engine.sock"
+        path.write_text("not a socket")
+        assert not trusted_socket(str(path))
+
+    def test_a_symlink_to_a_socket_is_not_trusted(
+        self, bound_socket: str, socket_dir: Path
+    ) -> None:
+        link = socket_dir / "link.sock"
+        link.symlink_to(bound_socket)
+        assert not trusted_socket(str(link))
+
+    def test_a_symlinked_directory_is_not_trusted(
+        self, bound_socket: str, socket_dir: Path
+    ) -> None:
+        link = socket_dir / "dir-link"
+        link.symlink_to(socket_dir)
+        assert not trusted_socket(str(link / "engine.sock"))
+
+    @staticmethod
+    def owned_by_someone_else(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        """Make lstat report `path` (and only it) as owned by another user."""
+        real = os.lstat
+
+        def lstat(target, *args, **kwargs):
+            result = real(target, *args, **kwargs)
+            if str(target) != path:
+                return result
+            fields = list(result)
+            fields[4] += 1  # st_uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+
+    def test_a_socket_someone_else_owns_is_not_trusted(
+        self, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.owned_by_someone_else(monkeypatch, bound_socket)
+        assert not trusted_socket(bound_socket)
+
+    def test_a_directory_someone_else_owns_is_not_trusted(
+        self, bound_socket: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.owned_by_someone_else(monkeypatch, str(Path(bound_socket).parent))
+        assert not trusted_socket(bound_socket)
+
+
+@pytest.mark.anyio
+class TestImageModels:
+    async def refreshed(self, tmp_path: Path, **config) -> Catalog:
+        catalog = make_catalog(tmp_path, handler_for(), **config)
+        await catalog.refresh()
+        return catalog
+
+    async def test_nothing_changes_while_no_socket_is_set(self, tmp_path: Path) -> None:
+        catalog = await self.refreshed(tmp_path)
+        assert not any(m.output == "image" for m in catalog.models())
+        assert set(catalog.status) == {"ollama", "openrouter", "anthropic"}
+        assert catalog.images_status() == "off"
+        for model in catalog.models():
+            assert not {"output", "edits", "est_s", "note"} & set(model.to_json())
+
+    async def test_image_models_are_listed_after_the_local_ones_when_a_socket_is_set(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        catalog = await self.refreshed(tmp_path, images={"socket": bound_socket})
+        models = catalog.models()
+        images = [m for m in models if m.output == "image"]
+        assert [m.id for m in images] == ["images/zimage", "images/klein4b"]
+        assert all(m.provider == "images" and m.tier == "local" for m in images)
+        assert all(m.available and m.reason is None for m in images)
+        assert all(m.efforts is None and m.price_in is None for m in images)
+        tiers = [m.tier for m in models]
+        assert tiers == sorted(tiers, key=["free", "local", "paid"].index)
+        assert models.index(images[0]) > max(
+            i for i, m in enumerate(models) if m.provider == "ollama"
+        )
+        assert catalog.get("images/klein4b") == images[1]
+        assert catalog.images_status() == "ok"
+        assert catalog.status["images"] == "ok"
+
+    async def test_image_models_say_what_they_are_in_json(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        catalog = await self.refreshed(tmp_path, images={"socket": bound_socket})
+        zimage = catalog.get("images/zimage").to_json()
+        klein = catalog.get("images/klein4b").to_json()
+        assert (zimage["output"], zimage["edits"], zimage["note"]) == (
+            "image",
+            False,
+            "Best with text in images.",
+        )
+        assert klein["edits"] is True
+        assert zimage["est_s"] == {"square": 23, "wide": 12, "tall": 12}
+        assert (zimage["name"], zimage["tier"], zimage["efforts"]) == (
+            "Z-Image Turbo",
+            "local",
+            None,
+        )
+        json.dumps([zimage, klein])
+
+    async def test_the_models_come_from_the_settings(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        only = {
+            "id": "only",
+            "name": "Only one",
+            "steps": 3,
+            "est_s": {"square": 2, "wide": 1, "tall": 1},
+        }
+        catalog = await self.refreshed(
+            tmp_path, images={"socket": bound_socket, "models": [only]}
+        )
+        assert [m.id for m in catalog.models() if m.output == "image"] == [
+            "images/only"
+        ]
+
+    async def test_a_missing_socket_lists_them_unavailable_with_the_fix(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        catalog = await self.refreshed(
+            tmp_path, images={"socket": str(socket_dir / "engine.sock")}
+        )
+        images = [m for m in catalog.models() if m.output == "image"]
+        assert len(images) == 2
+        assert not any(m.available for m in images)
+        assert {m.reason for m in images} == {IMAGES_UNAVAILABLE}
+        assert catalog.status["images"] == "down"
+
+    async def test_trust_is_checked_on_every_listing_not_cached(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        catalog = await self.refreshed(tmp_path, images={"socket": bound_socket})
+        assert catalog.get("images/zimage").available
+        directory = Path(bound_socket).parent
+        directory.chmod(0o755)
+        try:
+            assert not catalog.get("images/zimage").available
+            assert catalog.status["images"] == "down"
+        finally:
+            directory.chmod(0o700)
+        assert catalog.get("images/zimage").available
+
+    async def test_an_image_model_is_never_the_default(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        """Even when it is the only usable model, and even though it counts as local."""
+        catalog = make_catalog(
+            tmp_path,
+            handler_for(ollama_up=False, openrouter_up=False),
+            environ={},
+            images={"socket": bound_socket},
+        )
+        await catalog.refresh()
+        assert any(m.available and m.output == "image" for m in catalog.models())
+        assert catalog.default_model() is None
+
+    async def test_the_default_is_unchanged_with_image_models_present(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        with_images = await self.refreshed(tmp_path, images={"socket": bound_socket})
+        without = await self.refreshed(tmp_path)
+        assert with_images.default_model() == without.default_model()
+        assert with_images.default_model() == "openrouter/google/gemma-4-31b-it:free"
+
+    async def test_a_missing_openrouter_key_does_not_touch_image_models(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        catalog = await self.refreshed(
+            tmp_path, environ={}, images={"socket": bound_socket}
+        )
+        assert catalog.get("images/zimage").available

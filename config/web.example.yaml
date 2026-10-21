@@ -58,6 +58,26 @@ anthropic:
       input_per_mtok: "4"
       output_per_mtok: "20"
 
+# Image generation on this PC. Leave `socket` unset and nothing about it shows up. Set it to the image engine's
+# Unix socket (for example /run/user/1000/aihub-images/engine.sock) and the model picker gains a "Makes images"
+# group. The first model is the default image model; `id` is also the engine's name for it.
+images:
+  socket: null
+  models:
+    - id: zimage
+      name: Z-Image Turbo
+      steps: 8
+      edits: false
+      note: Best with text in images.
+      est_s: {square: 23, wide: 12, tall: 12}   # warm seconds per shape: the picker's hint, and (3x plus a minute) each image's time limit
+    - id: klein4b
+      name: FLUX.2 klein 4B
+      steps: 4
+      sample_method: euler
+      edits: true
+      note: Fast drafts; edits images; text often misspelled.
+      est_s: {square: 8, wide: 5, tall: 5}
+
 limits:
   max_message_chars: 100000
   cloud_context_tokens: 60000   # earlier messages are left out beyond this, to bound the cost of a turn

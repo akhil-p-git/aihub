@@ -1,0 +1,54 @@
+[Unit]
+Description=aihub image engine host (launcher for sd-server, no network)
+# A launcher bug can fail this unit; engine failures never do (the launcher answers 503 and stays up).
+# After three failed starts in a minute: systemctl --user reset-failed aihub-images.socket aihub-images.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+# Started by the first connection to aihub-images.socket. It exits by itself after 5 idle minutes and
+# systemd starts it again on the next connection, so there is no Restart= and no [Install] section.
+ExecStart=/usr/bin/python3 -I %h/work/Dev/aihub/systemd/images/launcher.py %h/work/Dev/aihub/systemd/images/models.json
+WorkingDirectory=%h/work/aihub-images/models
+TimeoutStopSec=10
+# No ExecStartPre, ExecStartPost or JoinsNamespaceOf: in a user manager they run outside the private
+# network namespace (see docs/adr/0001-image-engine.md). The launcher checks that only "lo" exists.
+PrivateNetwork=yes
+PrivateUsers=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/work/aihub-images %h/work/Dev/aihub/systemd/images
+PrivateDevices=yes
+BindPaths=/dev/nvidiactl /dev/nvidia0 /dev/nvidia-uvm -/dev/nvidia-uvm-tools
+# Emptied: /run, because PrivateUsers keeps the user's groups, so the host's sockets there (the Docker API,
+# the system bus) would stay reachable; /var/log and the core dump directory, which ACLs let the user read
+# (journals, the memory of other processes); /dev/pts, which PrivateDevices binds from the host and which
+# holds the user's open terminals. The launcher's own socket arrives as an inherited descriptor.
+TemporaryFileSystem=/dev/shm /run:ro /var/log:ro /var/lib/systemd/coredump:ro /dev/pts:ro
+PrivatePIDs=yes
+PrivateIPC=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET
+KeyringMode=private
+# No core files: a crashed engine would otherwise leave its memory (prompts included) in systemd-coredump.
+LimitCORE=0
+UMask=0077
+Environment=CUDA_CACHE_DISABLE=1
+MemoryMax=12G
+OOMScoreAdjust=500
+Nice=5
+# Not set: MemoryDenyWriteExecute and SystemCallFilter. CUDA's JIT and driver ioctls are untested under them.

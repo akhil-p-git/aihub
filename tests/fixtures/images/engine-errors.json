@@ -1,0 +1,96 @@
+{
+  "vram_short": {
+    "what": "Z-Image at 1024 with an Ollama model resident: the engine could not make 2129 MB available",
+    "source": "fail/f1_zimage_1024_documented.log lines 202-208",
+    "lines": [
+      "[W] model manager memory on CUDA0: reported free 950.31 MB / total 7887.25 MB, tracked weights 0.00 MB / other runtime 0.00 MB / current runtime 0.00 MB --- model_manager.cpp:1784",
+      "[W] model manager cannot make enough memory available on CUDA0: need 2129.16 MB device / 1617.16 MB budget, available 950.31 MB device / unlimited budget --- model_manager.cpp:2013",
+      "[E] z_image segment 1/36 (z_image.prelude) failed during weight preparation --- ggml_runner.cpp:898",
+      "[E] diffusion model compute failed --- diffusion_engine.cpp:2751",
+      "[E] Diffusion model sampling failed --- diffusion_engine.cpp:2972",
+      "[E] sampling for image 1/1 failed after 0.05s --- image.cpp:904",
+      "[E] generate failed --- main.cpp:940"
+    ]
+  },
+  "vram_short_with_budget": {
+    "what": "Z-Image at 1024 on the default auto-fit, with Ollama resident: the log also names a smaller budget, and the free figure is 942.75 MB",
+    "source": "fail/f2_zimage_1024_autofit.log lines 209-215",
+    "lines": [
+      "[W] model manager memory on CUDA0: reported free 942.75 MB / total 7887.25 MB, tracked weights 0.00 MB / other runtime 0.00 MB / current runtime 0.00 MB --- model_manager.cpp:1784",
+      "[W] model manager cannot make enough memory available on CUDA0: need 2129.16 MB device / 1617.16 MB budget, available 942.75 MB device / 452.31 MB budget --- model_manager.cpp:2013",
+      "[E] z_image segment 1/36 (z_image.prelude) failed during weight preparation --- ggml_runner.cpp:898",
+      "[E] diffusion model compute failed --- diffusion_engine.cpp:2751",
+      "[E] Diffusion model sampling failed --- diffusion_engine.cpp:2972",
+      "[E] sampling for image 1/1 failed after 0.03s --- image.cpp:904",
+      "[E] generate failed --- main.cpp:940"
+    ]
+  },
+  "vram_short_other_model": {
+    "what": "FLUX.3 at 1024 under an external VRAM squeeze",
+    "source": "failure_flux3_1024_cli_vram_squeeze.log lines 66-71",
+    "lines": [
+      "[W] model manager cannot make enough memory available on CUDA0: need 512.00 MB device / 794.39 MB budget, available 499.00 MB device / unlimited budget --- model_manager.cpp:2013",
+      "[E] flux3 segment 1/1 (graph) failed during weight preparation --- ggml_runner.cpp:898",
+      "[E] diffusion model compute failed --- diffusion_engine.cpp:2751",
+      "[E] Diffusion model sampling failed --- diffusion_engine.cpp:2972",
+      "[E] sampling for image 1/1 failed after 21.91s --- image.cpp:904",
+      "[E] generate failed --- main.cpp:940"
+    ]
+  },
+  "gpu_busy_or_unavailable": {
+    "what": "The GPU refused CUDA allocations (the wedge): klein 9B could not allocate its text encoder",
+    "source": "A_klein9b_1024_p3-maxvram3.log lines 33, 52, 54, 60-66",
+    "lines": [
+      "[W] ggml: ggml_backend_cuda_device_get_memory: cudaMemGetInfo failed (CUDA-capable device(s) is/are busy or unavailable), returning 0/0",
+      "[W] ggml: ggml_backend_cuda_device_get_memory: cudaMemGetInfo failed (CUDA-capable device(s) is/are busy or unavailable), returning 0/0",
+      "[W] ggml: ggml_backend_cuda_device_get_memory: cudaMemGetInfo failed (CUDA-capable device(s) is/are busy or unavailable), returning 0/0",
+      "[E] ggml: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 333.84 MiB on device 0: cudaMalloc failed: CUDA-capable device(s) is/are busy or unavailable",
+      "[E] ggml: ggml_backend_buft_alloc_buffer_n_default: failed to allocate CUDA0 buffer of size 350060544",
+      "[E] model manager alloc compute params backend buffer failed, num_tensors = 1 --- model_manager.cpp:570",
+      "[E] qwen3 segment 1/29 (llm.text.prelude) failed during weight preparation --- ggml_runner.cpp:898",
+      "[E] LLM prompt encoding failed --- conditioner.hpp:2288",
+      "[E] failed to encode prompt --- image.cpp:448",
+      "[E] generate failed --- main.cpp:940"
+    ]
+  },
+  "model_files_wrong": {
+    "what": "A start failure: the text encoder file lacks tensors (the GPU was also unreachable, as the first two warnings show)",
+    "source": "errors/missing_llm.log lines 8, 9, 19-21",
+    "lines": [
+      "[W] ggml: ggml_backend_cuda_device_get_memory: cudaMemGetInfo failed (CUDA-capable device(s) is/are busy or unavailable), returning 0/0",
+      "[W] auto-fit: no GPU memory budget available; using CPU --- backend_fit.cpp:446",
+      "[E] Conditioner model tensor 'text_encoders.llm.model.embed_tokens.weight' not in model metadata --- model_manager.cpp:763",
+      "[E] Conditioner model tensor 'text_encoders.llm.model.norm.weight' not in model metadata --- model_manager.cpp:763",
+      "[E] model metadata validation failed --- diffusion_engine.cpp:1386"
+    ]
+  },
+  "wrong_vae": {
+    "what": "A start failure: a VAE file of the wrong shape",
+    "source": "server/s3.server.log lines 38-45",
+    "lines": [
+      "[E] VAE tensor 'first_stage_model.decoder.conv_in.weight' has wrong shape in model metadata: got [3, 3, 16, 512], expected [3, 3, 32, 512] --- model_manager.cpp:793",
+      "[E] VAE tensor 'first_stage_model.encoder.conv_out.bias' has wrong shape in model metadata: got [32, 1, 1, 1], expected [64, 1, 1, 1] --- model_manager.cpp:793",
+      "[E] VAE tensor 'first_stage_model.encoder.conv_out.weight' has wrong shape in model metadata: got [3, 3, 512, 32], expected [3, 3, 512, 64] --- model_manager.cpp:793",
+      "[E] VAE tensor 'first_stage_model.post_quant_conv.bias' not in model metadata --- model_manager.cpp:763",
+      "[E] VAE tensor 'first_stage_model.post_quant_conv.weight' not in model metadata --- model_manager.cpp:763",
+      "[E] VAE tensor 'first_stage_model.quant_conv.bias' not in model metadata --- model_manager.cpp:763",
+      "[E] VAE tensor 'first_stage_model.quant_conv.weight' not in model metadata --- model_manager.cpp:763",
+      "[E] model metadata validation failed --- diffusion_engine.cpp:1386"
+    ]
+  },
+  "vae_out_of_memory_abort": {
+    "what": "A 1280 px image: CUDA ran out of memory in the VAE and the engine aborted (the line that names a source path was left out)",
+    "source": "A_zimage-turbo_1280_res-scale.log lines 201 and 203",
+    "lines": [
+      "[E] ggml: CUDA error: out of memory",
+      "[E] ggml:   cuMemCreate(&handle, reserve_size, &prop, 0)"
+    ]
+  },
+  "vae_retry_warning": {
+    "what": "A warning only: the VAE ran out of memory and the engine retried with tiling",
+    "source": "server/s3.server.log line 267",
+    "lines": [
+      "[W] VAE decode ran out of memory; retrying with spatial tiling --- backend_fit.cpp:518"
+    ]
+  }
+}

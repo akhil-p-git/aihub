@@ -1,9 +1,11 @@
-"""The models the picker offers: installed Ollama models, OpenRouter's free list and pinned paid models, and Claude."""
+"""The models the picker offers: installed Ollama models, OpenRouter's free list and pinned paid models, Claude, and
+the image models of the settings where an image engine is set up."""
 
 import asyncio
 import json
 import logging
 import os
+import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -23,6 +25,7 @@ CLAUDE_LEVELS = ("low", "medium", "high", "xhigh", "max")
 OLLAMA_TTL = 15.0
 OPENROUTER_TTL = 6 * 3600.0
 NOT_CHAT_MODELS = ("content-safety", "guard")
+IMAGES_UNAVAILABLE = "Image engine isn't set up. See README, Images."
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,12 +63,18 @@ class ModelInfo:
     size_bytes: int | None = None
     available: bool = True
     reason: str | None = None
+    # Image models only: `output` is "image" (a text model makes replies), `edits` says whether it can change a
+    # picture it is given, `est_s` is its warm seconds per shape and `note` one line on what it is good at.
+    output: str = "text"
+    edits: bool = False
+    est_s: Mapping[str, int | float] | None = None
+    note: str | None = None
 
     def to_json(self) -> dict[str, object]:
         price = None
         if self.price_in is not None and self.price_out is not None:
             price = {"in": _plain(self.price_in), "out": _plain(self.price_out)}
-        return {
+        data: dict[str, object] = {
             "id": self.id,
             "provider": self.provider,
             "name": self.name,
@@ -81,10 +90,40 @@ class ModelInfo:
             "available": self.available,
             "reason": self.reason,
         }
+        if self.output == "image":
+            # Text models carry none of these, so the list is unchanged where nothing makes images.
+            data |= {
+                "output": self.output,
+                "edits": self.edits,
+                "est_s": self.est_s,
+                "note": self.note,
+            }
+        return data
 
 
 def _plain(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def trusted_socket(path: str) -> bool:
+    """Whether `path` is a socket we may send prompts to: ours, in a directory only we can enter.
+
+    lstat never follows a link, so a symlink in either place fails the type checks. The directory's mode
+    matters because anyone who could write there could swap the socket for their own. This never connects.
+    """
+    try:
+        directory = os.lstat(os.path.dirname(path))
+        leaf = os.lstat(path)
+    except OSError:
+        return False
+    me = os.geteuid()
+    return (
+        stat.S_ISDIR(directory.st_mode)
+        and directory.st_uid == me
+        and directory.st_mode & 0o077 == 0
+        and stat.S_ISSOCK(leaf.st_mode)
+        and leaf.st_uid == me
+    )
 
 
 def ollama_efforts(show: Mapping[str, object]) -> Effort | None:
@@ -237,10 +276,25 @@ class Catalog:
         self._ollama_at = 0.0
         self._openrouter_at = 0.0
         self._claude = [claude_model(m) for m in cfg.anthropic.models]
-        self.status: dict[str, dict[str, object]] = {
+        self._status: dict[str, dict[str, object]] = {
             name: {"ok": None, "error": None}
             for name in ("ollama", "openrouter", "anthropic")
         }
+
+    @property
+    def status(self) -> dict[str, object]:
+        """Health per provider, as the UI shows it. `images` is listed only where image generation is set up."""
+        status: dict[str, object] = dict(self._status)
+        if (images := self.images_status()) != "off":
+            status["images"] = images
+        return status
+
+    def images_status(self) -> str:
+        """Image generation is 'off' (no socket in the settings), 'down' (the socket can't be trusted) or 'ok'."""
+        socket_path = self._cfg.images.socket
+        if not socket_path:
+            return "off"
+        return "ok" if trusted_socket(socket_path) else "down"
 
     async def refresh(self, *, force: bool = False) -> None:
         """Re-read what is stale. Failures are recorded in `status`, never raised."""
@@ -276,9 +330,9 @@ class Catalog:
             names = {str(tag["name"]) for tag in tags}
             self._shows = {k: v for k, v in self._shows.items() if k in names}
         except (httpx2.HTTPError, ValueError, KeyError, ExceptionGroup) as err:
-            self.status["ollama"] = {"ok": False, "error": _describe(err)}
+            self._status["ollama"] = {"ok": False, "error": _describe(err)}
         else:
-            self.status["ollama"] = {"ok": True, "error": None}
+            self._status["ollama"] = {"ok": True, "error": None}
         self._ollama_at = time.monotonic()
 
     async def _refresh_openrouter(self) -> None:
@@ -295,11 +349,11 @@ class Catalog:
             ]
             self._write_cache()
         except (httpx2.HTTPError, ValueError, KeyError, TypeError) as err:
-            self.status["openrouter"] = {"ok": False, "error": _describe(err)}
+            self._status["openrouter"] = {"ok": False, "error": _describe(err)}
             if not self._openrouter_raw:
                 self._openrouter_raw = self._read_cache()
         else:
-            self.status["openrouter"] = {"ok": True, "error": None}
+            self._status["openrouter"] = {"ok": True, "error": None}
         self._openrouter_at = time.monotonic()
 
     def _write_cache(self) -> None:
@@ -352,9 +406,9 @@ class Catalog:
             "openrouter": (self._cfg.openrouter.key_env, "OpenRouter"),
             "anthropic": (self._cfg.anthropic.key_env, "Anthropic"),
         }
-        ollama_down = self.status["ollama"]["ok"] is False
+        ollama_down = self._status["ollama"]["ok"] is False
         out = []
-        for model in [*free, *local, *paid_or, *self._claude]:
+        for model in [*free, *local, *self._image_models(), *paid_or, *self._claude]:
             route = routes.get(model.provider)
             if model.provider == "ollama" and ollama_down:
                 model = replace(
@@ -369,12 +423,36 @@ class Catalog:
             out.append(model)
         return out
 
+    def _image_models(self) -> list[ModelInfo]:
+        """The models in the settings, only when a socket is named; usable only while that socket is trusted."""
+        images = self._cfg.images
+        if not images.socket:
+            return []
+        ready = trusted_socket(images.socket)
+        return [
+            ModelInfo(
+                id=f"images/{model.id}",
+                provider="images",
+                native=model.id,
+                name=model.name,
+                tier="local",
+                available=ready,
+                reason=None if ready else IMAGES_UNAVAILABLE,
+                output="image",
+                edits=model.edits,
+                est_s=model.est_s.model_dump(),
+                note=model.note or None,
+            )
+            for model in images.models
+        ]
+
     def get(self, model_id: str) -> ModelInfo | None:
         return next((m for m in self.models() if m.id == model_id), None)
 
     def default_model(self) -> str | None:
         """The first configured default that is usable, else any usable free or local model."""
-        usable = {m.id: m for m in self.models() if m.available}
+        # An image model counts as local, but a chat can't start on one.
+        usable = {m.id: m for m in self.models() if m.available and m.output != "image"}
         for model_id in self._cfg.default_models:
             if model_id in usable:
                 return model_id

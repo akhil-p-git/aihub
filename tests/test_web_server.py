@@ -3,6 +3,7 @@ import hmac
 import json
 import secrets
 import socket
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +19,22 @@ from aihub_web.db import Store
 from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
 from aihub_web.security import CSP, SecurityMiddleware
 from aihub_web.server import create_app, ndjson
-from helpers import HANG, KEYS, TODAY, Clock, FakeProvider, handler_for, make_service
+from helpers import (
+    FAST_PACING,
+    HANG,
+    HOLD,
+    KEYS,
+    TODAY,
+    Clock,
+    FakeEngine,
+    FakeProvider,
+    finished,
+    generating,
+    handler_for,
+    make_service,
+    serve_engine,
+    webp,
+)
 from starlette.testclient import TestClient
 from test_web_shutdown import free_port
 
@@ -42,6 +58,7 @@ def build(tmp_path: Path, environ=KEYS, **config):
         transport=httpx2.MockTransport(handler_for()),
         providers=fakes,
         today=lambda: TODAY,
+        image_pacing=FAST_PACING,
     )
     return app, fakes
 
@@ -771,3 +788,495 @@ class TestStaticFiles:
         html = api.get("/").text
         for path in re.findall(r'(?:href|src)="(/[^"]+)"', html):
             assert api.get(path).status_code == 200, path
+
+
+IMAGE = "images/zimage"
+
+
+@pytest.fixture
+def image_api(tmp_path: Path, socket_dir: Path):
+    """The app with image generation on, talking to a FakeEngine over a real Unix socket."""
+    path = str(socket_dir / "engine.sock")
+    engine = FakeEngine()
+    with serve_engine(engine, path):
+        app, fakes = build(tmp_path, images={"socket": path})
+        with TestClient(app, base_url=BASE) as client:
+            client.fakes, client.engine = fakes, engine
+            yield client
+
+
+def make_image(client: TestClient, text: str = "a red fox", **body) -> tuple[str, dict]:
+    """Make one image through the API; returns the chat id and the image's metadata."""
+    events = reply(client, text=text, model=IMAGE, **body)
+    assert events[-1]["t"] == "done", events[-1]
+    return events[0]["chat"]["id"], events[-1]["message"]["images"][0]
+
+
+class TestImageModelsInTheLists:
+    def test_the_lists_are_unchanged_while_no_socket_is_set(
+        self, api: TestClient
+    ) -> None:
+        data = api.get("/api/bootstrap").json()
+        assert set(data) == {
+            "models",
+            "default_model",
+            "providers",
+            "chats",
+            "settings",
+            "retention_days",
+        }
+        assert set(data["providers"]) == {"ollama", "openrouter", "anthropic"}
+        assert not any(m["provider"] == "images" for m in data["models"])
+        for model in data["models"]:
+            assert not {"output", "edits", "est_s", "note"} & set(model)
+        assert data["default_model"] == FREE
+        assert (
+            api.get("/api/models").json()["providers"].keys()
+            == data["providers"].keys()
+        )
+
+    def test_a_socket_adds_the_image_models_and_a_status(
+        self, image_api: TestClient
+    ) -> None:
+        data = image_api.get("/api/bootstrap").json()
+        images = [m for m in data["models"] if m["provider"] == "images"]
+        assert [m["id"] for m in images] == ["images/zimage", "images/klein4b"]
+        assert images[0]["est_s"] == {"square": 23, "wide": 12, "tall": 12}
+        assert (images[0]["output"], images[0]["edits"], images[1]["edits"]) == (
+            "image",
+            False,
+            True,
+        )
+        assert all(m["available"] for m in images)
+        assert data["providers"]["images"] == "ok"
+        assert set(data) == {
+            "models",
+            "default_model",
+            "providers",
+            "chats",
+            "settings",
+            "retention_days",
+        }
+        assert data["default_model"] == FREE
+        assert image_api.get("/api/models").json()["providers"]["images"] == "ok"
+
+    def test_a_socket_that_is_not_there_lists_them_unavailable(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        app, _ = build(tmp_path, images={"socket": str(socket_dir / "absent.sock")})
+        with TestClient(app, base_url=BASE) as client:
+            data = client.get("/api/bootstrap").json()
+            images = [m for m in data["models"] if m["provider"] == "images"]
+            assert len(images) == 2 and not any(m["available"] for m in images)
+            assert (
+                images[0]["reason"] == "Image engine isn't set up. See README, Images."
+            )
+            assert data["providers"]["images"] == "down"
+            refused = client.post("/api/chat", json={"text": "a fox", "model": IMAGE})
+            assert refused.status_code == 409
+            assert refused.json()["error"]["code"] == "model_unavailable"
+
+
+class TestMakingImagesOverHttp:
+    def test_a_prompt_streams_progress_and_then_the_finished_reply(
+        self, image_api: TestClient
+    ) -> None:
+        with image_api.stream(
+            "POST",
+            "/api/chat",
+            json={"text": "a red fox", "model": IMAGE, "shape": "wide"},
+        ) as response:
+            assert response.headers["content-type"].startswith("application/x-ndjson")
+            assert response.headers["cache-control"] == "no-cache, no-transform"
+            events = [json.loads(line) for line in response.iter_lines() if line]
+        kinds = [e["t"] for e in events]
+        assert kinds[0] == "chat" and kinds[-1] == "done"
+        progress = [e for e in events if e["t"] == "progress"]
+        assert {"t": "progress", "phase": "queued"} in progress
+        assert {"t": "progress", "phase": "sampling", "step": 1, "steps": 8} in progress
+        assert progress[-1] == {"t": "progress", "phase": "finishing"}
+        message = events[-1]["message"]
+        assert message["status"] == "done" and message["content"] == ""
+        [image] = message["images"]
+        assert (
+            image["w"],
+            image["h"],
+            image["steps"],
+            image["model"],
+            image["ref"],
+        ) == (
+            1024,
+            576,
+            8,
+            IMAGE,
+            None,
+        )
+        assert set(message["usage"]) == {"total_ms", "steps", "shape"}
+
+    def test_the_chat_lists_the_image_without_its_bytes(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, image = make_image(image_api)
+        detail = image_api.get(f"/api/chats/{chat_id}").json()
+        assert [m["images"] for m in detail["messages"]] == [None, [image]]
+        assert len(json.dumps(detail)) < 2000
+        assert detail["pending_image"] is None
+
+    def test_the_image_comes_back_as_webp_with_the_headers_that_keep_it_private(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, image = make_image(image_api, shape="wide")
+        response = image_api.get(f"/api/chats/{chat_id}/images/{image['id']}")
+        assert response.status_code == 200
+        assert response.content == webp("wide")
+        headers = response.headers
+        assert headers["content-type"] == "image/webp"
+        assert headers["cache-control"] == "no-store"
+        assert headers["x-content-type-options"] == "nosniff"
+        assert headers["cross-origin-resource-policy"] == "same-origin"
+        assert headers["content-security-policy"] == CSP
+        assert (
+            headers["content-disposition"]
+            == f'inline; filename="aihub-{image["id"]}.webp"'
+        )
+        assert "access-control-allow-origin" not in headers
+
+    def test_an_image_is_found_only_under_its_own_chat_and_its_own_id(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, image = make_image(image_api)
+        other_chat, other_image = make_image(image_api, text="another")
+        for path in (
+            f"/api/chats/{other_chat}/images/{image['id']}",  # another chat's id
+            f"/api/chats/{chat_id}/images/{other_image['id']}",
+            f"/api/chats/{chat_id}/images/0123456789abcdef",  # unknown image
+            "/api/chats/0123456789abcdef/images/" + image["id"],  # unknown chat
+            f"/api/chats/{chat_id}/images/{image['id'].upper()}",  # not the canonical form
+            f"/api/chats/{chat_id}/images/{image['id'][:15]}",
+            f"/api/chats/{chat_id}/images/{image['id']}0",
+            f"/api/chats/{chat_id}/images/..%2f..%2fetc%2fpasswd",
+            f"/api/chats/{chat_id}/images/%2e%2e",
+            f"/api/chats/{chat_id.upper()}/images/{image['id']}",
+        ):
+            response = image_api.get(path)
+            assert response.status_code == 404, path
+            if response.headers["content-type"].startswith("application/json"):
+                assert response.json()["error"]["code"] in ("no_image", "not_found")
+        missing = image_api.get(f"/api/chats/{chat_id}/images/0123456789abcdef")
+        assert missing.json()["error"] == {
+            "code": "no_image",
+            "message": "That image no longer exists.",
+        }
+
+    def test_only_ids_in_the_canonical_form_are_looked_up(
+        self, image_api: TestClient, tmp_path: Path
+    ) -> None:
+        """Ids the app makes are 16 lowercase hex digits. A row that somehow has another kind is not served."""
+        raw = sqlite3.connect(tmp_path / "chats.db")
+        raw.execute("PRAGMA foreign_keys = ON")
+        # (chat id, image id): one pair with a wrong image id, one with a wrong chat id
+        rows = [
+            ("abcdef0123456789", "FEDCBA9876543210"),
+            ("ABCDEF0123456790", "feedface00112233"),
+        ]
+        for n, (chat_id, image_id) in enumerate(rows):
+            raw.execute(
+                "INSERT INTO chats VALUES (?, 't', 'm', NULL, 1, 1)", (chat_id,)
+            )
+            raw.execute(
+                "INSERT INTO messages VALUES (?, ?, 1, 'assistant', '', NULL, NULL, NULL, NULL, 'done', NULL, 1)",
+                (f"message{n:09d}", chat_id),
+            )
+            raw.execute(
+                "INSERT INTO images VALUES (?, ?, ?, 'image/webp', 1, 1, 1, 1, 'm', NULL, 4, X'52494646', 1)",
+                (image_id, f"message{n:09d}", chat_id),
+            )
+        raw.commit()
+        raw.close()
+        for chat_id, image_id in rows:
+            response = image_api.get(f"/api/chats/{chat_id}/images/{image_id}")
+            assert response.status_code == 404, (chat_id, image_id)
+
+    @pytest.mark.parametrize("site", ["cross-site", "same-site"])
+    def test_a_fetch_from_another_site_is_refused(
+        self, image_api: TestClient, site: str
+    ) -> None:
+        chat_id, image = make_image(image_api)
+        path = f"/api/chats/{chat_id}/images/{image['id']}"
+        refused = image_api.get(path, headers={"sec-fetch-site": site})
+        assert refused.status_code == 403
+        assert refused.content != webp("square")
+        assert refused.headers["cache-control"] == "no-store"
+        for allowed in ("same-origin", "none"):
+            assert (
+                image_api.get(path, headers={"sec-fetch-site": allowed}).status_code
+                == 200
+            )
+        assert (
+            image_api.get(path).status_code == 200
+        )  # no header: not a browser's embedded fetch
+
+    def test_the_launch_token_covers_the_image_route(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        path = str(socket_dir / "engine.sock")
+        with serve_engine(FakeEngine(), path):
+            app, _ = build(
+                tmp_path,
+                environ={**KEYS, "AIHUB_LAUNCH_TOKEN": TOKEN},
+                images={"socket": path},
+            )
+            with TestClient(app, base_url=BASE) as client:
+                with client.stream(
+                    "POST",
+                    "/api/chat",
+                    json={"text": "a fox", "model": IMAGE},
+                    headers=cookie(TOKEN),
+                ) as response:
+                    events = [
+                        json.loads(line) for line in response.iter_lines() if line
+                    ]
+                chat_id = events[0]["chat"]["id"]
+                image_id = events[-1]["message"]["images"][0]["id"]
+                url = f"/api/chats/{chat_id}/images/{image_id}"
+                assert client.get(url).status_code == 401
+                assert client.get(url, headers=cookie("wrong")).status_code == 401
+                assert client.get(url, headers=cookie(TOKEN)).status_code == 200
+                assert (
+                    client.post(f"/api/chats/{chat_id}/image/stop").status_code == 401
+                )
+
+    def test_deleting_the_chat_deletes_its_images(self, image_api: TestClient) -> None:
+        chat_id, image = make_image(image_api)
+        url = f"/api/chats/{chat_id}/images/{image['id']}"
+        assert image_api.get(url).status_code == 200
+        assert image_api.delete(f"/api/chats/{chat_id}").status_code == 204
+        assert image_api.get(url).status_code == 404
+
+    def test_deleting_everything_deletes_every_image(
+        self, image_api: TestClient
+    ) -> None:
+        make_image(image_api, text="one")
+        chat_id, second = make_image(image_api, text="two")
+        image_api.request("DELETE", "/api/chats", json={"confirm": "delete-all"})
+        assert (
+            image_api.get(f"/api/chats/{chat_id}/images/{second['id']}").status_code
+            == 404
+        )
+
+    def test_retrying_replaces_the_image(self, image_api: TestClient) -> None:
+        events = reply(image_api, text="a red fox", model=IMAGE)
+        chat_id, user_id = events[0]["chat"]["id"], events[0]["user"]["id"]
+        old = events[-1]["message"]["images"][0]["id"]
+        again = reply(image_api, chat_id=chat_id, regenerate_for=user_id)
+        new = again[-1]["message"]["images"][0]["id"]
+        assert new != old
+        assert image_api.get(f"/api/chats/{chat_id}/images/{old}").status_code == 404
+        assert image_api.get(f"/api/chats/{chat_id}/images/{new}").status_code == 200
+
+    @pytest.mark.parametrize(
+        ("body", "status", "code"),
+        [
+            ({"text": "x" * 2001, "model": IMAGE}, 413, "prompt_too_long"),
+            ({"text": "a fox", "model": IMAGE, "shape": "huge"}, 422, "invalid"),
+            ({"text": "hi", "model": FREE, "shape": "wide"}, 422, "invalid"),
+            (
+                {"text": "a fox", "model": IMAGE, "reference": "0123456789abcdef"},
+                422,
+                "invalid",
+            ),
+        ],
+    )
+    def test_refusals_come_as_json_before_anything_streams(
+        self, image_api: TestClient, body: dict, status: int, code: str
+    ) -> None:
+        response = image_api.post("/api/chat", json=body)
+        assert (response.status_code, response.json()["error"]["code"]) == (
+            status,
+            code,
+        )
+        assert image_api.get("/api/chats").json()["chats"] == []
+
+
+class TestStoppingAnImage:
+    def test_there_is_nothing_to_stop_when_nothing_is_being_made(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, _ = make_image(image_api)
+        response = image_api.post(f"/api/chats/{chat_id}/image/stop")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "no_job"
+        unknown = image_api.post("/api/chats/0123456789abcdef/image/stop")
+        assert (unknown.status_code, unknown.json()["error"]["code"]) == (
+            404,
+            "no_chat",
+        )
+
+    def test_the_body_is_empty_or_an_empty_object_and_nothing_else(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, _ = make_image(image_api)
+        url = f"/api/chats/{chat_id}/image/stop"
+        assert (
+            image_api.post(url, json={}).status_code == 404
+        )  # no job, but the body was fine
+        assert image_api.post(url, json={"force": True}).status_code == 422
+        assert (
+            image_api.post(
+                url, content="[]", headers={"content-type": "application/json"}
+            ).status_code
+            == 422
+        )
+        assert (
+            image_api.post(
+                url, content="{nope", headers={"content-type": "application/json"}
+            ).status_code
+            == 400
+        )
+        assert (
+            image_api.post(
+                url, content="x", headers={"content-type": "text/plain"}
+            ).status_code
+            == 415
+        )
+
+    def test_without_image_generation_the_route_has_nothing_to_stop(
+        self, api: TestClient
+    ) -> None:
+        chat_id = reply(api, text="hi", model=FREE)[0]["chat"]["id"]
+        response = api.post(f"/api/chats/{chat_id}/image/stop")
+        assert (response.status_code, response.json()["error"]["code"]) == (
+            404,
+            "no_job",
+        )
+        assert "pending_image" not in api.get(f"/api/chats/{chat_id}").json()
+
+    def test_a_cross_site_post_is_refused_like_any_write(
+        self, image_api: TestClient
+    ) -> None:
+        chat_id, _ = make_image(image_api)
+        response = image_api.post(
+            f"/api/chats/{chat_id}/image/stop", headers={"sec-fetch-site": "cross-site"}
+        )
+        assert response.status_code == 403
+
+
+@contextlib.contextmanager
+def running(app):
+    """The app on a real socket, because a browser dropping the connection can't be simulated in-process."""
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app, host="127.0.0.1", port=0, log_level="warning", lifespan="on"
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started, "server did not start"
+    port = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.fixture
+def live_images(tmp_path: Path, socket_dir: Path):
+    path = str(socket_dir / "engine.sock")
+    engine = FakeEngine()
+    with serve_engine(engine, path):
+        app, _ = build(tmp_path, images={"socket": path})
+        with running(app) as base:
+            yield base, engine
+
+
+class TestImagesOnARealServer:
+    def test_dropping_the_connection_still_saves_the_image(self, live_images) -> None:
+        """Starlette cancels the response task when the client goes away. The job is not part of it."""
+        base, engine = live_images
+        engine.scripts.append([generating(1, 8), HOLD, finished])
+        with httpx2.Client(base_url=base, timeout=10) as client:
+            with client.stream(
+                "POST", "/api/chat", json={"text": "a red fox", "model": IMAGE}
+            ) as response:
+                lines = response.iter_lines()
+                chat_id = json.loads(next(lines))["chat"]["id"]
+                assert json.loads(next(lines))["phase"] == "sampling"
+            # leaving the block closed the connection in the middle of the job
+            pending = client.get(f"/api/chats/{chat_id}").json()["pending_image"]
+            assert pending["phase"] == "sampling" and pending["model"] == IMAGE
+            engine.release()
+
+            def saved():
+                messages = client.get(f"/api/chats/{chat_id}").json()["messages"]
+                return messages if len(messages) == 2 else None
+
+            reply_message = wait_for(saved)[1]
+            assert reply_message["status"] == "done"
+            image_id = reply_message["images"][0]["id"]
+            assert client.get(
+                f"/api/chats/{chat_id}/images/{image_id}"
+            ).content == webp("square")
+            assert client.get(f"/api/chats/{chat_id}").json()["pending_image"] is None
+        assert (engine.kills, engine.cancels) == (0, [])
+
+    def test_stop_ends_the_open_stream_with_a_stopped_reply(self, live_images) -> None:
+        base, engine = live_images
+        engine.scripts.append([generating(2, 8)])
+        with httpx2.Client(base_url=base, timeout=10) as client:
+            with client.stream(
+                "POST", "/api/chat", json={"text": "a fox", "model": IMAGE}
+            ) as response:
+                lines = response.iter_lines()
+                chat_id = json.loads(next(lines))["chat"]["id"]
+                assert json.loads(next(lines)) == {
+                    "t": "progress",
+                    "phase": "sampling",
+                    "step": 2,
+                    "steps": 8,
+                }
+                pending = client.get(f"/api/chats/{chat_id}").json()["pending_image"]
+                assert pending == {
+                    "model": IMAGE,
+                    "shape": "square",
+                    "phase": "sampling",
+                    "step": 2,
+                    "steps": 8,
+                }
+                stop = client.post(f"/api/chats/{chat_id}/image/stop")
+                assert (stop.status_code, stop.json()) == (200, {"stopping": True})
+                rest = [json.loads(line) for line in lines if line]
+            assert (
+                rest[-1]["t"] == "done" and rest[-1]["message"]["status"] == "stopped"
+            )
+            assert rest[-1]["message"]["images"] is None
+            assert client.get(f"/api/chats/{chat_id}").json()["pending_image"] is None
+            assert client.post(f"/api/chats/{chat_id}/image/stop").status_code == 404
+        assert (engine.kills, engine.cancels) == (1, [])
+
+    def test_a_second_browser_window_sees_the_job_and_can_stop_it(
+        self, live_images
+    ) -> None:
+        base, engine = live_images
+        engine.scripts.append([generating(1, 8)])
+        with (
+            httpx2.Client(base_url=base, timeout=10) as first,
+            httpx2.Client(base_url=base, timeout=10) as second,
+            first.stream(
+                "POST", "/api/chat", json={"text": "a fox", "model": IMAGE}
+            ) as response,
+        ):
+            lines = response.iter_lines()
+            chat_id = json.loads(next(lines))["chat"]["id"]
+            next(lines)
+            assert (
+                second.get(f"/api/chats/{chat_id}").json()["pending_image"]["phase"]
+                == "sampling"
+            )
+            assert second.post(f"/api/chats/{chat_id}/image/stop").json() == {
+                "stopping": True
+            }
+            assert json.loads(list(lines)[-1])["message"]["status"] == "stopped"
