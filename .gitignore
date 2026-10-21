@@ -8,3 +8,8 @@ node_modules
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+# the desktop app's build output, downloads and build tools (desktop/build/ stays tracked for icons)
+/desktop/dist/
+/desktop/payload/
+/desktop/.tools/
+/desktop/.cache/
