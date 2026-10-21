@@ -58,17 +58,24 @@ function rig() {
   const window = {
     destroyed: false,
     url: "",
+    // What the next loadFile lands on instead of the page it was asked for, as when Chromium shows its error page.
+    landOn: null,
     onLoadURL: null,
+    webContents: Object.assign(new EventEmitter(), {
+      getURL: () => window.url,
+    }),
     isDestroyed() {
       return this.destroyed;
     },
     async loadFile(path) {
       log.push({ type: "loadFile", path });
-      this.url = pathToFileURL(path).href;
+      this.url = this.landOn ?? pathToFileURL(path).href;
+      this.webContents.emit("did-stop-loading");
     },
     async loadURL(url) {
       log.push({ type: "loadURL", url, originAtCall: state.lifecycle.origin });
       this.url = url;
+      this.webContents.emit("did-stop-loading");
       await this.onLoadURL?.(url);
     },
   };
@@ -400,6 +407,144 @@ describe("a backend that ends", () => {
     await settle();
     assert.equal(r.all("loadFile").length, 0);
     assert.equal(r.dialogs.length, 1, "the dialog does not need the window");
+  });
+});
+
+describe("the loading page", () => {
+  const STALE = "http://127.0.0.1:4001/";
+  const loadingUrl = pathToFileURL(LOADING_FILE).href;
+
+  /** The window as the real one is when a backend ends: the old page's load settles after the loading page's. */
+  const staleSettles = (r, url = STALE) => {
+    r.window.url = url;
+    r.window.webContents.emit("did-stop-loading");
+  };
+
+  it("is put back when a navigation that began before the exit settles on another page", async () => {
+    const r = rig();
+    await r.up();
+    r.backend.die();
+    await settle();
+    assert.equal(r.window.url, loadingUrl);
+    assert.equal(r.all("loadFile").length, 1);
+
+    // A reload had started just before the exit; its request was cancelled and Chromium shows its error page.
+    staleSettles(r);
+    await settle();
+    assert.equal(r.all("loadFile").length, 2);
+    assert.equal(r.window.url, loadingUrl);
+  });
+
+  it("is put back when the load that was asked for was replaced and the replacement settles elsewhere", async () => {
+    const r = rig();
+    await r.up();
+    const loadFile = r.window.loadFile;
+    r.window.loadFile = async (path) => {
+      r.log.push({ type: "loadFile", path });
+      throw new Error("ERR_ABORTED (-3) loading 'file:///app/src/loading.html'");
+    };
+    r.backend.die();
+    await settle();
+    assert.equal(r.all("loadFile").length, 1);
+
+    r.window.loadFile = loadFile;
+    staleSettles(r);
+    await settle();
+    assert.equal(r.all("loadFile").length, 2);
+    assert.equal(r.window.url, loadingUrl);
+  });
+
+  it("is left alone while it is what the window shows", async () => {
+    const r = rig();
+    await r.up();
+    r.backend.die();
+    await settle();
+    r.window.webContents.emit("did-stop-loading");
+    r.window.webContents.emit("did-stop-loading");
+    await settle();
+    assert.equal(r.all("loadFile").length, 1);
+  });
+
+  it("is not asked for while a backend is up", async () => {
+    const r = rig();
+    await r.up();
+    staleSettles(r, "http://127.0.0.1:4001/some/other/page");
+    await settle();
+    assert.equal(r.all("loadFile").length, 0);
+  });
+
+  it("is not asked for while the app is leaving", async () => {
+    const r = rig();
+    await r.up();
+    r.backend.die();
+    await settle();
+    r.log.length = 0;
+    r.lifecycle.beginQuit();
+    staleSettles(r);
+    await settle();
+    assert.equal(r.all("loadFile").length, 0);
+  });
+
+  it("is not asked for from a window that is gone", async () => {
+    const r = rig();
+    await r.up();
+    r.backend.die();
+    await settle();
+    r.log.length = 0;
+    r.window.destroyed = true;
+    assert.doesNotThrow(() => staleSettles(r));
+    await settle();
+    assert.equal(r.all("loadFile").length, 0);
+  });
+
+  it("is asked for again at most five times in a row, then left", async () => {
+    const r = rig();
+    await r.up();
+    r.window.landOn = STALE; // the loading page itself cannot be shown
+    r.backend.die();
+    await settle();
+    assert.equal(r.all("loadFile").length, 6, "the first ask and five more");
+    staleSettles(r);
+    await settle();
+    assert.equal(r.all("loadFile").length, 6, "no further ask");
+  });
+
+  it("counts the repeats again once the loading page has been shown", async () => {
+    const r = rig();
+    await r.up();
+    r.window.landOn = STALE;
+    r.backend.die();
+    await settle();
+    assert.equal(r.all("loadFile").length, 6);
+
+    r.window.landOn = null;
+    r.window.url = loadingUrl;
+    r.window.webContents.emit("did-stop-loading"); // shown at last
+    r.window.landOn = STALE;
+    staleSettles(r);
+    await settle();
+    assert.equal(r.all("loadFile").length, 11, "five more repeats, from a budget that started over");
+  });
+
+  it("is not mistaken for a page whose address merely contains its name", async () => {
+    const r = rig();
+    await r.up();
+    r.backend.die();
+    await settle();
+    for (const url of [
+      `${loadingUrl}.evil`,
+      "file:///elsewhere/loading.html",
+      "file:///app/src/",
+      "about:blank",
+      "",
+      "chrome-error://chromewebdata/",
+    ]) {
+      const before = r.all("loadFile").length;
+      r.window.landOn = null;
+      staleSettles(r, url);
+      await settle();
+      assert.equal(r.all("loadFile").length, before + 1, url);
+    }
   });
 });
 

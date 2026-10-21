@@ -4,10 +4,14 @@
 // Nothing here imports Electron. main.js hands in the window, the cookie jar, the dialog and the way out, so that
 // node:test can drive all of it with stand-ins.
 
+import { fileURLToPath } from "node:url";
 import { allowsRequest } from "./policy.js";
 
 /** The cookie that carries the launch token the backend demands on every /api/ request. */
 export const COOKIE = "aihub_t";
+
+// How many times in a row the loading page is asked for again after something else has settled in its place.
+const LOADING_REPEATS = 5;
 
 export class Lifecycle {
   #backend;
@@ -22,6 +26,7 @@ export class Lifecycle {
   #origin = null;
   #quitting = false;
   #offering = false;
+  #repeats = 0;
 
   /**
    * - backend: the Backend: start(), origin, logPath and an "exit" event.
@@ -63,6 +68,7 @@ export class Lifecycle {
   /** Shows the first backend. What goes wrong ends in a dialog, or in `fail`; the promise never rejects. */
   start() {
     this.#backend.on("exit", (event) => this.#ended(event));
+    this.#window.webContents.on("did-stop-loading", () => this.#keepLoadingPage());
     return this.#show()
       .catch((error) => {
         if (!this.#quitting) return this.#offerRestart("aihub could not start its backend.", error.message);
@@ -91,6 +97,29 @@ export class Lifecycle {
 
   #showLoadingPage() {
     if (!this.#window.isDestroyed()) this.#window.loadFile(this.#loadingFile).catch(() => {});
+  }
+
+  /**
+   * While there is no backend the window belongs on the loading page, and whatever settles in it is looked at. A
+   * navigation that began just before the backend ended (a reload) can finish after the loading page has loaded: on
+   * the old page, or on the error page Chromium shows for the request the guard cancelled.
+   */
+  #keepLoadingPage() {
+    if (this.#origin !== null || this.#quitting || this.#window.isDestroyed()) return;
+    if (this.#showsLoadingPage()) {
+      this.#repeats = 0;
+    } else if (this.#repeats < LOADING_REPEATS) {
+      this.#repeats++;
+      this.#showLoadingPage();
+    }
+  }
+
+  #showsLoadingPage() {
+    try {
+      return fileURLToPath(this.#window.webContents.getURL()) === this.#loadingFile;
+    } catch {
+      return false; // not a file: address at all
+    }
   }
 
   /**
