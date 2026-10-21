@@ -1037,6 +1037,31 @@ describe("a stand-in interpreter", () => {
       });
     }
 
+    // node:util parseEnv reads a value of nothing but blanks as running on into the next line, so that the next
+    // line's name and value become this one's value, and the next key is lost.
+    for (const [name, blank, newline] of [
+      ["a space", " ", "\n"],
+      ["two spaces", "  ", "\n"],
+      ["a tab", "\t", "\n"],
+      ["a space before a CRLF", " ", "\r\n"],
+    ]) {
+      it(`reads a key left blank with ${name} as blank, and still finds the next key`, async (t) => {
+        const keys = [`AIHUB_OPENROUTER_KEY=${blank}`, `AIHUB_ANTHROPIC_KEY=${ANTHROPIC_KEY}`, ""].join(newline);
+        const r = rig(t, { keys });
+        const { files, body, written } = recorder(r);
+        r.useStub(body);
+        const { backend } = r.make();
+        await backend.start();
+        await written();
+        assert.ok(!names(files.env).includes("AIHUB_OPENROUTER_KEY"), "a blank key was passed on");
+        assert.equal(valueOf(files.env, "AIHUB_ANTHROPIC_KEY"), ANTHROPIC_KEY);
+        const crossed = lines(files.env).filter(
+          (line) => line.includes("AIHUB_ANTHROPIC_KEY=") && !line.startsWith("AIHUB_ANTHROPIC_KEY="),
+        );
+        assert.deepEqual(crossed, [], "one key's name and value ended up inside another variable");
+      });
+    }
+
     it("never writes to the child's stdin and never closes it while the child lives", async (t) => {
       const r = rig(t);
       const received = join(r.dir, "stdin.txt");

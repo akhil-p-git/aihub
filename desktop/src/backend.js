@@ -311,7 +311,9 @@ export class Backend extends EventEmitter {
       if (error.code !== "ENOENT") this.#note(`could not read the keys file (${error.code})`);
       return {};
     }
-    return parseEnv(text);
+    // parseEnv reads a value of nothing but blanks as running on into the next line, so that the next key's name and
+    // value become this one's value and the next key is lost. Blanks at the end of a line mean nothing here.
+    return parseEnv(text.replace(/[ \t]+$/gm, ""));
   }
 
   get #statePath() {
