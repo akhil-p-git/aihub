@@ -22,6 +22,9 @@ from aihub_web.db import Store
 from test_web_shutdown import free_port, wait_until_up
 
 ROOT = Path(__file__).parents[1]
+# Seconds the desktop shell waits after SIGTERM before it kills the backend. A stop mid-reply takes the
+# 5 s grace period of the server plus its own shutdown.
+STOP_BUDGET = 7
 READY = re.compile(r'\{"event":"ready","port":[0-9]+\}\n')
 RETURNS_WITHOUT_STARTING = """
 import uvicorn
@@ -208,17 +211,7 @@ def interrupt(app: Launch) -> None:
     app.process.send_signal(signal.SIGINT)
 
 
-@pytest.mark.parametrize(
-    ("stop", "statuses", "forbidden"),
-    [
-        (close_stdin, (0, -signal.SIGTERM), ("Traceback", "Fatal Python error")),
-        # SIGINT does not end the process the instant the shutdown is done, as SIGTERM does, so the
-        # request uvicorn cancelled after the grace period logs its CancelledError. uvicorn.run did too.
-        (interrupt, (0,), ("KeyboardInterrupt", "Fatal Python error")),
-    ],
-    ids=["stdin closed", "SIGINT"],
-)
-def test_stopping_mid_reply_keeps_the_partial_reply(
+def stop_mid_reply(
     launch,
     occupied_port: int,
     tmp_path: Path,
@@ -226,6 +219,8 @@ def test_stopping_mid_reply_keeps_the_partial_reply(
     statuses: tuple[int, ...],
     forbidden: tuple[str, ...],
 ) -> None:
+    """Stop a server the way the desktop shell runs it while a reply streams: the exit is clean and
+    what had streamed is kept as a stopped reply."""
     app = launch(
         stdin=subprocess.PIPE,
         config_port=occupied_port,
@@ -244,13 +239,17 @@ def test_stopping_mid_reply_keeps_the_partial_reply(
             streamed += event["d"] if event["t"] == "text" else ""
             if streamed.count("word") >= 3:
                 break
-        deadline = time.monotonic() + 7
+        stopped_at = time.monotonic()
         stop(app)
-        # Once the grace period is over the server drops the connection mid-stream.
+        # Once the grace period is over the server drops the connection mid-stream. Reading stops at the
+        # budget, or a server that held the connection for longer would still look as if it stopped in time.
         with contextlib.suppress(httpx2.RemoteProtocolError):
             for _ in lines:
-                pass
-    status = app.process.wait(timeout=max(deadline - time.monotonic(), 0.1))
+                if time.monotonic() - stopped_at > STOP_BUDGET:
+                    break
+    status = app.process.wait(timeout=20)
+    took = time.monotonic() - stopped_at
+    assert took <= STOP_BUDGET, f"stopping took {took:.1f} s; log:\n{app.log()}"
     assert status in statuses, app.log()
 
     log = app.log()
@@ -267,11 +266,39 @@ def test_stopping_mid_reply_keeps_the_partial_reply(
         store.close()
 
 
+def test_closing_stdin_stops_the_server_and_keeps_the_partial_reply(
+    launch, occupied_port: int, tmp_path: Path
+) -> None:
+    stop_mid_reply(
+        launch,
+        occupied_port,
+        tmp_path,
+        close_stdin,
+        statuses=(0, -signal.SIGTERM),
+        forbidden=("Traceback", "Fatal Python error"),
+    )
+
+
+def test_sigint_mid_reply_keeps_the_partial_reply(
+    launch, occupied_port: int, tmp_path: Path
+) -> None:
+    # SIGINT does not end the process the instant the shutdown is done, as SIGTERM does, so the request
+    # uvicorn cancelled after the grace period logs its CancelledError. uvicorn.run did too.
+    stop_mid_reply(
+        launch,
+        occupied_port,
+        tmp_path,
+        interrupt,
+        statuses=(0,),
+        forbidden=("KeyboardInterrupt", "Fatal Python error"),
+    )
+
+
 def test_closing_stdin_stops_an_idle_server_and_logs_why(launch) -> None:
     app = launch(stdin=subprocess.PIPE, AIHUB_PORT="0", AIHUB_EXIT_ON_STDIN_EOF="1")
     app.ready_line()
     close_stdin(app)
-    assert app.process.wait(timeout=7) in (0, -signal.SIGTERM), app.log()
+    assert app.process.wait(timeout=STOP_BUDGET) in (0, -signal.SIGTERM), app.log()
     log = app.log()
     assert "stdin closed, stopping" in log
     assert "Traceback" not in log and "Fatal Python error" not in log, log
