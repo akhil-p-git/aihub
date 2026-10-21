@@ -1,8 +1,9 @@
-// Builds the Python that the packaged desktop app starts its backend with: desktop/payload/<target>/.
+// Builds the Python that the packaged desktop app starts its backend with: desktop/payload/linux-x64/.
 //
-//   node scripts/build-backend.mjs <linux-x64>
+//   node scripts/build-backend.mjs
 //
-// The result is laid out as the app finds it under resources/backend/:
+// It takes no arguments and builds that one payload. The result is laid out as the app finds it under
+// resources/backend/:
 //
 //   bin/python3.12                                 CPython from python-build-standalone, pinned by sha256
 //   lib/python3.12/site-packages/aihub_web/        the app, with its static/ folder
@@ -10,8 +11,8 @@
 //
 // The steps: uv exports the locked runtime dependencies with their hashes; the pinned archive is downloaded
 // (https only, with a timeout) and checked against its sha256 before anything is extracted; uv installs the
-// wheels for the target platform; app/aihub_web is copied in; what the app does not need is pruned. All of it
-// happens in a work folder next to the result, which replaces desktop/payload/<target> only after every step
+// wheels for Linux x86_64 and Python 3.12; app/aihub_web is copied in; what the app does not need is pruned. All of
+// it happens in a work folder next to the result, which replaces desktop/payload/linux-x64 only after every step
 // has passed, so a failed or interrupted run never leaves something that looks like a payload.
 //
 // No binary from the archive or from a wheel is ever modified (no strip, no patchelf), so the payload holds the
@@ -57,17 +58,14 @@ const RELEASE_URL = `https://github.com/astral-sh/python-build-standalone/releas
 export const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_REDIRECTS = 5;
 
-// triple: the archive's platform and the value of uv's --python-platform.
-// host: the Node platform and architecture that can run the target's interpreter.
-// extension: the suffix of compiled modules (name.cpython-312-<extension>.so).
-export const TARGETS = Object.freeze({
-  "linux-x64": Object.freeze({
-    triple: "x86_64-unknown-linux-gnu",
-    sha256: "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91",
-    host: Object.freeze({ platform: "linux", arch: "x64" }),
-    extension: "x86_64-linux-gnu",
-  }),
-});
+// The one target. TARGET is the folder name under desktop/payload. TRIPLE is how python-build-standalone names the
+// platform in its archives, and the value of uv's --python-platform. ARCHIVE_SHA256 is what the release's
+// SHA256SUMS file lists for the archive. MODULE_SUFFIX ends the names of compiled modules, as in
+// name.cpython-312-<suffix>.so.
+export const TARGET = "linux-x64";
+export const TRIPLE = "x86_64-unknown-linux-gnu";
+export const ARCHIVE_SHA256 = "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91";
+const MODULE_SUFFIX = "x86_64-linux-gnu";
 
 const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(desktopDir, "..");
@@ -86,14 +84,9 @@ export class BuildError extends Error {
 // ---------------------------------------------------------------------------------------------------------------
 // The command line and the pins
 
-/** The target named by the command line, or a BuildError with status 2. */
-export function parseTarget(args) {
-  const names = Object.keys(TARGETS);
-  if (args.length !== 1) throw new BuildError(`usage: node scripts/build-backend.mjs <${names.join("|")}>`, 2);
-  if (!Object.hasOwn(TARGETS, args[0])) {
-    throw new BuildError(`unknown target "${args[0]}" (expected ${names.join(" or ")})`, 2);
-  }
-  return args[0];
+/** Throws a BuildError with status 2 and the usage line unless the command line is empty. */
+export function checkArguments(args) {
+  if (args.length > 0) throw new BuildError("usage: node scripts/build-backend.mjs (it takes no arguments)", 2);
 }
 
 /** Throws a BuildError with status 2 unless this machine is Linux on an x86-64 CPU. */
@@ -102,13 +95,13 @@ export function assertHost(platform = process.platform, arch = process.arch) {
   throw new BuildError(`must run on Linux x86_64, not ${platform} ${arch}`, 2);
 }
 
-export function archiveName(target) {
-  return `cpython-${PYTHON_VERSION}+${PBS_TAG}-${TARGETS[target].triple}-install_only_stripped.tar.gz`;
+export function archiveName() {
+  return `cpython-${PYTHON_VERSION}+${PBS_TAG}-${TRIPLE}-install_only_stripped.tar.gz`;
 }
 
 /** The asset URL; the + of the file name is written %2B, which is how GitHub lists it. */
-export function archiveUrl(target) {
-  return `${RELEASE_URL}/${encodeURIComponent(archiveName(target))}`;
+export function archiveUrl() {
+  return `${RELEASE_URL}/${encodeURIComponent(archiveName())}`;
 }
 
 /** Throws unless `url` is an https URL. Never prints the query, which may carry a signed token. */
@@ -236,13 +229,13 @@ export async function fetchVerified({ url, file, sha256, download = downloadFile
   return file;
 }
 
-/** The target's archive in the download cache: fetched only when the cache has no file with the pinned sha256. */
-function fetchArchive(target) {
+/** The archive in the download cache: fetched only when the cache has no file with the pinned sha256. */
+function fetchArchive() {
   return fetchVerified({
-    url: archiveUrl(target),
-    file: join(downloadsDir, archiveName(target)),
-    sha256: TARGETS[target].sha256,
-    report: (message) => log(target, message),
+    url: archiveUrl(),
+    file: join(downloadsDir, archiveName()),
+    sha256: ARCHIVE_SHA256,
+    report: log,
   });
 }
 
@@ -399,17 +392,16 @@ export function auditPayload(payload, required = []) {
  * What follows the installation of the app and its dependencies: prune, drop the RECORD lines of what the prune
  * removed, and check the result. Returns what the first two did. Throws when the check fails.
  */
-export function finishPayload(work, target) {
+export function finishPayload(work) {
   const pruned = prune(work);
   const trimmed = trimRecords(join(work, "lib", `python${PYTHON_MINOR}`, "site-packages"));
-  auditPayload(work, requiredFiles(target));
+  auditPayload(work, requiredFiles());
   return { pruned, trimmed };
 }
 
-export function requiredFiles(target) {
-  const { extension } = TARGETS[target];
+export function requiredFiles() {
   const site = `lib/python${PYTHON_MINOR}/site-packages`;
-  const tag = `cpython-${PYTHON_MINOR.replace(".", "")}-${extension}`;
+  const tag = `cpython-${PYTHON_MINOR.replace(".", "")}-${MODULE_SUFFIX}`;
   return [
     `bin/python${PYTHON_MINOR}`,
     `lib/python${PYTHON_MINOR}/os.py`,
@@ -576,19 +568,13 @@ export function readPythonVersion(work) {
   return version;
 }
 
-/** Whether this machine can run the target's interpreter. */
-export function canRunTarget(target, platform = process.platform, arch = process.arch) {
-  const { host } = TARGETS[target];
-  return host.platform === platform && host.arch === arch;
-}
-
 /**
- * The arguments of uv pip install for the target's wheels: only hashed wheels (the requirements come on stdin
- * with their hashes), copied rather than linked into uv's cache, for the target's platform and Python 3.12.
- * `python` is the interpreter that uv asks about the machine it runs on; without one uv looks for its own.
+ * The arguments of uv pip install: only hashed wheels (the requirements come on stdin with their hashes), copied
+ * rather than linked into uv's cache, chosen for Linux x86_64 and Python 3.12. `python` is the interpreter that uv
+ * asks about the machine it runs on: the payload's own.
  */
-export function uvInstallArgs(target, site, python = null) {
-  const args = [
+export function uvInstallArgs(site, python) {
+  return [
     "pip",
     "install",
     "--link-mode",
@@ -596,7 +582,7 @@ export function uvInstallArgs(target, site, python = null) {
     "--target",
     site,
     "--python-platform",
-    TARGETS[target].triple,
+    TRIPLE,
     "--python-version",
     PYTHON_MINOR,
     "--only-binary",
@@ -606,28 +592,20 @@ export function uvInstallArgs(target, site, python = null) {
     "--no-python-downloads",
     "-r",
     "-",
+    "--python",
+    python,
   ];
-  if (python) args.push("--python", python);
-  return args;
 }
 
-export async function installDependencies(target, work, requirements) {
+export async function installDependencies(work, requirements) {
   const site = join(work, "lib", `python${PYTHON_MINOR}`, "site-packages");
-  // uv needs some interpreter to ask about the host. The target's own is used when this machine can run it; for
-  // any other target uv finds one on the machine (UV_PYTHON picks it). uv may not download one: with no interpreter
-  // at all it would fetch a CPython that nothing here pins.
-  const python = canRunTarget(target) ? join(work, "bin", `python${PYTHON_MINOR}`) : null;
-  const args = uvInstallArgs(target, site, python);
+  // uv asks the payload's own interpreter about the machine; it runs here because main has checked the host.
+  const python = join(work, "bin", `python${PYTHON_MINOR}`);
   // Run from the temp folder, not from inside the repository: uv would read the repository's pyproject.toml
   // settings and look for its .venv there. PYTHONDONTWRITEBYTECODE keeps uv's query of the payload's own
   // interpreter from writing .pyc files into the payload.
   const env = { ...process.env, PYTHONDONTWRITEBYTECODE: "1" };
-  try {
-    await run("uv", args, { cwd: tmpdir(), env, input: requirements, what: "uv pip install" });
-  } catch (err) {
-    if (!(err instanceof BuildError) || !/No interpreter found/.test(err.message)) throw err;
-    throw new BuildError(`${err.message}; install a Python 3 or set UV_PYTHON to one (uv may not download one here)`);
-  }
+  await run("uv", uvInstallArgs(site, python), { cwd: tmpdir(), env, input: requirements, what: "uv pip install" });
   return readdirSync(site).filter((entry) => entry.endsWith(".dist-info") && !entry.startsWith("pip-")).length;
 }
 
@@ -653,32 +631,32 @@ export function measure(root) {
   return { files, symlinks, bytes };
 }
 
-const log = (target, message) => console.log(`build-backend: ${target}: ${message}`);
+const log = (message) => console.log(`build-backend: ${TARGET}: ${message}`);
 const mib = (bytes) => `${(bytes / 1048576).toFixed(1)} MiB`;
 const seconds = (since) => `${((Date.now() - since) / 1000).toFixed(1)} s`;
 const count = (n, noun) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
-async function buildTarget(target) {
+async function build() {
   const started = Date.now();
-  const finalDir = join(payloadDir, target);
+  const finalDir = join(payloadDir, TARGET);
   const requirements = await exportRequirements();
-  const archive = await fetchArchive(target);
+  const archive = await fetchArchive();
 
   let python;
   await buildAtomically(finalDir, async (work) => {
     await extract(archive, work);
     python = readPythonVersion(work);
-    const packages = await installDependencies(target, work, requirements);
-    log(target, `installed ${packages} locked packages for ${TARGETS[target].triple}`);
-    log(target, `copied aihub_web (${copyApp(work)} files)`);
-    const { pruned, trimmed } = finishPayload(work, target);
-    log(target, `pruned ${pruned.entries} entries (${mib(pruned.bytes)})`);
-    log(target, `dropped ${count(trimmed, "line")} for pruned files from RECORD files`);
+    const packages = await installDependencies(work, requirements);
+    log(`installed ${packages} locked packages for ${TRIPLE}`);
+    log(`copied aihub_web (${copyApp(work)} files)`);
+    const { pruned, trimmed } = finishPayload(work);
+    log(`pruned ${pruned.entries} entries (${mib(pruned.bytes)})`);
+    log(`dropped ${count(trimmed, "line")} for pruned files from RECORD files`);
   });
 
   const { files, symlinks, bytes } = measure(finalDir);
   const days = pbsAgeDays();
-  console.log(`target   ${target} (${TARGETS[target].triple})`);
+  console.log(`target   ${TARGET} (${TRIPLE})`);
   console.log(`python   ${python}, python-build-standalone ${PBS_TAG}, ${days} days old`);
   console.log(
     `payload  ${relative(repoRoot, finalDir)}: ${mib(bytes)}, ${count(files, "file")}, ${count(symlinks, "symlink")}`,
@@ -688,14 +666,14 @@ async function buildTarget(target) {
   if (warning) console.error(`build-backend: warning: ${warning}`);
 }
 
-/** Builds the payload for the target in `args`. Returns the exit status. */
+/** Builds the payload; `args` must be empty. Returns the exit status. */
 export async function main(args) {
   try {
-    const target = parseTarget(args);
+    checkArguments(args);
     assertHost();
     process.umask(0o022); // the modes of what is built should not depend on the caller's umask
     exitOnInterrupt();
-    await buildTarget(target);
+    await build();
     return 0;
   } catch (err) {
     if (err instanceof BuildError) {

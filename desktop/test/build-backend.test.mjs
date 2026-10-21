@@ -25,11 +25,13 @@ import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  ARCHIVE_SHA256,
   BuildError,
   DOWNLOAD_TIMEOUT_MS,
   PBS_TAG,
   PYTHON_VERSION,
-  TARGETS,
+  TARGET,
+  TRIPLE,
   ageWarning,
   archiveName,
   archiveUrl,
@@ -37,7 +39,7 @@ import {
   assertHttps,
   auditPayload,
   buildAtomically,
-  canRunTarget,
+  checkArguments,
   copyApp,
   downloadFile,
   exportRequirements,
@@ -47,7 +49,6 @@ import {
   finishPayload,
   installDependencies,
   measure,
-  parseTarget,
   pbsAgeDays,
   prune,
   readPythonVersion,
@@ -103,10 +104,10 @@ const elf = (...names) =>
   Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), ...names.map((name) => Buffer.from(`\0${name}\0`))]);
 
 describe("the pin table", () => {
-  it("has the linux-x64 target only, with its triple and a 64-hex sha256", () => {
-    assert.deepEqual(Object.keys(TARGETS), ["linux-x64"]);
-    assert.equal(TARGETS["linux-x64"].triple, "x86_64-unknown-linux-gnu");
-    assert.match(TARGETS["linux-x64"].sha256, /^[0-9a-f]{64}$/);
+  it("builds the folder linux-x64 for the platform x86_64-unknown-linux-gnu, pinned by a 64-hex sha256", () => {
+    assert.equal(TARGET, "linux-x64");
+    assert.equal(TRIPLE, "x86_64-unknown-linux-gnu");
+    assert.match(ARCHIVE_SHA256, /^[0-9a-f]{64}$/);
   });
 
   // A new release changes the tag, the version and the hash together, here and in the script.
@@ -117,18 +118,15 @@ describe("the pin table", () => {
 
   it("holds the sha256 value that the release's SHA256SUMS file lists for the Linux archive", () => {
     // https://github.com/astral-sh/python-build-standalone/releases/download/20261003/SHA256SUMS
-    assert.equal(TARGETS["linux-x64"].sha256, "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91");
+    assert.equal(ARCHIVE_SHA256, "731af898886c5f821890dc901eca3c651cca8e51fa7308c159d12a1194aeac91");
   });
 
   it("names the install_only_stripped archive of the pinned release", () => {
-    assert.equal(
-      archiveName("linux-x64"),
-      "cpython-3.12.15+20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-    );
+    assert.equal(archiveName(), "cpython-3.12.15+20261003-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz");
   });
 
   it("downloads over https from the release's asset path, with the + written as %2B", () => {
-    const url = new URL(archiveUrl("linux-x64"));
+    const url = new URL(archiveUrl());
     assert.equal(url.protocol, "https:");
     assert.equal(url.host, "github.com");
     assert.equal(
@@ -208,34 +206,26 @@ describe("verifyArchive", () => {
   });
 });
 
-describe("parseTarget", () => {
-  it("accepts the one target", () => {
-    assert.equal(parseTarget(["linux-x64"]), "linux-x64");
+describe("checkArguments", () => {
+  const usage = "usage: node scripts/build-backend.mjs (it takes no arguments)";
+
+  it("accepts an empty command line", () => {
+    assert.doesNotThrow(() => checkArguments([]));
   });
 
-  it("refuses a missing or an extra argument with status 2 and the usage line", () => {
-    for (const args of [[], ["linux-x64", "linux-x64"]]) {
-      assert.throws(
-        () => parseTarget(args),
-        (err) =>
-          err instanceof BuildError &&
-          err.status === 2 &&
-          err.message === "usage: node scripts/build-backend.mjs <linux-x64>",
-        JSON.stringify(args),
-      );
-    }
-  });
-
-  it("refuses an unknown target with status 2 and says what is accepted", () => {
+  it("refuses any argument with status 2 and the usage line, the target that older versions took included", () => {
     const names = ["toString", "__proto__", "constructor", "hasOwnProperty", ""]; // keys every object has
-    for (const name of ["linux-arm64", "--help", ...names]) {
+    for (const args of [
+      ["linux-x64"],
+      ["linux-arm64"],
+      ["--help"],
+      ["linux-x64", "linux-x64"],
+      ...names.map((n) => [n]),
+    ]) {
       assert.throws(
-        () => parseTarget([name]),
-        (err) =>
-          err instanceof BuildError &&
-          err.status === 2 &&
-          err.message === `unknown target "${name}" (expected linux-x64)`,
-        JSON.stringify(name),
+        () => checkArguments(args),
+        (err) => err instanceof BuildError && err.status === 2 && err.message === usage,
+        JSON.stringify(args),
       );
     }
   });
@@ -268,11 +258,11 @@ describe("assertHost", () => {
 describe("running the script", () => {
   // The script runs with a uv that fails at once. A run that these tests expect to be refused then cannot go on to
   // build a payload in the real desktop/payload folder if the refusal is ever lost: it ends at uv with another status.
+  const uvSaid = "uv ran, so the script did not stop before the build";
   function runScript(args, nodeArgs = []) {
     const bin = join(scratch, "uv-that-fails");
     mkdirSync(bin, { recursive: true });
-    const stub = '#!/bin/sh\necho "uv ran, so the script did not stop before the build" >&2\nexit 99\n';
-    writeFileSync(join(bin, "uv"), stub, { mode: 0o755 });
+    writeFileSync(join(bin, "uv"), `#!/bin/sh\necho "${uvSaid}" >&2\nexit 99\n`, { mode: 0o755 });
     const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` };
     return spawnSync(process.execPath, [...nodeArgs, script, ...args], { encoding: "utf8", env });
   }
@@ -287,25 +277,27 @@ describe("running the script", () => {
       ["freebsd", "x64"],
       ["linux", "arm64"],
     ]) {
-      const run = runScript(["linux-x64"], [pretendHost(platform, arch)]);
+      const run = runScript([], [pretendHost(platform, arch)]);
       assert.equal(run.status, 2, run.stderr);
       assert.equal(run.stdout, "");
       assert.equal(run.stderr, `build-backend: must run on Linux x86_64, not ${platform} ${arch}\n`);
     }
   });
 
-  it("exits 2 with a one-line message for an unknown target", () => {
-    const run = runScript(["linux-arm64"]);
-    assert.equal(run.status, 2, run.stderr);
-    assert.equal(run.stdout, "");
-    assert.match(run.stderr, /unknown target "linux-arm64"/);
-    assert.equal(run.stderr.trim().split("\n").length, 1);
+  it("exits 2 with a one-line usage for any argument, before it builds anything", () => {
+    for (const args of [["linux-x64"], ["--help"], [""], ["linux-x64", "linux-x64"]]) {
+      const run = runScript(args);
+      assert.equal(run.status, 2, run.stderr);
+      assert.equal(run.stdout, "");
+      assert.equal(run.stderr, "build-backend: usage: node scripts/build-backend.mjs (it takes no arguments)\n");
+    }
   });
 
-  it("exits 2 when no target is given", () => {
+  it("starts the build on this machine when it is given no argument, and stops at a uv that fails", () => {
     const run = runScript([]);
-    assert.equal(run.status, 2, run.stderr);
-    assert.match(run.stderr, /usage: node scripts\/build-backend\.mjs/);
+    assert.equal(run.status, 1, run.stderr);
+    assert.equal(run.stdout, "");
+    assert.equal(run.stderr, `build-backend: uv export failed (exit 99): ${uvSaid}\n`);
   });
 
   it("can be imported without building anything", () => {
@@ -568,7 +560,7 @@ describe("requiredFiles", () => {
   ];
 
   it("lists the interpreter, the app and the two compiled dependencies, and no libpython", () => {
-    assert.deepEqual(requiredFiles("linux-x64"), [
+    assert.deepEqual(requiredFiles(), [
       ...common,
       `${site}/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so`,
       `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
@@ -826,7 +818,7 @@ describe("finishPayload", () => {
 
   it("prunes, drops the RECORD lines of what went, and checks what the app needs", () => {
     const work = installed();
-    const { pruned, trimmed } = finishPayload(work, "linux-x64");
+    const { pruned, trimmed } = finishPayload(work);
     assert.equal(pruned.entries, 6, "bin/pip, include, libpython, pip, .lock, site-packages/bin");
     assert.equal(trimmed, 1);
     assert.equal(readFileSync(join(work, record), "utf8"), recordText.split("\n").slice(1).join("\n"));
@@ -840,7 +832,7 @@ describe("finishPayload", () => {
     const work = installed();
     rmSync(join(work, `${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`));
     assert.throws(
-      () => finishPayload(work, "linux-x64"),
+      () => finishPayload(work),
       (err) =>
         err instanceof BuildError &&
         err.message === `payload check failed: missing ${site}/yaml/_yaml.cpython-312-x86_64-linux-gnu.so`,
@@ -1013,8 +1005,8 @@ describe("the uv and tar arguments", () => {
     assert.ok(!args.includes("--no-hashes"), "the hashes stay in the output");
   });
 
-  it("installs only hashed wheels, copied, for the target's platform and Python 3.12", () => {
-    const args = uvInstallArgs("linux-x64", "/work/site");
+  it("installs only hashed wheels, copied, for Linux x86_64 and Python 3.12, asking the payload's interpreter", () => {
+    const args = uvInstallArgs("/work/site", "/work/bin/python3.12");
     assert.deepEqual(args.slice(0, 2), ["pip", "install"]);
     assert.equal(valueOf(args, "--link-mode"), "copy");
     assert.equal(valueOf(args, "--target"), "/work/site");
@@ -1022,16 +1014,8 @@ describe("the uv and tar arguments", () => {
     assert.equal(valueOf(args, "--python-version"), "3.12");
     assert.equal(valueOf(args, "--only-binary"), ":all:");
     assert.equal(valueOf(args, "-r"), "-", "the requirements come on stdin");
+    assert.equal(valueOf(args, "--python"), "/work/bin/python3.12");
     for (const flag of ["--require-hashes", "--no-python-downloads"]) assert.ok(args.includes(flag), flag);
-  });
-
-  it("names an interpreter for uv only when it is given one", () => {
-    assert.ok(!uvInstallArgs("linux-x64", "/work/site").includes("--python"));
-    assert.ok(!uvInstallArgs("linux-x64", "/work/site", null).includes("--python"));
-    assert.equal(
-      valueOf(uvInstallArgs("linux-x64", "/work/site", "/work/bin/python3.12"), "--python"),
-      "/work/bin/python3.12",
-    );
   });
 
   it("unpacks the archive without its top-level folder, into the folder it is given", () => {
@@ -1042,12 +1026,6 @@ describe("the uv and tar arguments", () => {
       "-C",
       "/work",
     ]);
-  });
-
-  it("can run a target's interpreter only on the platform and CPU it was built for", () => {
-    assert.equal(canRunTarget("linux-x64", "linux", "x64"), true);
-    assert.equal(canRunTarget("linux-x64", "linux", "arm64"), false);
-    assert.equal(canRunTarget("linux-x64", "freebsd", "x64"), false);
   });
 });
 
@@ -1129,11 +1107,10 @@ describe("running uv", () => {
     const site = join(work, "lib/python3.12/site-packages");
     const requirements = "idna==3.20 \\\n    --hash=sha256:00\n";
 
-    const packages = await installDependencies("linux-x64", work, requirements);
+    const packages = await installDependencies(work, requirements);
 
     const seen = call();
-    const python = canRunTarget("linux-x64") ? join(work, "bin/python3.12") : null;
-    assert.deepEqual(seen.args, uvInstallArgs("linux-x64", site, python));
+    assert.deepEqual(seen.args, uvInstallArgs(site, join(work, "bin/python3.12")));
     assert.equal(seen.stdin, requirements);
     assert.equal(seen.bytecode, "1", "uv's query of the payload's interpreter must not write .pyc files");
     assert.equal(
@@ -1144,22 +1121,22 @@ describe("running uv", () => {
     assert.equal(packages, 2, "pip's own dist-info is not a locked package");
   });
 
-  it("turns uv's failure into one line, with what to do when it found no Python", async () => {
+  it("turns uv's failure into one line in uv's own words, with no advice about finding a Python", async () => {
     process.env.STUB_UV_MODE = "no-interpreter";
     await assert.rejects(
-      installDependencies("linux-x64", workFolder(), "x\n"),
+      installDependencies(workFolder(), "x\n"),
       (err) =>
         err instanceof BuildError &&
-        !err.message.includes("\n") &&
-        /^uv pip install failed \(exit 2\): error: No interpreter found for Python 3\.12.*UV_PYTHON/.test(err.message),
+        err.message ===
+          "uv pip install failed (exit 2): error: No interpreter found for Python 3.12 in the system path",
     );
     await assert.rejects(exportRequirements(), /^BuildError: uv export failed \(exit 2\): error: No interpreter found/);
   });
 
-  it("gives uv's own reason, cause line included, without Python advice, when it fails for another reason", async () => {
+  it("gives uv's own reason, cause line included, when it fails for another reason", async () => {
     process.env.STUB_UV_MODE = "hash-mismatch";
     await assert.rejects(
-      installDependencies("linux-x64", workFolder(), "x\n"),
+      installDependencies(workFolder(), "x\n"),
       (err) =>
         err instanceof BuildError &&
         err.message === "uv pip install failed (exit 2): error: Failed to download `idna==3.20`; cause: Hash mismatch",
