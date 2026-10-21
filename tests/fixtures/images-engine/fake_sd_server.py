@@ -437,6 +437,7 @@ def main() -> None:
                 "argv": sys.argv[1:],
                 "listen_vars": listen_vars,
                 "fd3_open": fd3_open,
+                "env": dict(os.environ),
             },
         )
     start_mode(args.standin_start)

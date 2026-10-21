@@ -602,6 +602,44 @@ class TestStartAndForward:
         assert start["fd3_open"] is False and start["listen_vars"] == {}
         assert rig.status() == {"engine": "zimage", "state": "ready", "last_error": []}
 
+    def test_the_engine_inherits_a_short_list_of_variables_and_nothing_else(
+        self, launch
+    ):
+        # Under systemd the launcher's environment is the user manager's: session bus, display, agent sockets.
+        wanted = {
+            "HOME": "/nonexistent-home",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "CUDA_CACHE_DISABLE": "1",
+            "CUDA_VISIBLE_DEVICES": "0",
+            "GGML_CUDA_NO_PINNED": "1",
+            "SD_MMAP_FLAGS": "1",
+        }
+        unwanted = {
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/bus",
+            "DISPLAY": ":99",
+            "XDG_RUNTIME_DIR": "/nonexistent/run",
+            "SSH_AUTH_SOCK": "/nonexistent/agent",
+            "SESSION_MANAGER": "local/nonexistent",
+            "LD_PRELOAD": "/nonexistent/preload.so",
+            "LD_LIBRARY_PATH": "/nonexistent/lib",
+            "PYTHONPATH": "/nonexistent/python",
+            "AIHUB_IMAGES_GRACE_S": "3",
+            # names that only start like a listed one
+            "LANGUAGE": "en",
+            "HOMEBREW_PREFIX": "/nonexistent/brew",
+            "CUDAFOO": "1",
+            "PATHEXT": ".exe",
+        }
+        rig = launch(env={**wanted, **unwanted})
+        assert rig.submit("zimage").status == 202
+        [start] = rig.starts()
+        seen = start["env"]
+        assert {name: seen.get(name) for name in wanted} == wanted
+        assert seen["PATH"] == os.environ["PATH"]
+        assert set(unwanted) & set(seen) == set()
+        assert not [name for name in seen if name.startswith("LISTEN_")]
+
     def test_a_job_runs_to_the_end_through_the_launcher(self, launch):
         rig = launch()
         job_id = rig.submit("zimage", width=1024, height=576).json()["id"]

@@ -32,7 +32,8 @@ launcher would not run: it is not alone in a network namespace, it was not given
 models.json or a timing variable is wrong.
 
 The engine must not outlive the launcher. Under systemd, KillMode=control-group and PrivatePIDs=yes end it
-with the unit; elsewhere PR_SET_PDEATHSIG ends it when the launcher dies.
+with the unit; elsewhere PR_SET_PDEATHSIG ends it when the launcher dies. It inherits no file descriptor but
+stdin, stdout and stderr, and only the variables in ENGINE_ENV.
 
 AIHUB_IMAGES_<NAME>_S sets a timing in seconds, once, at start: IDLE, BACKOFF, START, GRACE, CLIENT and
 ENGINE (the defaults are in TIMES). Tests use them so that they need not wait minutes. The unit sets none.
@@ -99,6 +100,10 @@ MEDIA_TYPE = re.compile(
     r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:[ \t]*;[ -~]*)?"
 )
 JSON_TYPE = re.compile(r"application/json(?:[ \t]*;.*)?", re.IGNORECASE)
+# The only variables the engine inherits. The launcher's own environment is the user manager's: session bus,
+# display, agent sockets. The engine reads CUDA_* (the CUDA runtime) and SD_MMAP_FLAGS (examples and src at
+# the pin), and ggml reads GGML_*.
+ENGINE_ENV = re.compile(r"PATH|HOME|LANG|LC_[A-Z_]+|(?:CUDA|GGML|SD)_[A-Z0-9_]+")
 VERBOSE_FLAG = re.compile(r"-v+|--verbose|--log-level(=.*)?")
 LENGTH = re.compile(r"[0-9]{1,10}")
 
@@ -539,7 +544,7 @@ class Host:
 
     async def spawn(self, model: str) -> Engine | None:
         argv = self.config.argv(model)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("LISTEN_")}
+        env = {k: v for k, v in os.environ.items() if ENGINE_ENV.fullmatch(k)}
         self.spawned.clear()
         try:
             proc = await asyncio.create_subprocess_exec(
