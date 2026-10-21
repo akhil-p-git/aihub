@@ -215,18 +215,22 @@ class FakeEngine:
     with none left a job runs the standard steps, and ends with the image for the size that was asked for.
     """
 
-    def __init__(self, *, model: str | None = "zimage") -> None:
+    def __init__(
+        self, *, model: str | None = "zimage", timeline: list | None = None
+    ) -> None:
+        # Shared with a FakeOllama, to see which of the two was asked first.
+        self.timeline = timeline
         self.models = {"zimage", "klein4b"}
-        self.engine = model  # the model that is loaded, as GET /launcher/status says
+        # The model that is loaded, as GET /launcher/status says.
+        self.engine = model
         self.state = "ready" if model else "idle"
         self.last_error: list[str] = []
         self.scripts: list[list] = []
-        self.submit_response: tuple[int, object] | None = (
-            None  # forces the answer to img_gen
-        )
-        self.submit_delay = (
-            0.0  # seconds the launcher spends loading the model before answering
-        )
+        # Set these to force the launcher's answer to img_gen and to a cancel.
+        self.submit_response: tuple[int, object] | None = None
+        self.cancel_response: tuple[int, object] | None = None
+        # Seconds the launcher spends loading the model before it answers img_gen.
+        self.submit_delay = 0.0
         self.calls: list[tuple[str, str]] = []
         self.headers: list[dict[str, str]] = []
         self.submitted: list[dict] = []
@@ -254,6 +258,8 @@ class FakeEngine:
         with self._lock:
             self.calls.append((method, path))
             self.headers.append(headers)
+            if self.timeline is not None:
+                self.timeline.append(("engine", method, path))
             if (method, path) == ("GET", "/launcher/status"):
                 return 200, {
                     "engine": self.engine,
@@ -337,6 +343,8 @@ class FakeEngine:
         if job is None:
             return 404, {"error": "job not found"}
         self.cancels.append(job_id)
+        if self.cancel_response:
+            return self.cancel_response
         if (job["last"] or {}).get("status") == "generating":
             return 409, {
                 "error": "job is currently generating and cannot be interrupted yet"
@@ -406,19 +414,22 @@ class FakeOllama:
         *resident: str,
         stubborn: tuple[str, ...] = (),
         size_vram: int = 5_000_000_000,
+        timeline: list | None = None,
     ) -> None:
+        self.timeline = timeline
         self.resident = [
             {"name": name, "model": name, "size": size_vram, "size_vram": size_vram}
             for name in resident
         ]
-        self.stubborn = set(
-            stubborn
-        )  # models that stay loaded when asked to leave, like one mid-reply
+        # Models that stay loaded when asked to leave, like one in the middle of a reply.
+        self.stubborn = set(stubborn)
         self.calls: list[tuple[str, str, object]] = []
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content) if request.content else None
         self.calls.append((request.method, request.url.path, body))
+        if self.timeline is not None:
+            self.timeline.append(("ollama", request.method, request.url.path))
         if request.url.path == "/api/ps":
             return httpx2.Response(200, json={"models": self.resident})
         if body.get("keep_alive") == 0 and body["model"] not in self.stubborn:

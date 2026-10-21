@@ -848,29 +848,19 @@ class TestGpuLock:
         assert "garbage collection" in caplog.text
 
     @pytest.mark.anyio
-    async def test_an_image_waits_its_turn_and_is_told_when_it_starts_to_wait(
-        self, socket_dir: Path
-    ) -> None:
+    async def test_an_image_waits_its_turn(self, socket_dir: Path) -> None:
         lock = GpuLock(socket_dir)
         text_turn = lock.share()
-        waits = []
-        task = asyncio.create_task(
-            lock.exclusive(wait=5, tick=0.01, on_wait=lambda: waits.append("waiting"))
-        )
+        task = asyncio.create_task(lock.exclusive(wait=5, tick=0.01))
         await asyncio.sleep(0.1)
-        assert not task.done() and waits == ["waiting"]
+        assert not task.done()
         text_turn.release()
         lease = await asyncio.wait_for(task, 2)
-        assert waits == ["waiting"]  # said once, not at every retry
         lease.release()
 
     @pytest.mark.anyio
-    async def test_a_free_gpu_is_taken_without_a_word(self, socket_dir: Path) -> None:
-        waits = []
-        lease = await GpuLock(socket_dir).exclusive(
-            wait=5, tick=0.01, on_wait=waits.append
-        )
-        assert waits == []
+    async def test_a_free_gpu_is_taken_at_once(self, socket_dir: Path) -> None:
+        lease = await GpuLock(socket_dir).exclusive(wait=0, tick=0.01)
         lease.release()
 
     @pytest.mark.anyio
