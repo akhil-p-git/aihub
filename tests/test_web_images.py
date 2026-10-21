@@ -1019,3 +1019,28 @@ class TestUnloadOllama:
             client, OllamaConfig(url="http://127.0.0.1:9999"), settle=0.1, tick=0.01
         )
         assert seen == ["http://127.0.0.1:9999/api/ps"]
+
+
+@pytest.mark.anyio
+class TestLogging:
+    async def test_polling_the_launcher_does_not_fill_the_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        engine = FakeEngine()
+        client = client_for(engine)
+        with caplog.at_level("INFO", logger="httpx2"):
+            job_id = await client.submit(image_request())
+            for _ in range(5):
+                await client.poll("zimage", job_id)
+            await client.status()
+        assert "engine" not in caplog.text and len(engine.calls) == 7
+
+    async def test_other_requests_are_still_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with httpx2.AsyncClient(
+            transport=httpx2.MockTransport(lambda request: httpx2.Response(200))
+        ) as other:
+            with caplog.at_level("INFO", logger="httpx2"):
+                await other.get("http://127.0.0.1:11434/api/tags")
+        assert "http://127.0.0.1:11434/api/tags" in caplog.text

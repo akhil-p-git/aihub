@@ -7,12 +7,23 @@ back is untrusted: replies are capped, ids are checked, and the `poll_url` in an
 
 import base64
 import json
+import logging
 import re
 from dataclasses import dataclass
 
 import httpx2
 
 from .base import ImageRequest
+
+
+class _SilentLauncherCalls(logging.Filter):
+    """A running job polls the launcher four times a second, and httpx2 logs every request at INFO."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "http://engine/" not in record.getMessage()
+
+
+logging.getLogger("httpx2").addFilter(_SilentLauncherCalls())
 
 MAX_REPLY_BYTES = 16 * 1024 * 1024
 # Lossy WebP quality asked of the engine: about 0.1 to 0.2 MB an image.
