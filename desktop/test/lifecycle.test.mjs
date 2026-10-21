@@ -538,10 +538,13 @@ describe("the loading page", () => {
     await settle();
     assert.equal(r.all("loadFile").length, 6);
 
+    // The restart asks for the loading page on purpose, and with a budget refilled: the ask and five repeats.
+    r.log.length = 0;
     r.backend.willStart(reply(4002, "token-two"));
     r.dialogs[0].answer(0);
     await settle();
     assert.equal(r.lifecycle.origin, "http://127.0.0.1:4002");
+    assert.equal(r.all("loadFile").length, 6);
 
     // Second episode: the first two loads land elsewhere again, and the third gets through.
     r.log.length = 0;
