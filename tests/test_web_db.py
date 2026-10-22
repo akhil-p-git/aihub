@@ -6,6 +6,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from aihub_web import db as db_module
 from aihub_web.db import ImageRow, Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "images"
@@ -573,5 +574,51 @@ class TestMigration:
         raw.execute("PRAGMA user_version = 1")
         raw.execute("PRAGMA foreign_keys = ON")
         raw.execute("DELETE FROM chats")
+        assert raw.execute("SELECT count(*) FROM images").fetchone()[0] == 0
+        raw.close()
+
+    def test_the_steps_are_numbered_without_gaps_and_the_last_one_is_the_version(
+        self,
+    ) -> None:
+        steps = sorted(db_module.MIGRATIONS)
+        assert steps == list(range(1, len(steps) + 1))
+        assert db_module.SCHEMA_VERSION == steps[-1]
+
+    def test_a_step_that_fails_leaves_an_upgraded_file_as_it_was(
+        self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = v1_copy(tmp_path)
+        before = (schema_of(path), rows_of(path))
+        # The second statement fails, after the first has already run.
+        monkeypatch.setitem(
+            db_module.MIGRATIONS, 2, "CREATE TABLE images (x); CREATE TABLE images (x);"
+        )
+        with pytest.raises(sqlite3.OperationalError, match="already exists"):
+            Store(path, clock)
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == 1
+        raw.close()
+        assert (schema_of(path), rows_of(path)) == before
+
+    def test_a_new_file_keeps_the_steps_it_finished_and_completes_on_the_next_open(
+        self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "chats.db"
+        with monkeypatch.context() as broken:
+            broken.setitem(db_module.MIGRATIONS, 2, "CREATE TABLE images (x); SELECT")
+            with pytest.raises(sqlite3.OperationalError):
+                Store(path, clock)
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == 1
+        assert {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        } == {"chats", "messages", "settings"}
+        raw.close()
+        Store(path, clock).close()
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == db_module.SCHEMA_VERSION
         assert raw.execute("SELECT count(*) FROM images").fetchone()[0] == 0
         raw.close()

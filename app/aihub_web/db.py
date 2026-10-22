@@ -16,7 +16,6 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
 DAY_MS = 86_400_000
 # Columns update_chat may change; the names are interpolated into SQL, so never take them from input.
 EDITABLE_CHAT_COLUMNS = ("title", "model", "effort")
@@ -75,6 +74,11 @@ CREATE TABLE images (
 CREATE INDEX images_message ON images (message_id);
 CREATE INDEX images_chat ON images (chat_id);
 """
+
+# Each step takes a database from the version before it to its own, and step 1 is the base schema. A new file runs every
+# step, so it ends up with exactly the tables, columns and SQL that an upgraded file has.
+MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA}
+SCHEMA_VERSION = max(MIGRATIONS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +180,12 @@ class Store:
             "secure_delete = ON",
         ):
             self._db.execute(f"PRAGMA {pragma}")
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            # A step that failed leaves its transaction open; closing rolls it back and frees the database's lock.
+            self._db.close()
+            raise
 
     def _migrate(self) -> None:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -184,14 +193,15 @@ class Store:
             raise RuntimeError(
                 f"database schema {version} is newer than this app ({SCHEMA_VERSION})"
             )
-        # A new file gets everything. Version 1 only lacks the images table: the upgrade adds it and
-        # touches nothing else, so there is nothing to back-fill.
-        script = {0: SCHEMA + IMAGES_SCHEMA, 1: IMAGES_SCHEMA}.get(version)
-        if script:
-            with self._lock:
-                self._db.executescript(
-                    f"BEGIN;\n{script}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
-                )
+        for step in range(version + 1, SCHEMA_VERSION + 1):
+            self._run_step(step)
+
+    def _run_step(self, step: int) -> None:
+        """One schema step in one transaction: a step that fails leaves the file at the version before it."""
+        with self._lock:
+            self._db.executescript(
+                f"BEGIN;\n{MIGRATIONS[step]}\nPRAGMA user_version = {step};\nCOMMIT;"
+            )
 
     def _now(self) -> int:
         return int(self._clock() * 1000)
