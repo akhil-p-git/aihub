@@ -18,6 +18,8 @@ export async function open(
     bypassCSP,
   });
   const page = await context.newPage();
+  // Mutation runs set a short one, so that a test that is meant to fail does so in seconds, not after 30 each.
+  if (process.env.E2E_TIMEOUT) page.setDefaultTimeout(Number(process.env.E2E_TIMEOUT));
   const problems = [];
   const requests = [];
   page.on("console", (m) => m.type() === "error" && problems.push(`console: ${m.text()}`));
@@ -31,7 +33,12 @@ export async function open(
     );
   });
   await page.goto(`${app.url}/${hash}`);
-  await page.waitForFunction(() => !document.getElementById("model-chip")?.disabled);
+  // Loaded: the composer's model chip is on, or the page is the tasks list, which has no composer to enable.
+  await page.waitForFunction(
+    () =>
+      !document.getElementById("model-chip")?.disabled ||
+      (location.hash === "#/tasks" && document.getElementById("chat-nav")?.getAttribute("aria-busy") === "false"),
+  );
   return {
     page,
     context,

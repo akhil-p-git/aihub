@@ -24,7 +24,8 @@ async function waitFor(url, what, child) {
   for (let i = 0; i < 100; i++) {
     if (child.exitCode !== null) throw new Error(`${what} exited early with code ${child.exitCode}`);
     try {
-      if ((await fetch(url)).ok) return;
+      // A listener that accepts and never answers must not hold the start for ever.
+      if ((await fetch(url, { signal: AbortSignal.timeout(2000) })).ok) return;
     } catch {
       // not listening yet
     }

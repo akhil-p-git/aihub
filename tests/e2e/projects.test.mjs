@@ -588,7 +588,10 @@ describe("what a review found", () => {
     try {
       await many(crowded, 18);
       const chatId = await makeChat(crowded, "a chat at the bottom");
-      const { page, context } = await open(browser, crowded, { hash: `#/c/${chatId}` });
+      const { page, context } = await open(browser, crowded, { hash: `#/c/${chatId}`, bypassCSP: true });
+      // The links under the list leave a button at its end room for a menu below it. Take them away, so that the
+      // list runs to the bottom of the window and there is none.
+      await page.addStyleTag({ content: ".sidebar-foot { display: none; }" });
       const where = async (label) => {
         await page.getByRole("button", { name: label }).click();
         const menu = page.locator("#row-menu");

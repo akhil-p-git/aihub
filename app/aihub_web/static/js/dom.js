@@ -43,6 +43,10 @@ const ICONS = {
       },
     ],
   ],
+  clock: [
+    ["circle", { cx: 10, cy: 10, r: 7.5 }],
+    ["path", { d: "M10 5.5V10l3 2" }],
+  ],
   alert: [
     ["circle", { cx: 10, cy: 10, r: 7.5 }],
     ["path", { d: "M10 6v4.5M10 13.5v.01" }],

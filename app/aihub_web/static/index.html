@@ -33,6 +33,7 @@
     </div>
     <nav class="chat-nav" id="chat-nav" aria-label="Recent chats" aria-busy="true"></nav>
     <div class="sidebar-foot">
+      <a class="foot-btn" id="open-tasks" href="#/tasks"></a>
       <button class="foot-btn" id="open-settings" type="button"></button>
       <p class="retention" id="retention">Chats are deleted 30 days after their last message.</p>
     </div>
@@ -58,6 +59,14 @@
           <button class="btn" id="route-retry" type="button" hidden>Try again</button>
         </section>
         <div class="messages" id="messages" role="log" aria-label="Conversation"></div>
+        <section class="tasks" id="tasks-page" aria-labelledby="title">
+          <div class="tasks-head">
+            <p class="tasks-intro">Runs a prompt on a model on this PC, on a schedule. Only while aihub is open, one task at a time, up to 15 minutes each.</p>
+            <button class="btn" id="new-task" type="button" data-kind="primary">New task</button>
+          </div>
+          <p class="tasks-empty" id="tasks-empty" hidden>No scheduled tasks yet.</p>
+          <ul class="task-list" id="task-list" role="list" aria-label="Tasks"></ul>
+        </section>
       </div>
     </div>
     <button class="jump" id="jump" type="button" hidden></button>

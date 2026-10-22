@@ -2,7 +2,14 @@
 
 import { ApiError, api, streamChat } from "./api.js";
 import { configureConversation, focusReply, ReplyView, replyFor, userMessage } from "./conversation.js";
-import { confirmDialog, openDeleteProject, openProjectDialog, openRowMenu, openSettings } from "./dialogs.js";
+import {
+  confirmDialog,
+  openDeleteProject,
+  openProjectDialog,
+  openRowMenu,
+  openSettings,
+  openTaskDialog,
+} from "./dialogs.js";
 import { bars, h, icon } from "./dom.js";
 import { openChoiceMenu, openEffortMenu } from "./effort.js";
 import {
@@ -15,9 +22,12 @@ import {
   routeFor,
   shapeNote,
   shortName,
+  taskNext,
+  taskStatus,
 } from "./format.js";
 import { openModelPicker } from "./picker.js";
 import { renderSidebar } from "./sidebar.js";
+import { renderTasks } from "./tasks.js";
 import { toast } from "./toast.js";
 
 const $ = (id) => document.getElementById(id);
@@ -52,6 +62,10 @@ const els = {
   effortName: $("effort-name"),
   navOpen: $("nav-open"),
   status: $("status"),
+  openTasks: $("open-tasks"),
+  newTask: $("new-task"),
+  taskList: $("task-list"),
+  tasksEmpty: $("tasks-empty"),
 };
 
 const state = {
@@ -61,6 +75,8 @@ const state = {
   providers: {},
   chats: [],
   projects: [],
+  tasks: [],
+  view: "chat", // "chat", or "tasks" for the scheduled tasks page
   open: new Set(), // ids of the projects whose chats are shown in the list
   nextProject: null, // set by "New chat in <project>", taken by the new chat that follows
   draftProject: null, // the project the unsent new chat will go in
@@ -101,6 +117,7 @@ const currentModel = () => state.byId.get(state.draft.model);
 const isImage = (model) => model?.output === "image";
 const chatById = (id) => state.chats.find((chat) => chat.id === id);
 const projectById = (id) => state.projects.find((project) => project.id === id);
+const taskById = (id) => state.tasks.find((task) => task.id === id);
 const chatsOf = (projectId) => state.chats.filter((chat) => chat.project_id === projectId);
 
 const OPEN_KEY = "aihub.projects.open";
@@ -157,6 +174,12 @@ function renderSidebarNow() {
 }
 
 function renderTitle() {
+  if (state.view === "tasks") {
+    els.title.textContent = "Scheduled tasks";
+    document.title = "Scheduled tasks - aihub";
+    els.sub.hidden = true;
+    return;
+  }
   const chat = state.chat;
   els.title.textContent = chat ? chat.title : "New chat";
   document.title = chat ? `${chat.title} - aihub` : "aihub";
@@ -164,6 +187,7 @@ function renderTitle() {
   const project = projectById(chat ? chat.project_id : state.draftProject);
   const notes = [];
   if (project) notes.push(`Project: ${project.name}`);
+  if (chat?.task_id) notes.push(`Scheduled task${taskById(chat.task_id) ? `: ${taskById(chat.task_id).name}` : ""}`);
   if (left !== null && left <= 7)
     notes.push(left === 0 ? "Deletes today" : `Deletes in ${left} day${left === 1 ? "" : "s"}`);
   els.sub.replaceChildren(...notes.map((note) => h("span", {}, note)));
@@ -349,10 +373,13 @@ function swapDraftText(key) {
 
 const CHAT_HASH = /^#\/c\/([0-9a-f]{16})$/;
 // Any other fragment (the skip link's, a typed one) must not replace the chat that is open.
-const isRoute = (hash) => CHAT_HASH.test(hash) || hash === "" || hash === "#/";
+const TASKS_HASH = "#/tasks";
+const isRoute = (hash) => CHAT_HASH.test(hash) || hash === "" || hash === "#/" || hash === TASKS_HASH;
 
 function route() {
   closeDrawer();
+  if (location.hash === TASKS_HASH) return showTasks();
+  leaveTasks();
   const match = CHAT_HASH.exec(location.hash);
   if (match) openChat(match[1]);
   else newChat();
@@ -951,6 +978,167 @@ function beginRename(row, chat) {
   input.addEventListener("blur", () => finish(true));
 }
 
+// ---- scheduled tasks
+
+/** The models a task may use: those that run on this PC. */
+const taskModels = () => state.models.filter((m) => m.provider === "ollama");
+
+/** What "Delete all chats" leaves alone, said in a sentence ("" when there is nothing). */
+function whatStays() {
+  const parts = [];
+  if (state.projects.length) parts.push("projects");
+  if (state.tasks.length) parts.push("scheduled tasks");
+  const text = parts.join(" and ");
+  return text ? ` ${text[0].toUpperCase()}${text.slice(1)} stay.` : "";
+}
+
+async function refreshChats() {
+  state.chats = (await api.get("/api/chats")).chats;
+  if (!state.query) renderSidebarNow();
+}
+
+function focusTaskControl(key) {
+  els.taskList.querySelector(`[data-key="${key}"]`)?.focus();
+}
+
+let tasksDrawn = ""; // what the cards say now: a refresh that changes none of it leaves them alone
+
+function renderTasksNow() {
+  const now = Date.now();
+  const drawing = JSON.stringify([
+    state.tasks.map((task) => [task, taskStatus(task, now), taskNext(task, now)]),
+    state.projects.map((project) => [project.id, project.name]),
+    state.models.map((model) => [model.id, model.name]),
+  ]);
+  // Rebuilding cards that would read the same costs a click that lands between pressing and releasing a button.
+  if (drawing === tasksDrawn) return;
+  tasksDrawn = drawing;
+  const focused = els.taskList.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+  renderTasks(els.taskList, els.tasksEmpty, { tasks: state.tasks, byId: state.byId, projectById, now });
+  if (focused) focusTaskControl(focused); // the cards were rebuilt under the keyboard
+}
+
+const taskRuns = (tasks) => JSON.stringify(tasks.map((t) => [t.id, t.last_run_at, t.last_chat_id, t.running]));
+
+let tasksTimer = 0;
+function armTaskPolling() {
+  clearTimeout(tasksTimer);
+  if (state.view !== "tasks") return;
+  // Quickly while a run is going, so that its end shows; slowly otherwise, so that a scheduled run that starts shows too.
+  const delay = state.tasks.some((task) => task.running) ? 2000 : 30_000;
+  tasksTimer = setTimeout(() => refreshTasks().catch(armTaskPolling), delay);
+}
+
+let tasksSeq = 0;
+
+async function refreshTasks() {
+  const seq = ++tasksSeq;
+  const before = state.tasks;
+  const { tasks } = await api.get("/api/tasks");
+  if (seq !== tasksSeq) return; // a newer request was made, and its answer is the one to show
+  state.tasks = tasks;
+  if (state.view === "tasks") {
+    renderTasksNow();
+    // A run that ends is said aloud: the cards change without anything being pressed.
+    for (const task of tasks) {
+      if (!task.running && before.find((b) => b.id === task.id)?.running)
+        announce(`${task.name}: ${taskStatus(task).label}`);
+    }
+  }
+  // A run that started or ended made a chat or finished one: the list of chats has to show it.
+  if (taskRuns(tasks) !== taskRuns(before)) refreshChats().catch(() => {});
+  armTaskPolling();
+}
+
+function showTasks() {
+  leaveRun();
+  state.view = "tasks";
+  state.chat = null;
+  state.messages = [];
+  els.app.dataset.view = "tasks";
+  els.openTasks.setAttribute("aria-current", "page");
+  renderTitle();
+  renderSidebarNow();
+  renderTasksNow();
+  els.scroller.scrollTop = 0;
+  announce("Scheduled tasks");
+  refreshTasks().catch(armTaskPolling);
+}
+
+function leaveTasks() {
+  if (state.view !== "tasks") return;
+  state.view = "chat";
+  els.app.dataset.view = "chat";
+  els.openTasks.removeAttribute("aria-current");
+  clearTimeout(tasksTimer);
+}
+
+async function runTask(task) {
+  try {
+    const { chat_id } = await api.post(`/api/tasks/${task.id}/run`);
+    toast("Started.", { action: { label: "Open chat", run: () => go(`#/c/${chat_id}`) } });
+  } catch (err) {
+    toast(err.message);
+  }
+  refreshTasks().catch(armTaskPolling);
+}
+
+async function toggleTask(input) {
+  const on = input.checked;
+  try {
+    await api.patch(`/api/tasks/${input.dataset.id}`, { enabled: on });
+  } catch (err) {
+    input.checked = !on;
+    toast(err.code === "no_task" ? "That task was deleted." : err.message);
+  }
+  refreshTasks().catch(armTaskPolling);
+}
+
+function createTask() {
+  openTaskDialog({
+    models: taskModels(),
+    projects: state.projects,
+    onSave: async (body) => {
+      await api.post("/api/tasks", body);
+      // A list that fails to load after the task was made must not make the dialog say that saving failed.
+      await refreshTasks().catch(armTaskPolling);
+    },
+  });
+}
+
+function editTask(task) {
+  const dialog = openTaskDialog({
+    task,
+    models: taskModels(),
+    projects: state.projects,
+    onSave: async (changes) => {
+      if (!Object.keys(changes).length) return;
+      await api.patch(`/api/tasks/${task.id}`, changes);
+      await refreshTasks().catch(armTaskPolling);
+    },
+  });
+  dialog.addEventListener("close", () => focusTaskControl(`${task.id}:edit`));
+}
+
+async function deleteTask(task) {
+  const ok = await confirmDialog({
+    title: "Delete this task?",
+    text: `“${task.name}” will be deleted. Its chats stay in your list.`,
+    confirm: "Delete task",
+  });
+  if (!ok) return;
+  try {
+    await api.del(`/api/tasks/${task.id}`);
+  } catch (err) {
+    if (err.code !== "no_task") return toast(err.message);
+  }
+  state.tasks = state.tasks.filter((t) => t.id !== task.id);
+  renderTasksNow();
+  els.newTask.focus();
+  toast("Task deleted.");
+  refreshChats().catch(() => {}); // its chats lose the mark
+}
+
 function openSettingsDialog() {
   let deleted = false;
   const dialog = openSettings({
@@ -965,7 +1153,7 @@ function openSettingsDialog() {
     onDeleteAll: async () => {
       const ok = await confirmDialog({
         title: "Delete all chats?",
-        text: `Every chat and message will be removed from this PC.${state.projects.length ? " Projects stay." : ""} This can't be undone.`,
+        text: `Every chat and message will be removed from this PC.${whatStays()} This can't be undone.`,
         confirm: "Delete everything",
       });
       if (!ok) return false;
@@ -989,6 +1177,7 @@ function decorate() {
   $("nav-open").replaceChildren(icon("menu"));
   $("new-chat").replaceChildren(icon("plus"), h("span", {}, "New chat"));
   $("new-chat-top").replaceChildren(icon("plus"));
+  els.openTasks.replaceChildren(icon("clock"), h("span", {}, "Scheduled tasks"));
   $("open-settings").replaceChildren(icon("sliders"), h("span", {}, "Settings"));
   els.jump.replaceChildren(icon("down"), h("span", {}, "Jump to latest"));
   els.send.replaceChildren(icon("up"));
@@ -1001,6 +1190,24 @@ function wire() {
   $("new-chat").addEventListener("click", () => go("#/"));
   $("new-chat-top").addEventListener("click", () => go("#/"));
   $("open-settings").addEventListener("click", openSettingsDialog);
+  els.newTask.addEventListener("click", createTask);
+  els.taskList.addEventListener("click", (event) => {
+    const control = event.target.closest("button[data-action]");
+    const task = control && taskById(control.dataset.id);
+    if (!task) return;
+    if (control.dataset.action === "run") runTask(task);
+    else if (control.dataset.action === "edit") editTask(task);
+    else deleteTask(task);
+  });
+  els.taskList.addEventListener("change", (event) => {
+    const input = event.target.closest('input[data-action="toggle"]');
+    if (input) toggleTask(input);
+  });
+  // Chats made while the window was away (a scheduled run) show up when it is looked at again.
+  window.addEventListener("focus", () => {
+    refreshChats().catch(() => {});
+    refreshTasks().catch(() => {});
+  });
   els.jump.addEventListener("click", scrollToBottom);
   window.addEventListener("hashchange", () => isRoute(location.hash) && route());
   document.querySelector(".skip").addEventListener("click", (event) => {
@@ -1135,6 +1342,7 @@ function applyBootstrap(data) {
   state.providers = data.providers;
   state.chats = data.chats;
   state.projects = data.projects ?? [];
+  state.tasks = data.tasks ?? [];
   state.settings = data.settings;
   state.retentionDays = data.retention_days;
   els.retention.textContent = `Chats are deleted ${data.retention_days} days after their last message.`;

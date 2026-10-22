@@ -42,7 +42,14 @@ describe("phone, 360 px wide", () => {
     await send(page, "hello");
     await replyDone(page);
     await page.locator("#nav-open").click();
-    for (const selector of [".new-chat", "#search", ".chat-link >> nth=0", ".menu-btn >> nth=0", "#open-settings"]) {
+    for (const selector of [
+      ".new-chat",
+      "#search",
+      ".chat-link >> nth=0",
+      ".menu-btn >> nth=0",
+      "#open-tasks",
+      "#open-settings",
+    ]) {
       const b = await box(page, selector);
       assert.ok(b.height >= 40, `${selector} is ${b.height} tall`);
     }

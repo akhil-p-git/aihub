@@ -1,7 +1,8 @@
 // Modal dialogs (settings, confirmation) and the small menu on a chat row.
 
 import { h, icon, placePopover } from "./dom.js";
-import { estimateTokens } from "./format.js";
+import { estimateTokens, levelLabel, shortName } from "./format.js";
+import { DAY_NAMES, REPEATS, needsDay, needsTime, toFields, toSchedule } from "./schedule.js";
 
 let counter = 0;
 
@@ -167,6 +168,197 @@ function withStatus(button) {
       status.toggleAttribute("data-error", failed);
     },
   };
+}
+
+const sameValue = (a, b) =>
+  JSON.stringify(a && typeof a === "object" ? Object.entries(a).sort() : a) ===
+  JSON.stringify(b && typeof b === "object" ? Object.entries(b).sort() : b);
+
+/**
+ * The dialog for a scheduled task. `models` are the models a task may use (text models on this PC) and `projects`
+ * the projects. `onSave(body)` may throw; its message is shown. For a task that exists the body holds only what the
+ * person changed, and is empty when nothing was.
+ */
+export function openTaskDialog({ task = null, models, projects, onSave }) {
+  const options = models.map((m) => ({
+    id: m.id,
+    text: shortName(m.name) + (m.available ? "" : " (not available now)"),
+    levels: m.efforts?.levels ?? [],
+    available: m.available,
+  }));
+  // A model that was removed since the task was made stays what it is, rather than being swapped for another.
+  if (task && !options.some((o) => o.id === task.model)) {
+    options.push({
+      id: task.model,
+      text: `${task.model.replace(/^ollama\//, "")} (not installed)`,
+      levels: [],
+      available: false,
+    });
+  }
+
+  const name = h("input", { id: "task-name", type: "text", maxlength: "80", autocomplete: "off", spellcheck: "false" });
+  const prompt = h("textarea", {
+    id: "task-prompt",
+    placeholder: "Summarise what I should do today.",
+    spellcheck: "true",
+    "aria-describedby": "task-prompt-hint",
+  });
+  const model = h("select", { id: "task-model", "aria-describedby": "task-model-hint" });
+  const effort = h("select", { id: "task-effort" });
+  const repeat = h(
+    "select",
+    { id: "task-repeat", "aria-describedby": "task-repeat-hint" },
+    REPEATS.map(([value, words]) => h("option", { value }, words)),
+  );
+  const time = h("input", { id: "task-time", type: "time" });
+  const day = h(
+    "select",
+    { id: "task-day" },
+    DAY_NAMES.map((words, i) => h("option", { value: String(i) }, words)),
+  );
+  const project = h(
+    "select",
+    { id: "task-project" },
+    h("option", { value: "" }, "No project"),
+    projects.map((p) => h("option", { value: p.id }, p.name)),
+  );
+  const enabled = h("input", { id: "task-enabled", type: "checkbox" });
+
+  const start = toFields(task?.schedule);
+  name.value = task?.name ?? "";
+  prompt.value = task?.prompt ?? "";
+  model.replaceChildren(...options.map((o) => h("option", { value: o.id }, o.text)));
+  model.value = task?.model ?? (options.find((o) => o.available) ?? options[0])?.id ?? "";
+  repeat.value = start.repeat;
+  time.value = start.time;
+  day.value = start.day;
+  project.value = task?.project_id ?? "";
+  enabled.checked = task ? task.enabled : true;
+
+  const effortField = h("div", { class: "field" }, h("label", { for: "task-effort" }, "Intensity"), effort);
+  const timeField = h("div", { class: "field" }, h("label", { for: "task-time" }, "Time"), time);
+  const dayField = h("div", { class: "field" }, h("label", { for: "task-day" }, "Day"), day);
+  const when = h("div", { class: "field-row" }, timeField, dayField);
+
+  const syncEffort = (keep) => {
+    const levels = options.find((o) => o.id === model.value)?.levels ?? [];
+    effort.replaceChildren(
+      h("option", { value: "" }, "Default"),
+      ...levels.map((level) => h("option", { value: level }, levelLabel(level))),
+    );
+    effort.value = levels.includes(keep) ? keep : "";
+    effortField.hidden = levels.length === 0;
+  };
+  const syncSchedule = () => {
+    timeField.hidden = !needsTime(repeat.value);
+    dayField.hidden = !needsDay(repeat.value);
+    when.hidden = timeField.hidden && dayField.hidden;
+  };
+  syncEffort(task?.effort ?? "");
+  syncSchedule();
+  model.addEventListener("change", () => syncEffort(effort.value));
+  repeat.addEventListener("change", syncSchedule);
+
+  const status = h("p", { class: "action-status", role: "status", id: "task-status" });
+  const form = h(
+    "form",
+    { class: "dlg-body", id: "task-form", novalidate: "" },
+    h("div", { class: "field" }, h("label", { for: "task-name" }, "Name"), name),
+    h(
+      "div",
+      { class: "field" },
+      h("label", { for: "task-prompt" }, "Prompt"),
+      prompt,
+      h(
+        "span",
+        { class: "hint", id: "task-prompt-hint" },
+        "Sent as the message. If the task is in a project, the project's instructions are added.",
+      ),
+    ),
+    h(
+      "div",
+      { class: "field" },
+      h("label", { for: "task-model" }, "Model"),
+      model,
+      h(
+        "span",
+        { class: "hint", id: "task-model-hint" },
+        options.length
+          ? "Tasks use models on this PC, so they never cost anything."
+          : "No model on this PC was found. Start Ollama and reload the page.",
+      ),
+    ),
+    effortField,
+    h(
+      "div",
+      { class: "field" },
+      h("label", { for: "task-repeat" }, "Repeat"),
+      repeat,
+      h(
+        "span",
+        { class: "hint", id: "task-repeat-hint" },
+        "On this PC's clock. A run missed while aihub was closed happens when it opens, if that is within 12 hours.",
+      ),
+    ),
+    when,
+    h("div", { class: "field" }, h("label", { for: "task-project" }, "Project"), project),
+    h("label", { class: "check" }, enabled, h("span", {}, "Run on this schedule")),
+    status,
+  );
+  const cancel = h("button", { class: "btn", type: "button" }, "Cancel");
+  // Not disabled while it saves: a focused button that turns disabled drops the keyboard out of the dialog.
+  const save = h("button", { class: "btn", type: "submit", form: "task-form", "data-kind": "primary" }, "Save");
+  const dialog = modal(task ? "Edit task" : "New task", form, h("div", { class: "dlg-foot" }, cancel, save));
+  cancel.addEventListener("click", () => dialog.close());
+  let saving = false;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (saving) return;
+    const cleaned = name.value.split(/\s+/).filter(Boolean).join(" ");
+    const text = prompt.value.trim();
+    const problem = !cleaned
+      ? ["Give the task a name.", name]
+      : !text
+        ? ["Write the prompt.", prompt]
+        : !model.value
+          ? ["Choose a model.", model]
+          : needsTime(repeat.value) && !time.value
+            ? ["Choose a time.", time]
+            : null;
+    status.removeAttribute("data-error");
+    if (problem) {
+      status.textContent = problem[0];
+      status.setAttribute("data-error", "");
+      problem[1].focus();
+      return;
+    }
+    const wanted = {
+      name: cleaned,
+      prompt: text,
+      model: model.value,
+      // A model the page does not know shows no levels, and must not wipe the one the task has.
+      effort: effortField.hidden ? (task?.effort ?? null) : effort.value || null,
+      schedule: toSchedule({ repeat: repeat.value, time: time.value, day: day.value }),
+      project_id: project.value || null,
+      enabled: enabled.checked,
+    };
+    const body = task
+      ? Object.fromEntries(Object.entries(wanted).filter(([key, value]) => !sameValue(value, task[key])))
+      : wanted;
+    saving = true;
+    status.textContent = "";
+    try {
+      await onSave(body);
+      dialog.close();
+    } catch (err) {
+      status.textContent = err.message;
+      status.setAttribute("data-error", "");
+    } finally {
+      saving = false;
+    }
+  });
+  name.focus();
+  return dialog;
 }
 
 const THEMES = [

@@ -3,6 +3,10 @@
 import { h, icon } from "./dom.js";
 import { groupChats } from "./format.js";
 
+/** The clock before the title of a chat that a scheduled task made, with the words for a screen reader. */
+const taskMark = () =>
+  h("span", { class: "task-mark" }, icon("clock"), h("span", { class: "sr-only" }, "Scheduled task: "));
+
 function row(chat, current) {
   return h(
     "div",
@@ -10,7 +14,7 @@ function row(chat, current) {
     h(
       "a",
       { class: "chat-link", href: `#/c/${chat.id}`, "aria-current": chat.id === current ? "page" : null },
-      h("span", { class: "t" }, chat.title),
+      h("span", { class: "t" }, chat.task_id ? taskMark() : null, chat.title),
       chat.snippet ? h("span", { class: "snip" }, chat.snippet) : null,
     ),
     h(
