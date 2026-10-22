@@ -4,6 +4,68 @@ A private AI hub for one person: a web chat that puts local, free and paid model
 relay bot, local Ollama models, free and cheap OpenRouter models, and a capped Claude API workspace. No secrets
 live in this repo; they are in `~/.config/aihub/`.
 
+## Install on Linux
+This is the web chat, run as a systemd user service and opened in a browser. It was built and tested on Arch Linux
+(x86_64) with an NVIDIA GPU; nothing else has been tried. Everything stays on your machine unless you add a key.
+
+**You need**
+- Linux with systemd user services, `git`, and [uv](https://docs.astral.sh/uv/getting-started/installation/), which fetches
+  Python 3.12 for you.
+- [Ollama](https://ollama.com/download), running (it listens on `127.0.0.1:11434`), with at least one chat model. A new chat
+  starts on the first usable model in `default_models`, and the example settings name `ollama/qwen3:8b` (5.2 GB), so
+  `ollama pull qwen3:8b` makes it work at once. `ollama pull qwen3:4b` (2.5 GB) is smaller; then put
+  `ollama/qwen3:4b` in `default_models`. Any Ollama model that can chat shows up in the picker by itself.
+  Without Ollama the page still opens, and the local models are marked "Ollama isn't responding".
+- Optional: keys for OpenRouter and Claude (see "Add a key" below), and an NVIDIA GPU for images (see Images).
+
+**Install**
+
+    git clone https://github.com/akhil-p-git/aihub ~/work/Dev/aihub
+    cd ~/work/Dev/aihub
+    uv sync --frozen --python 3.12
+    install -d -m 700 state/web
+    mkdir -p ~/.config/aihub ~/.config/systemd/user
+    cp config/web.example.yaml ~/.config/aihub/web.yaml
+    ln -sfn "$PWD/systemd/aihub-web.service" ~/.config/systemd/user/aihub-web.service
+    systemctl --user daemon-reload
+    systemctl --user enable --now aihub-web
+
+Then open <http://127.0.0.1:8787>. Check it with `curl -sf http://127.0.0.1:8787/api/health` and
+`journalctl --user -u aihub-web -f`. The unit expects the checkout at `~/work/Dev/aihub`; to put it somewhere else,
+change the `%h/work/Dev/aihub` paths in `systemd/aihub-web.service` first. `scripts/install.sh` does the same for
+the web chat but also installs Open WebUI and the Discord bot, which you do not need.
+
+To run it without systemd, in the checkout:
+`PYTHONPATH=app AIHUB_STATE_DIR=state/web .venv/bin/python -m aihub_web`. The settings file is optional; without
+`~/.config/aihub/web.yaml` the defaults apply.
+
+**Add a key.** The page works with local models alone. Keys unlock the rest, and a model whose key is missing is listed
+but disabled, with the fix written next to it.
+
+| For | Get a key at | Name in the file |
+|---|---|---|
+| OpenRouter: its free models (`:free`) and the paid ones listed in `paid_models` | <https://openrouter.ai/keys> (give it a credit limit) | `AIHUB_OPENROUTER_KEY` |
+| Claude | <https://platform.claude.com/settings/keys> (create it inside a workspace with a spend limit) | `AIHUB_ANTHROPIC_KEY` |
+
+Put the keys in `~/.config/aihub/aihub.env`, one `NAME=value` per line, with no quotes and no `export`. Create it private,
+then edit it, so the key never goes through your shell history:
+
+    mkdir -p ~/.config/aihub && (umask 077 && touch ~/.config/aihub/aihub.env)
+    $EDITOR ~/.config/aihub/aihub.env     # add: AIHUB_OPENROUTER_KEY=... and/or AIHUB_ANTHROPIC_KEY=...
+    systemctl --user restart aihub-web
+
+The service reads the file only at start,
+so restart it after every change. The spend limit on the key, not this app, is the hard cap on Claude. The paid OpenRouter
+models and the Claude models are chosen in `~/.config/aihub/web.yaml` (`paid_models`, `anthropic.models`). `default_models`
+must stay free or local, so a forgotten chat cannot spend your credits. The desktop app reads the same keys file.
+
+**Images** need more: an NVIDIA GPU, `sd-server` built from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+with CUDA (this repo was tested with commit `0518b34`) at `~/work/aihub-images/bin/sd-server`, and the model files named in
+`systemd/images/models.json` under `~/work/aihub-images/models/`: `z-image-turbo/` (`z_image_turbo-Q5_0.gguf`,
+`Qwen3-4B-Q4_K_M.gguf`, `ae.safetensors`) and `flux2-klein-4b/` (`flux-2-klein-4b-Q8_0.gguf`, `Qwen3-4B-Q4_K_M.gguf`,
+`flux2-vae.safetensors`). stable-diffusion.cpp's `docs/z_image.md` and `docs/flux2.md` say where to download the weights. There is no
+script for this yet; the steps to turn it on are under Images below.
+
 ## Layout
 - `app/aihub_web/` the web chat: a small Starlette backend, and `static/` the browser UI (plain ES modules, no build step)
 - `DESIGN.md` the design tokens and principles (`npx @google/design.md@0.4.0 lint DESIGN.md`)
