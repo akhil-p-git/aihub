@@ -1644,7 +1644,7 @@ class TestTasksApi:
         )
         assert (made["name"], made["prompt"]) == ("Morning digest", "Summarise my day.")
         assert (made["model"], made["effort"], made["schedule"]) == (LOCAL, "on", DAILY)
-        assert made["schedule_text"] == "Every day at 08:00"
+        assert made["schedule_text"] == "Every day at 8:00 AM"
         assert (made["enabled"], made["next_run_at"]) == (True, TOMORROW)
         assert (made["last_status"], made["last_chat_id"]) == (None, None)
         assert (made["failures"], made["running"], made["project_id"]) == (

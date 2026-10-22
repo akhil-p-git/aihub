@@ -159,13 +159,13 @@ export function coerceEffort(model, effort) {
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/** A moment as a person says it: "today 08:05", "tomorrow 08:00", "Thu 07:00" within the week, else "27 Oct 07:00". */
+/** A moment as a person says it: "today 8:05 AM", "tomorrow 8:00 AM", "Thu 7:00 AM" within the week, else "27 Oct 7:00 AM". */
 export function formatWhen(ms, now = Date.now()) {
   const at = new Date(ms);
   const today = new Date(now);
   const midnight = (date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
   const days = Math.round((midnight(at) - midnight(today)) / 86_400_000);
-  const time = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+  const time = `${at.getHours() % 12 || 12}:${String(at.getMinutes()).padStart(2, "0")} ${at.getHours() < 12 ? "AM" : "PM"}`;
   if (days === 0) return `today ${time}`;
   if (days === 1) return `tomorrow ${time}`;
   if (days === -1) return `yesterday ${time}`;

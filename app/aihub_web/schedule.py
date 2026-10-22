@@ -113,6 +113,12 @@ def next_run(schedule: Hourly | Daily | Weekdays | Weekly, after_ms: int) -> int
     raise ValueError("a schedule always has a next run within a week")
 
 
+def _clock(hhmm: str) -> str:
+    """ "18:30" as a person reads it on a 12-hour clock: "6:30 PM". Noon is 12:00 PM and midnight 12:00 AM."""
+    hour = int(hhmm[:2])
+    return f"{hour % 12 or 12}:{hhmm[3:]} {'AM' if hour < 12 else 'PM'}"
+
+
 def describe(schedule: Hourly | Daily | Weekdays | Weekly) -> str:
     match schedule:
         case Hourly(every=1):
@@ -120,8 +126,8 @@ def describe(schedule: Hourly | Daily | Weekdays | Weekly) -> str:
         case Hourly(every=every):
             return f"Every {every} hours"
         case Daily(time=hhmm):
-            return f"Every day at {hhmm}"
+            return f"Every day at {_clock(hhmm)}"
         case Weekdays(time=hhmm):
-            return f"Every weekday at {hhmm}"
+            return f"Every weekday at {_clock(hhmm)}"
         case Weekly(day=weekday, time=hhmm):
-            return f"Every {DAYS[weekday]} at {hhmm}"
+            return f"Every {DAYS[weekday]} at {_clock(hhmm)}"

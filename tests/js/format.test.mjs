@@ -221,15 +221,17 @@ describe("estimateTokens: the server's rule, so the project dialog counts what i
 describe("formatWhen", () => {
   const at = (...parts) => Date.UTC(...parts);
   const cases = [
-    [at(2026, 9, 20, 8, 5), "today 08:05"], // the same day, earlier than now
-    [at(2026, 9, 20, 23, 59), "today 23:59"],
-    [at(2026, 9, 21, 0, 0), "tomorrow 00:00"],
-    [at(2026, 9, 19, 22, 0), "yesterday 22:00"],
-    [at(2026, 9, 22, 7, 0), "Thu 07:00"], // within the next week: the day of the week
-    [at(2026, 9, 26, 7, 0), "Mon 07:00"],
-    [at(2026, 9, 27, 7, 0), "27 Oct 07:00"], // a week or more ahead: the date
-    [at(2026, 9, 12, 9, 30), "12 Oct 09:30"], // more than a day ago: the date
-    [at(2027, 0, 4, 12, 0), "4 Jan 2027 12:00"], // another year says the year
+    [at(2026, 9, 20, 8, 5), "today 8:05 AM"], // the same day, earlier than now
+    [at(2026, 9, 20, 23, 59), "today 11:59 PM"],
+    [at(2026, 9, 20, 12, 0), "today 12:00 PM"], // noon is 12 PM
+    [at(2026, 9, 20, 0, 30), "today 12:30 AM"], // and just after midnight is 12 AM,
+    [at(2026, 9, 21, 0, 0), "tomorrow 12:00 AM"],
+    [at(2026, 9, 19, 22, 0), "yesterday 10:00 PM"],
+    [at(2026, 9, 22, 7, 0), "Thu 7:00 AM"], // within the next week: the day of the week
+    [at(2026, 9, 26, 7, 0), "Mon 7:00 AM"],
+    [at(2026, 9, 27, 7, 0), "27 Oct 7:00 AM"], // a week or more ahead: the date
+    [at(2026, 9, 12, 9, 30), "12 Oct 9:30 AM"], // more than a day ago: the date
+    [at(2027, 0, 4, 12, 0), "4 Jan 2027 12:00 PM"], // another year says the year
   ];
   for (const [ms, text] of cases) {
     it(`${new Date(ms).toISOString()} reads "${text}"`, () => assert.equal(formatWhen(ms, NOW), text));
@@ -261,24 +263,24 @@ describe("taskStatus", () => {
   it("says when a run was done", () => {
     assert.deepEqual(taskStatus(task({ last_status: "done", last_run_at: ran }), NOW), {
       kind: "done",
-      label: "Done today 08:02",
+      label: "Done today 8:02 AM",
     });
   });
 
   it("gives the reason of a run that failed, was stopped, or was skipped", () => {
     assert.deepEqual(taskStatus(task({ last_status: "error", last_run_at: ran, last_error: "Gone." }), NOW), {
       kind: "error",
-      label: "Failed today 08:02",
+      label: "Failed today 8:02 AM",
       reason: "Gone.",
     });
     assert.deepEqual(taskStatus(task({ last_status: "stopped", last_run_at: ran, last_error: "Too long." }), NOW), {
       kind: "error",
-      label: "Stopped today 08:02",
+      label: "Stopped today 8:02 AM",
       reason: "Too long.",
     });
     assert.deepEqual(taskStatus(task({ last_status: "skipped", last_run_at: ran, last_error: "Late." }), NOW), {
       kind: "skipped",
-      label: "Skipped today 08:02",
+      label: "Skipped today 8:02 AM",
       reason: "Late.",
     });
   });
@@ -311,7 +313,7 @@ describe("taskNext", () => {
   });
 
   it("says when the next run is", () => {
-    assert.equal(next({ next_run_at: Date.UTC(2026, 9, 21, 8, 0) }), "Next run tomorrow 08:00");
+    assert.equal(next({ next_run_at: Date.UTC(2026, 9, 21, 8, 0) }), "Next run tomorrow 8:00 AM");
   });
 
   it("says a run that is due is due, since it starts within seconds or waits for a free model", () => {

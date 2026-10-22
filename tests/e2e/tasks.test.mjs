@@ -194,15 +194,15 @@ describe("the page", () => {
 
       const alpha = card(page, "Alpha digest");
       const text = await alpha.innerText();
-      assert.match(text, /Every weekday at 07:45/);
+      assert.match(text, /Every weekday at 7:45 AM/);
       assert.match(text, /qwen3:8b/);
       assert.match(text, /Home/);
       assert.match(text, /Not run yet/);
-      assert.match(text, /Next run (today|tomorrow|[A-Z][a-z]{2}) \d\d:\d\d|Next run \d+ [A-Z][a-z]{2}/);
+      assert.match(text, /Next run (today|tomorrow|[A-Z][a-z]{2}) \d{1,2}:\d\d [AP]M|Next run \d+ [A-Z][a-z]{2}/);
       assert.match(text, /Summarise what I should do today\./); // the first line of the prompt
       assert.doesNotMatch(text, /Be brief/);
 
-      assert.match(await card(page, "Zebra weekly").innerText(), /Every Friday at 17:30/);
+      assert.match(await card(page, "Zebra weekly").innerText(), /Every Friday at 5:30 PM/);
       const paused = card(page, "Beta hourly");
       assert.match(await paused.innerText(), /Every 6 hours/);
       assert.doesNotMatch(await paused.innerText(), /Next run/); // a task that is off has none
@@ -243,7 +243,7 @@ describe("making a task", () => {
 
       const made = card(page, "Morning digest");
       await made.waitFor();
-      assert.match(await made.innerText(), /Every weekday at 07:45/);
+      assert.match(await made.innerText(), /Every weekday at 7:45 AM/);
       const [task] = await tasksOf(fresh);
       assert.deepEqual(
         {
@@ -468,7 +468,7 @@ describe("running a task", () => {
       await mine.getByText("Running now").waitFor();
 
       // The page keeps asking, so the end of the run shows without a reload.
-      await mine.getByText(/^Done today \d\d:\d\d$/).waitFor({ timeout: 20_000 });
+      await mine.getByText(/^Done today \d{1,2}:\d\d [AP]M$/).waitFor({ timeout: 20_000 });
       assert.doesNotMatch(await mine.innerText(), /Running now/);
       const link = mine.getByRole("link", { name: "Open chat: Morning digest" });
       assert.equal(await mine.getByRole("switch").isChecked(), true);
@@ -496,7 +496,7 @@ describe("running a task", () => {
       const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
       const mine = card(page, "Flaky");
       await mine.getByRole("button", { name: "Run now: Flaky" }).click();
-      await mine.getByText(/^Failed today \d\d:\d\d$/).waitFor({ timeout: 20_000 });
+      await mine.getByText(/^Failed today \d{1,2}:\d\d [AP]M$/).waitFor({ timeout: 20_000 });
       assert.match(await mine.innerText(), /llama runner process has terminated/);
       await mine.getByRole("link", { name: "Open chat: Flaky" }).click();
       await page.getByRole("heading", { level: 1, name: `Flaky, ${today()}` }).waitFor();
@@ -647,7 +647,7 @@ describe("changing a task", () => {
       await card(page, "Announced").getByText("Running now").waitFor();
       await page
         .locator("#status")
-        .filter({ hasText: /^Announced: Done today \d\d:\d\d$/ })
+        .filter({ hasText: /^Announced: Done today \d{1,2}:\d\d [AP]M$/ })
         .waitFor({ timeout: 20_000 });
       await context.close();
     });
@@ -747,7 +747,7 @@ describe("changing a task", () => {
 
       const renamed = card(page, "Renamed");
       await renamed.waitFor();
-      assert.match(await renamed.innerText(), /Every day at 06:05/);
+      assert.match(await renamed.innerText(), /Every day at 6:05 AM/);
       await focusIs(page, "Edit: Renamed", "label");
       const [task] = await tasksOf(fresh);
       assert.deepEqual([task.name, task.schedule, task.effort], ["Renamed", { kind: "daily", time: "06:05" }, "on"]);
@@ -777,7 +777,7 @@ describe("changing a task", () => {
       await dlg.getByLabel("Repeat").selectOption("daily");
       await dlg.getByLabel("Time").fill("06:00");
       await dlg.getByRole("button", { name: "Save" }).click();
-      await card(page, "Renamed").getByText("Every day at 06:00").waitFor();
+      await card(page, "Renamed").getByText("Every day at 6:00 AM").waitFor();
       assert.deepEqual(sent, [{ schedule: { kind: "daily", time: "06:00" } }]);
 
       sent.length = 0;

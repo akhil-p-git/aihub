@@ -294,10 +294,15 @@ class TestInWords:
         [
             ({"kind": "hourly", "every": 1}, "Every hour"),
             ({"kind": "hourly", "every": 6}, "Every 6 hours"),
-            ({"kind": "daily", "time": "08:00"}, "Every day at 08:00"),
-            ({"kind": "weekdays", "time": "07:45"}, "Every weekday at 07:45"),
-            ({"kind": "weekly", "day": 0, "time": "09:00"}, "Every Monday at 09:00"),
-            ({"kind": "weekly", "day": 6, "time": "18:30"}, "Every Sunday at 18:30"),
+            ({"kind": "daily", "time": "08:00"}, "Every day at 8:00 AM"),
+            ({"kind": "weekdays", "time": "07:45"}, "Every weekday at 7:45 AM"),
+            ({"kind": "weekly", "day": 0, "time": "09:00"}, "Every Monday at 9:00 AM"),
+            ({"kind": "weekly", "day": 6, "time": "18:30"}, "Every Sunday at 6:30 PM"),
+            ({"kind": "daily", "time": "12:00"}, "Every day at 12:00 PM"),  # noon
+            (
+                {"kind": "daily", "time": "00:05"},
+                "Every day at 12:05 AM",
+            ),  # just after midnight
         ],
     )
     def test_each_kind(self, raw: dict, words: str) -> None:
