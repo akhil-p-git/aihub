@@ -100,15 +100,31 @@ SCHEMA_VERSION = max(MIGRATIONS)
 
 def shred(path: Path) -> None:
     """Overwrite a file with zeroes, then remove it: what secure_delete does for rows, and as best effort as it is
-    (a disk that writes copy-on-write may keep the old blocks). A link is refused, never followed."""
+    (a disk that writes copy-on-write may keep the old blocks). A symbolic link is refused, never followed, and a file
+    that has another name too is only unlinked: zeroing it would destroy what that other name keeps."""
     fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "wb") as file:
-        remaining = os.fstat(fd).st_size
+        info = os.fstat(fd)
+        remaining = info.st_size if info.st_nlink == 1 else 0
         while remaining > 0:
             remaining -= file.write(bytes(min(remaining, 1 << 20)))
         file.flush()
         os.fsync(fd)
     path.unlink()
+
+
+def is_a_copy(path: Path) -> bool:
+    """A regular file that is a SQLite database marked, in its header, as a copy this app made."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with open(path, "rb") as file:
+            header = file.read(100)
+    except OSError:
+        return False
+    return header[:16] == b"SQLite format 3\0" and header[
+        68:72
+    ] == BACKUP_APPLICATION_ID.to_bytes(4, "big")
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +242,7 @@ class Store:
         ):
             self._db.execute(f"PRAGMA {pragma}")
         try:
+            self._sweep_partial_copies()
             self._migrate()
         except BaseException:
             # A step that failed leaves its transaction open; closing rolls it back and frees the database's lock.
@@ -244,49 +261,81 @@ class Store:
             self._run_step(step)
 
     def _back_up(self, version: int) -> None:
-        """Copy the file as it is before a schema step rewrites it: the chats live nowhere else. If the copy cannot
-        be made the upgrade does not happen. The copy is private, one file, and goes when its chats would have."""
+        """Copy the file as it is before a schema step rewrites it: the chats live nowhere else. The copy is built
+        under a name no restore would use, marked and checked, and only then given its own name with a hard link,
+        which never replaces a file. A process that dies on the way leaves a part that the next start removes, never
+        a broken file under a copy's name. If the copy cannot be made the upgrade does not happen."""
         stem = f"{self._path.name}.v{version}"
-        target = self._path.with_name(f"{stem}.bak")
-        for n in range(2, 1000):
-            if not target.exists():
-                break
-            target = self._path.with_name(f"{stem}-{n}.bak")
-        os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        part = self._path.with_name(f"{stem}.bak.part")
+        os.close(os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         try:
-            copy = sqlite3.connect(target)
+            copy = sqlite3.connect(part)
             try:
                 self._db.backup(copy)
                 copy.execute(f"PRAGMA application_id = {BACKUP_APPLICATION_ID}")
             finally:
                 copy.close()
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
-        stamp = self._clock()
-        os.utime(target, (stamp, stamp))
+            stamp = self._clock()
+            os.utime(part, (stamp, stamp))
+            if not is_a_copy(part):
+                raise OSError(
+                    f"{part.name} did not come out as a database marked as this app's copy"
+                )
+            target = self._link_as_a_copy(part, stem)
+        finally:
+            self._shred_quietly(
+                part
+            )  # after the link it is a second name: unlinked, not zeroed
         log.info(
             "copied the database to %s before upgrading it from schema %d",
             target.name,
             version,
         )
 
+    def _link_as_a_copy(self, part: Path, stem: str) -> Path:
+        for n in range(1, 1000):
+            target = self._path.with_name(
+                f"{stem}.bak" if n == 1 else f"{stem}-{n}.bak"
+            )
+            try:
+                os.link(part, target)
+            except FileExistsError:
+                continue
+            return target
+        raise OSError(f"there are already 999 copies named {stem}")
+
+    def _sweep_partial_copies(self) -> None:
+        """A copy that a crash left unfinished holds chats under a name that is never expired: remove it."""
+        partial = re.compile(
+            rf"{re.escape(self._path.name)}\.v\d+\.bak\.part(-journal)?"
+        )
+        for path in self._path.parent.iterdir():
+            if (
+                partial.fullmatch(path.name)
+                and path.is_file()
+                and not path.is_symlink()
+            ):
+                self._shred_quietly(path)
+
+    def _shred_quietly(self, path: Path) -> bool:
+        """Remove one of our files, or say why not: a copy somebody made read-only must not stop the app from
+        starting, or a deletion from finishing after the chats are already gone."""
+        try:
+            shred(path)
+        except FileNotFoundError:
+            return False
+        except OSError as err:
+            log.warning("could not remove %s: %s", path.name, err.strerror or err)
+            return False
+        return True
+
     def _backups(self) -> list[Path]:
         """The copies this app made: named like one, and marked as one in the file's header."""
-        found = []
-        for path in sorted(self._path.parent.glob(f"{self._path.name}.v*.bak")):
-            if path.is_symlink() or not path.is_file():
-                continue
-            try:
-                with open(path, "rb") as file:
-                    header = file.read(100)
-            except OSError:
-                continue
-            if header[:16] == b"SQLite format 3\0" and header[
-                68:72
-            ] == BACKUP_APPLICATION_ID.to_bytes(4, "big"):
-                found.append(path)
-        return found
+        return [
+            path
+            for path in sorted(self._path.parent.glob(f"{self._path.name}.v*.bak"))
+            if is_a_copy(path)
+        ]
 
     def _run_step(self, step: int) -> None:
         """One schema step in one transaction: a step that fails leaves the file at the version before it."""
@@ -405,7 +454,7 @@ class Store:
             count = db.execute("DELETE FROM chats").rowcount
         self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         for backup in self._backups():
-            shred(backup)
+            self._shred_quietly(backup)
         return count
 
     def purge_expired(self, retention_days: int) -> int:
@@ -422,8 +471,7 @@ class Store:
         # A copy made before an upgrade holds chats as they were, so it may not outlive them.
         stale = self._clock() - retention_days * DAY_MS / 1000
         for backup in self._backups():
-            if backup.stat().st_mtime < stale:
-                shred(backup)
+            if backup.stat().st_mtime < stale and self._shred_quietly(backup):
                 log.info(
                     "removed %s, which is older than %d days",
                     backup.name,

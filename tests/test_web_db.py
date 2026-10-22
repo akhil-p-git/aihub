@@ -1,8 +1,12 @@
 import json
+import logging
+import os
 import re
 import shutil
 import sqlite3
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -642,6 +646,14 @@ def backups_of(path: Path) -> list[Path]:
     return sorted(path.parent.glob(f"{path.name}.v*.bak"))
 
 
+def parts_of(path: Path) -> list[Path]:
+    """What a copy is called until it is whole (and its rollback journal, while SQLite writes it)."""
+    return sorted(path.parent.glob(f"{path.name}.v*.bak.part*"))
+
+
+APP = Path(__file__).parents[1] / "app"
+
+
 class TestBackup:
     """A schema step rewrites the whole file and the chats live nowhere else, so the file is copied first."""
 
@@ -707,7 +719,7 @@ class TestBackup:
         real = sqlite3.connect
 
         def refuse_the_copy(target, *args, **kwargs):
-            if str(target).endswith(".bak"):
+            if str(target).endswith(".part"):
                 raise sqlite3.OperationalError("database or disk is full")
             return real(target, *args, **kwargs)
 
@@ -718,10 +730,38 @@ class TestBackup:
         assert backups_of(path) == [], (
             "no half-made copy is left to be mistaken for one"
         )
+        assert parts_of(path) == []
         assert (schema_of(path), rows_of(path)) == before
         raw = sqlite3.connect(path)
         assert user_version(raw) == 1
         raw.close()
+
+    def test_a_copy_that_does_not_come_out_marked_is_refused_and_not_kept(
+        self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A copy without the mark would never be expired, so the upgrade stops rather than leave one."""
+
+        class ForgetsTheMark(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if "application_id" in sql:
+                    return self.cursor()
+                return super().execute(sql, *args)
+
+        path = v1_copy(tmp_path)
+        before = (schema_of(path), rows_of(path))
+        real = sqlite3.connect
+
+        def connect(target, *args, **kwargs):
+            if str(target).endswith(".part"):
+                kwargs["factory"] = ForgetsTheMark
+            return real(target, *args, **kwargs)
+
+        monkeypatch.setattr(db_module.sqlite3, "connect", connect)
+        with pytest.raises(OSError, match="did not come out"):
+            Store(path, clock)
+        monkeypatch.undo()
+        assert backups_of(path) == [] and parts_of(path) == []
+        assert (schema_of(path), rows_of(path)) == before
 
     def test_a_copy_goes_when_it_is_older_than_the_retention_period(
         self, tmp_path: Path, clock: Clock
@@ -815,6 +855,89 @@ class TestBackup:
         with pytest.raises(OSError):
             db_module.shred(link)
         assert target.read_bytes() == b"keep me" and link.is_symlink()
+
+    def test_a_copy_has_its_name_only_once_it_is_whole(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        """A process that dies while copying leaves a part, never a file under the name a restore would use."""
+        path = v1_copy(tmp_path)
+        dies_with_the_copy_made = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(APP)!r})\n"
+            "from pathlib import Path\n"
+            "from aihub_web import db\n"
+            "db.os.link = lambda *args, **kwargs: os._exit(9)\n"
+            "db.Store(Path(sys.argv[1]))\n"
+        )
+        died = subprocess.run(
+            [sys.executable, "-I", "-c", dies_with_the_copy_made, str(path)],
+            check=False,
+        )
+        assert died.returncode == 9
+        assert backups_of(path) == []
+        assert [p.name for p in parts_of(path)] == ["chats.db.v1.bak.part"]
+        Store(
+            path, clock
+        ).close()  # the next start sweeps the part away and makes the copy properly
+        assert [b.name for b in backups_of(path)] == ["chats.db.v1.bak"]
+        assert parts_of(path) == []
+        assert rows_of(backups_of(path)[0]) == rows_of(v1_copy(tmp_path, "pristine.db"))
+
+    def test_a_part_that_a_crash_left_is_removed_at_the_next_start_and_never_counted(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = tmp_path / "chats.db"
+        Store(path, clock).close()
+        secret = b"chat text from a copy that never finished"
+        part = tmp_path / "chats.db.v2.bak.part"
+        journal = tmp_path / "chats.db.v2.bak.part-journal"
+        part.write_bytes(b"SQLite format 3\0" + secret)
+        journal.write_bytes(secret)
+        mine = tmp_path / "chats.db.v2.bak.part.keep"  # not a name this app makes
+        mine.write_bytes(b"somebody else's")
+        Store(path, clock).close()
+        assert not part.exists() and not journal.exists()
+        assert mine.read_bytes() == b"somebody else's"
+
+    def test_a_crash_between_linking_the_copy_and_removing_the_part_loses_nothing(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        Store(path, clock).close()
+        [copy] = backups_of(path)
+        whole = copy.read_bytes()
+        part = tmp_path / "chats.db.v1.bak.part"
+        os.link(copy, part)  # both names are one file, as at that moment
+        Store(path, clock).close()
+        assert not part.exists()
+        assert copy.read_bytes() == whole
+
+    def test_a_file_with_another_name_is_unlinked_not_zeroed(
+        self, tmp_path: Path
+    ) -> None:
+        kept = tmp_path / "kept-elsewhere.db"
+        kept.write_bytes(b"a copy somebody kept on purpose")
+        ours = tmp_path / "chats.db.v1.bak"
+        os.link(kept, ours)
+        db_module.shred(ours)
+        assert not ours.exists()
+        assert kept.read_bytes() == b"a copy somebody kept on purpose"
+
+    def test_a_copy_that_cannot_be_removed_does_not_stop_the_app(
+        self, tmp_path: Path, clock: Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        [copy] = backups_of(path)
+        copy.chmod(0o400)  # somebody made it read-only
+        clock.advance(days=400)
+        with caplog.at_level(logging.WARNING):
+            s.purge_expired(30)
+            assert s.delete_all() == 0  # the 400 days had already expired the chats
+        assert copy.exists()
+        assert caplog.text.count("could not remove chats.db.v1.bak") == 2
+        copy.chmod(0o600)
+        s.close()
 
 
 class TestMigrationToProjects:

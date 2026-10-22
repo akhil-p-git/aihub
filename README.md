@@ -52,8 +52,13 @@ activity. The sidebar says so, and a chat in its last week shows "Deletes in N d
 **Upgrading the database.** The schema has a version (`PRAGMA user_version`: 2 added images, 3 added projects). Starting a
 newer build on an older file upgrades it in place, one transaction per step, and first copies the file with SQLite's
 backup API to `chats.db.v<old>.bak` beside it (mode 600; a second copy of the same version is `chats.db.v<old>-2.bak`).
-If the copy cannot be made, the file is not upgraded. A copy holds chats as they were, so it is removed after
-`retention_days` and by "Delete all chats": copy it somewhere else first if you want to keep it longer. An older build
+The copy is built as `chats.db.v<old>.bak.part` and only gets its own name once it is whole, so a crash leaves a part
+(which the next start removes), never a broken file under the name a restore uses. If the copy cannot be made, the file
+is not upgraded. A copy holds chats as they were, so it is not kept for long: it is removed `retention_days` after it was
+made (a chat that was due to expire soon after the upgrade can live on in the copy for up to that long) and at once by
+"Delete all chats". Copy it somewhere else first if you want to keep it longer. A copy that cannot be removed (say you
+made it read-only) is left, and the log says so. An older build does not know about copies, so after going back, delete
+them by hand. An older build
 refuses a newer file (`database schema 3 is newer than this app (2)`), and setting `user_version` back by hand does not
 help, because from version 3 the `chats` table has a `project_id` column that older code cannot read. To go back, stop the
 service, put the copy over the database (`cp state/web/chats.db.v2.bak state/web/chats.db`), delete `chats.db-wal` and
