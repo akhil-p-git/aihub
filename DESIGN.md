@@ -196,7 +196,7 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 
 ## Layout
 - 4 px base. Spacing tokens only: 4, 8, 12, 16, 24, 32. Comfortable density in the conversation, compact density in the sidebar.
-- 280 px sidebar plus a conversation column of 44 rem, centered in the pane, with left-aligned text. Under 1024 px the sidebar is a drawer; on a narrow phone the model chip takes the first row of the composer and the intensity chip and Send share the second, with 44 px touch targets.
+- 280 px sidebar plus a conversation column of 44 rem, centered in the pane, with left-aligned text. Under 1024 px the sidebar is a drawer; on a narrow phone the model chip takes the first row of the composer and the intensity chip (or, for an image model, the Shape chip) and Send share the second, with 44 px touch targets.
 - The composer is docked, and the page uses `dvh` and safe-area insets so the on-screen keyboard never covers it.
 
 ## Elevation & Depth
@@ -208,7 +208,9 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 ## Components
 - **Signal bars:** four rising bars. In the composer they show the intensity level (Off is all outline). While a model is thinking they animate as an activity indicator. In the sidebar they are the wordmark. This is the one distinctive element.
 - **Composer:** one rounded surface holding the text area, the model chip and the intensity chip, and the Send button, which becomes Stop while a reply streams.
-- **Model picker:** a searchable list grouped as Free (cloud), On this PC, and Paid. Each row states tier, context size and price in words. Unavailable rows say what is missing.
+- **Model picker:** a searchable list grouped as Free (cloud), On this PC, Makes images, and Paid. Each row states tier, context size and price in words; an image model states what it is good at instead. Unavailable rows say what is missing.
+- **Shape chip:** in image mode it takes the intensity chip's place and opens the same small menu: Square, Wide, Tall, with the usual seconds for each in the note under the choices. It is text only and has no icon.
+- **Image reply:** a figure at column width, never taller than 70% of the window, with a 1 px `line` outline so a dark image does not disappear into the dark theme. While it is made, a slate in the same box (the same size rule, so the image replaces it without a jump) holds signal bars, one per two steps, and a line of state in `muted`: "Waiting for the GPU…", "Step 3 of 8", "Finishing…". A model estimated under ten seconds shows looping bars and "About 8 s" instead of steps. The slate is a progress bar that a keyboard can reach and that is never announced as it changes; the page says "Creating image", "Still working" and the result once each. The footer lists model, seconds, steps, seed and size, then the actions as text buttons: Download, New seed, Reuse prompt, Redo with the other model, Full size. They stay visible, unlike Copy and Retry, which show on hover.
 - **Reply:** no container, serif text. Reasoning sits above it in a collapsed "Thought for 8 s" disclosure.
 - **Empty state:** a short title naming the model, then one sentence about where the next prompt goes. No greeting, no suggestion chips.
 
@@ -223,4 +225,4 @@ A tool for one person who opens it many times a day. It is Operate mode: scanabi
 
 ## Motion
 - Press 120 ms, popover 160 ms, drawer 240 ms, `cubic-bezier(0.23, 1, 0.32, 1)`. Exits run faster. Only `transform` and `opacity` animate.
-- The signal bars loop at 900 ms while a model is working. Reduced motion shows static bars and no drawer slide.
+- The signal bars loop at 900 ms while a model is working. Reduced motion shows static bars and no drawer slide; the bars of an image being made then light one by one as steps finish, or, for a short job, all light.

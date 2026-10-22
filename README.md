@@ -63,9 +63,49 @@ run code or send the chat to a URL. The unit is sandboxed (`systemd-analyze --us
 To reach it from a phone or Mac, put Tailscale in front (not installed yet): follow `tailscale serve --help` for the
 current syntax, point it at `http://127.0.0.1:8787`, and add the machine's tailnet name to `allowed_hosts`.
 
-**Not built:** image or file attachments, editing a sent message, branching, tools or MCP, and Anthropic prompt
-caching. Leaving a chat while it streams stops that reply (the part so far is kept). It has been checked in
-Chromium; Firefox, Safari and iOS have not.
+**Not built:** image or file attachments, editing a sent message, editing an image, branching, tools or MCP, and
+Anthropic prompt caching. Leaving a chat while a text reply streams stops that reply (the part so far is kept);
+an image being made carries on (see Images). It has been checked in Chromium; Firefox, Safari and iOS have not.
+
+### Images
+Optional, and free: the images are made on this PC's GPU by stable-diffusion.cpp's `sd-server`, which runs in its own
+sandboxed user unit with no network (`systemd/aihub-images.service`, `docs/adr/0001-image-engine.md`). Nothing is sent
+anywhere and nothing is billed. While `images.socket` in `web.yaml` is unset, the page shows nothing about it.
+
+**Turn it on.** Put the engine in `~/work/aihub-images/` (`bin/sd-server` and, under `models/`, the files that
+`systemd/images/models.json` names; there is no build or fetch script yet), link the two units
+from the checkout (`systemctl --user link "$PWD/systemd/aihub-images.socket" "$PWD/systemd/aihub-images.service"`, which wants
+absolute paths, then `systemctl --user enable --now aihub-images.socket`), set `images: {socket: /run/user/1000/aihub-images/engine.sock}` in
+`~/.config/aihub/web.yaml`, and restart the service. `scripts/images/isolation_probe.sh` checks the unit's cage. The
+socket starts the engine on the first image and the engine exits after five idle minutes. If the units stop with
+`start-limit-hit`, `systemctl --user reset-failed aihub-images.socket aihub-images.service` and start the socket again.
+A socket that is missing or not owned by you shows the image models as unavailable, with this section named as the fix.
+
+**Using it.** The model picker lists a "Makes images" group next to "On this PC": Z-Image Turbo (the default, best at
+text in images) and FLUX.2 klein 4B (faster drafts, but it often misspells text). Choosing one puts the composer in image
+mode: the box is an "Image prompt", Send becomes "Create image", and a Shape chip (Square 1024 by 1024, Wide 1024 by 576,
+Tall 576 by 1024) takes the intensity chip's place and names the usual time for each shape. A box of signal bars shows
+the steps while the image is made. Stop ends the image (and the engine, which starts again for the next one); moving to
+another chat does not stop it, and coming back shows the progress and then the image. Under a finished image: Download (a `.webp`), New seed and "Redo with" the other
+model (both make the same prompt again as a new turn), Reuse prompt (the words go back in the box) and Full size.
+Choosing a text model leaves image mode. Editing an image is not built.
+
+**What it costs and what it blocks.** One image at a time uses the whole GPU, so while one is made local chat models
+answer "paused" and cloud models keep working; a second image waits up to two minutes for its turn. Each image has a time
+limit of three times its estimate plus a minute, at most five. The first image after the engine has been idle also loads the
+model, which adds to its time.
+
+**Storage.** Images live in `state/web/chats.db` as WebP (the schema is version 2, one `images` table) and go with their
+chat, when it expires or is deleted. Image storage stops at 2 GiB, after which new images are refused until chats are
+deleted. Code from before images refuses a version 2 database. To go back to it, stop the service and run
+`sqlite3 ~/work/Dev/aihub/state/web/chats.db 'PRAGMA user_version=1'`: the old code ignores the table, and deleting a
+chat still removes its images. To come forward again, run the same with `user_version=2` first (the upgrade creates the
+table, so it fails on a version 1 file that already has it). The desktop app keeps its own database and its frozen copy
+of the backend, so after pulling this change run `build:backend` and `dist:linux` again before pointing it at a
+version 2 database.
+
+**Exposure.** The engine is never reachable over the network, but the page's port is: if you put Tailscale in front of
+aihub (see Security), everyone the `allowed_hosts` list admits can make images and keep the GPU busy.
 
 ### Development
 - Tests: `uv run pytest -q` (Python), `TZ=UTC node --test "tests/js/*.test.mjs"` (browser modules).
@@ -103,6 +143,8 @@ writes it. With no keys, or empty ones, it starts on the local Ollama model, as 
 an optional `web.yaml` (the same settings as the service's), `desktop.json` (the port of the last run, which it tries
 first), `pycache/`, `logs/backend.log` (the previous run's log is kept as `backend.log.1`) and Chromium's profile. To carry
 the service's history over, stop the service and copy `state/web/chats.db` to `~/.config/aihub-desktop/state/`.
+Rebuild the app first if the service's database has image tables (schema version 2): an app built before the image work
+refuses to open one.
 
 **What differs from the browser page.**
 - Every launch picks a new random token. The backend refuses `/api/` requests that lack the `aihub_t` cookie, which only the
