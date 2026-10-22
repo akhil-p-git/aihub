@@ -622,3 +622,151 @@ class TestMigration:
         assert user_version(raw) == db_module.SCHEMA_VERSION
         assert raw.execute("SELECT count(*) FROM images").fetchone()[0] == 0
         raw.close()
+
+
+def backups_of(path: Path) -> list[Path]:
+    return sorted(path.parent.glob(f"{path.name}.v*.bak"))
+
+
+class TestBackup:
+    """A schema step rewrites the whole file and the chats live nowhere else, so the file is copied first."""
+
+    def test_upgrading_an_old_file_first_copies_it_as_it_was(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        before = rows_of(path)
+        Store(path, clock).close()
+        [backup] = backups_of(path)
+        assert backup.name == "chats.db.v1.bak"
+        assert rows_of(backup) == before
+        raw = sqlite3.connect(backup)
+        assert user_version(raw) == 1
+        assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert not raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'images'"
+        ).fetchone(), "the copy is from before the upgrade"
+        raw.close()
+
+    def test_the_copy_is_private_and_a_single_file(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        Store(path, clock).close()
+        [backup] = backups_of(path)
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+        sqlite3.connect(backup).close()
+        assert not (backup.parent / (backup.name + "-wal")).exists()
+        assert not (backup.parent / (backup.name + "-shm")).exists()
+
+    def test_a_new_file_and_a_current_one_are_not_copied(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = tmp_path / "chats.db"
+        Store(path, clock).close()
+        Store(path, clock).close()
+        assert backups_of(path) == []
+
+    def test_a_second_copy_never_replaces_the_first(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        Store(path, clock).close()
+        first = backups_of(path)[0].read_bytes()
+        for leftover in tmp_path.glob("chats.db-*"):
+            leftover.unlink()
+        shutil.copy(
+            FIXTURES / "chats-v1.db", path
+        )  # an old file again, as after a rollback
+        Store(path, clock).close()
+        assert [b.name for b in backups_of(path)] == [
+            "chats.db.v1-2.bak",
+            "chats.db.v1.bak",
+        ]
+        assert backups_of(path)[1].read_bytes() == first
+
+    def test_without_its_copy_the_upgrade_does_not_happen(
+        self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = v1_copy(tmp_path)
+        before = (schema_of(path), rows_of(path))
+        real = sqlite3.connect
+
+        def refuse_the_copy(target, *args, **kwargs):
+            if str(target).endswith(".bak"):
+                raise sqlite3.OperationalError("database or disk is full")
+            return real(target, *args, **kwargs)
+
+        monkeypatch.setattr(db_module.sqlite3, "connect", refuse_the_copy)
+        with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+            Store(path, clock)
+        monkeypatch.undo()
+        assert backups_of(path) == [], (
+            "no half-made copy is left to be mistaken for one"
+        )
+        assert (schema_of(path), rows_of(path)) == before
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == 1
+        raw.close()
+
+    def test_a_copy_goes_when_it_is_older_than_the_retention_period(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        clock.advance(days=30)
+        s.purge_expired(30)
+        assert len(backups_of(path)) == 1, "at exactly the limit it stays, like a chat"
+        clock.advance(seconds=1)
+        s.purge_expired(30)
+        assert backups_of(path) == []
+        s.close()
+
+    def test_a_deleted_copy_is_overwritten_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = b"private-marker-9c1d-" * 5000
+        target = tmp_path / "chats.db.v1.bak"
+        target.write_bytes(marker)
+        seen: list[bytes] = []
+        real_unlink = Path.unlink
+
+        def look_then_unlink(self: Path, *args, **kwargs) -> None:
+            seen.append(self.read_bytes())
+            real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", look_then_unlink)
+        db_module.shred(target)
+        assert seen == [bytes(len(marker))]
+        assert not target.exists()
+
+    def test_delete_all_takes_the_copies_with_it(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        assert len(backups_of(path)) == 1
+        s.delete_all()
+        assert backups_of(path) == []
+        s.close()
+
+    def test_a_file_that_only_looks_like_a_copy_is_never_touched(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        lookalike = tmp_path / "chats.db.v1-mine.bak"
+        shutil.copy(
+            FIXTURES / "chats-v1.db", lookalike
+        )  # somebody else's copy: no mark in its header
+        note = tmp_path / "chats.db.v9.bak"
+        note.write_text("not even a database")
+        clock.advance(days=400)
+        s.purge_expired(30)
+        s.delete_all()
+        assert lookalike.exists() and note.exists()
+        assert [b.name for b in backups_of(path)] == [
+            "chats.db.v1-mine.bak",
+            "chats.db.v9.bak",
+        ]
+        s.close()

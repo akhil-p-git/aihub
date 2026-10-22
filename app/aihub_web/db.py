@@ -17,6 +17,9 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 DAY_MS = 86_400_000
+# Set on the copies this app makes before a schema upgrade (SQLite's application_id, "AHB1"), so that expiring
+# old copies never touches a file somebody else put in the folder under a similar name.
+BACKUP_APPLICATION_ID = 0x41484231
 # Columns update_chat may change; the names are interpolated into SQL, so never take them from input.
 EDITABLE_CHAT_COLUMNS = ("title", "model", "effort")
 
@@ -79,6 +82,18 @@ CREATE INDEX images_chat ON images (chat_id);
 # step, so it ends up with exactly the tables, columns and SQL that an upgraded file has.
 MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA}
 SCHEMA_VERSION = max(MIGRATIONS)
+
+
+def shred(path: Path) -> None:
+    """Overwrite a file with zeroes, then remove it: what secure_delete does for rows, and as best effort as it is
+    (a disk that writes copy-on-write may keep the old blocks)."""
+    remaining = path.stat().st_size
+    with open(path, "r+b") as file:
+        while remaining > 0:
+            remaining -= file.write(bytes(min(remaining, 1 << 20)))
+        file.flush()
+        os.fsync(file.fileno())
+    path.unlink()
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +182,7 @@ class Store:
     def __init__(self, path: Path, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
         self._lock = threading.RLock()
+        self._path = path
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Create the file ourselves so it is private from the first byte; SQLite gives -wal and -shm the same mode.
         os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
@@ -193,8 +209,53 @@ class Store:
             raise RuntimeError(
                 f"database schema {version} is newer than this app ({SCHEMA_VERSION})"
             )
+        if 0 < version < SCHEMA_VERSION:
+            self._back_up(version)
         for step in range(version + 1, SCHEMA_VERSION + 1):
             self._run_step(step)
+
+    def _back_up(self, version: int) -> None:
+        """Copy the file as it is before a schema step rewrites it: the chats live nowhere else. If the copy cannot
+        be made the upgrade does not happen. The copy is private, one file, and goes when its chats would have."""
+        stem = f"{self._path.name}.v{version}"
+        target = self._path.with_name(f"{stem}.bak")
+        for n in range(2, 1000):
+            if not target.exists():
+                break
+            target = self._path.with_name(f"{stem}-{n}.bak")
+        os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        try:
+            copy = sqlite3.connect(target)
+            try:
+                self._db.backup(copy)
+                copy.execute(f"PRAGMA application_id = {BACKUP_APPLICATION_ID}")
+            finally:
+                copy.close()
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        stamp = self._clock()
+        os.utime(target, (stamp, stamp))
+        log.info(
+            "copied the database to %s before upgrading it from schema %d",
+            target.name,
+            version,
+        )
+
+    def _backups(self) -> list[Path]:
+        """The copies this app made: named like one, and marked as one in the file's header."""
+        found = []
+        for path in sorted(self._path.parent.glob(f"{self._path.name}.v*.bak")):
+            try:
+                with open(path, "rb") as file:
+                    header = file.read(100)
+            except OSError:
+                continue
+            if header[:16] == b"SQLite format 3\0" and header[
+                68:72
+            ] == BACKUP_APPLICATION_ID.to_bytes(4, "big"):
+                found.append(path)
+        return found
 
     def _run_step(self, step: int) -> None:
         """One schema step in one transaction: a step that fails leaves the file at the version before it."""
@@ -305,6 +366,8 @@ class Store:
         with self._tx() as db:
             count = db.execute("DELETE FROM chats").rowcount
         self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for backup in self._backups():
+            shred(backup)
         return count
 
     def purge_expired(self, retention_days: int) -> int:
@@ -318,6 +381,16 @@ class Store:
             # Move the deleted text out of the write-ahead log too.
             self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             log.info("purged %d chat(s) older than %d days", count, retention_days)
+        # A copy made before an upgrade holds chats as they were, so it may not outlive them.
+        stale = self._clock() - retention_days * DAY_MS / 1000
+        for backup in self._backups():
+            if backup.stat().st_mtime < stale:
+                shred(backup)
+                log.info(
+                    "removed %s, which is older than %d days",
+                    backup.name,
+                    retention_days,
+                )
         return count
 
     # messages
