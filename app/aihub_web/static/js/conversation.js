@@ -284,7 +284,10 @@ export class ReplyView {
         return "Queued…";
       case "sampling":
         if (this.est && this.est < 10) return `About ${this.est} s`;
-        return this.step ? `Step ${this.step} of ${this.steps}` : "Sampling…";
+        // Before the first step the engine is loading the model and reading the prompt, which takes seconds.
+        return this.step
+          ? `Step ${this.step} of ${this.steps}`
+          : `Working… ${Math.round((now - this.lastProgress) / 1000)} s`;
       case "finishing":
         return "Finishing…";
       default:

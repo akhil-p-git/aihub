@@ -299,6 +299,40 @@ describe("a job in progress", () => {
     await context.close();
   });
 
+  it("words each phase of an image as the plan lists them", async () => {
+    const { page, context } = await open(browser, app);
+    const shown = await page.evaluate(async () => {
+      const { ReplyView } = await import("/js/conversation.js");
+      const view = new ReplyView({ image: { shape: "square", est: 23 } });
+      document.body.append(view.el);
+      const labels = [view.el.querySelector(".img-label").textContent];
+      for (const event of [
+        { phase: "waiting" },
+        { phase: "starting" },
+        { phase: "queued" },
+        { phase: "sampling" },
+        { phase: "sampling", step: 2, steps: 8 },
+        { phase: "finishing" },
+      ]) {
+        view.progress(event);
+        labels.push(view.el.querySelector(".img-label").textContent);
+      }
+      view.stopping();
+      labels.push(view.el.querySelector(".img-label").textContent);
+      view.discard();
+      return labels;
+    });
+    assert.match(shown[0], /^Preparing…$/);
+    assert.match(shown[1], /^Waiting for the GPU…$/);
+    assert.match(shown[2], /^Starting the image engine… \d+ s$/);
+    assert.match(shown[3], /^Queued…$/);
+    assert.match(shown[4], /^Working… \d+ s$/);
+    assert.match(shown[5], /^Step 2 of 8$/);
+    assert.match(shown[6], /^Finishing…$/);
+    assert.match(shown[7], /^Stopping…$/);
+    await context.close();
+  });
+
   it("warns about a stall even when a polled chat hears the same progress again and again", async () => {
     const { page, context } = await open(browser, app);
     const text = await page.evaluate(async () => {
