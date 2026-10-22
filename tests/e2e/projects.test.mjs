@@ -383,6 +383,353 @@ describe("editing and deleting a project", () => {
   });
 });
 
+describe("what a review found", () => {
+  const many = async (base, count) => {
+    for (let n = 1; n <= count; n++) await makeProject(base, `Many ${String(n).padStart(2, "0")}`);
+  };
+  const inside = (box, view) =>
+    box.x >= 0 && box.y >= 0 && box.x + box.width <= view.width && box.y + box.height <= view.height;
+
+  it("lets the Move menu reach every project, however many there are", async () => {
+    const crowded = await startApp();
+    try {
+      await many(crowded, 18);
+      const chatId = await makeChat(crowded, "a chat among many projects");
+      const { page, context } = await open(browser, crowded, { hash: `#/c/${chatId}` });
+      await rowMenu(page, "Options for a chat among many projects", "Move to project…");
+      const menu = page.locator("#effort-pop");
+      await menu.waitFor();
+      const view = page.viewportSize();
+      assert.ok(inside(await menu.boundingBox(), view), "the menu is on the screen");
+      // The mouse wheel takes the last project into view, and it can be clicked where it is shown.
+      const box = await menu.boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.wheel(0, 3000);
+      await page.waitForFunction(() => {
+        const rows = document.querySelector("#effort-pop [role=radiogroup]"); // the wheel is applied asynchronously
+        return rows.scrollTop + rows.clientHeight >= rows.scrollHeight - 1;
+      });
+      const last = page.getByRole("radio", { name: "Many 18" });
+      const row = await last.boundingBox();
+      assert.ok(row.y >= box.y - 1 && row.y + row.height <= box.y + box.height + 1, "the last row is inside the menu");
+      const hit = await page.evaluate(
+        ([x, y]) => document.elementFromPoint(x, y)?.closest("[role=radio]")?.textContent,
+        [row.x + row.width / 2, row.y + row.height / 2],
+      );
+      assert.match(hit, /Many 18/);
+      await context.close();
+    } finally {
+      crowded.stop();
+    }
+  });
+
+  it("places a popover on the side that has room for it, and caps its height there", async () => {
+    const { page, context } = await open(browser, app); // 1280 x 800
+    const placed = await page.evaluate(async () => {
+      const { placePopover } = await import("/js/dom.js");
+      const place = ({ anchorTop, rows, below }) => {
+        const anchor = document.createElement("button");
+        Object.assign(anchor.style, {
+          position: "fixed",
+          insetInlineStart: "200px",
+          insetBlockStart: `${anchorTop}px`,
+          blockSize: "32px",
+        });
+        const pop = document.createElement("div");
+        pop.className = "pop";
+        pop.setAttribute("popover", "manual");
+        for (let n = 0; n < rows; n++) {
+          const row = document.createElement("div");
+          row.style.blockSize = "36px";
+          pop.append(row);
+        }
+        document.body.append(anchor, pop);
+        pop.showPopover();
+        placePopover(pop, anchor, { below });
+        const a = anchor.getBoundingClientRect();
+        const p = pop.getBoundingClientRect();
+        const result = {
+          below: pop.hasAttribute("data-below"),
+          gapBelow: p.top - a.bottom, // when the popover is under the anchor
+          gapAbove: a.top - p.bottom, // when it is over it
+          top: p.top,
+          bottom: p.bottom,
+          height: p.height,
+        };
+        pop.remove();
+        anchor.remove();
+        return result;
+      };
+      return {
+        tallNearTop: place({ anchorTop: 100, rows: 14, below: false }),
+        tallNearBottom: place({ anchorTop: 700, rows: 14, below: true }),
+        shortAskedBelow: place({ anchorTop: 300, rows: 3, below: true }),
+        shortAskedAbove: place({ anchorTop: 300, rows: 3, below: false }),
+        // Neither side can show all of it: it keeps the roomier side, whichever it asked for, and fits there.
+        tightAskedBelow: place({ anchorTop: 300, rows: 14, below: true }),
+        tightAskedAbove: place({ anchorTop: 440, rows: 14, below: false }),
+      };
+    });
+    const next = (gap) => gap >= 0 && gap <= 12; // next to its anchor, not merely on its side of it
+    const shown = (result) => result.top >= 0 && result.bottom <= 800;
+    const check = (name, result, below) => {
+      assert.equal(result.below, below, `${name}: ${below ? "under" : "over"} its anchor`);
+      assert.ok(
+        next(below ? result.gapBelow : result.gapAbove),
+        `${name}: next to its anchor ${JSON.stringify(result)}`,
+      );
+      assert.ok(shown(result), `${name}: on the screen ${JSON.stringify(result)}`);
+    };
+    check("a tall menu with no room above", placed.tallNearTop, true);
+    check("a tall menu with no room below", placed.tallNearBottom, false);
+    check("a short menu asked for below", placed.shortAskedBelow, true);
+    check("a short menu asked for above", placed.shortAskedAbove, false);
+    check("a menu too tall for either side, asked for below (more room there)", placed.tightAskedBelow, true);
+    check("a menu too tall for either side, asked for above (more room there)", placed.tightAskedAbove, false);
+    // 800 - (300 + 32) - 12 under the first, 440 - 12 over the second: as tall as the room, no more and no less.
+    assert.ok(Math.abs(placed.tightAskedBelow.height - 456) <= 1, `${placed.tightAskedBelow.height}px of 456`);
+    assert.ok(Math.abs(placed.tightAskedAbove.height - 428) <= 1, `${placed.tightAskedAbove.height}px of 428`);
+    await context.close();
+  });
+
+  it("measures a popover afresh each time it is placed, not by the cap it was last given", async () => {
+    const { page, context } = await open(browser, app);
+    await page.setViewportSize({ width: 1280, height: 300 });
+    await page.evaluate(async () => {
+      const { placePopover } = await import("/js/dom.js");
+      const anchor = document.createElement("button");
+      anchor.id = "probe-anchor";
+      Object.assign(anchor.style, {
+        position: "fixed",
+        insetInlineStart: "200px",
+        insetBlockStart: "100px",
+        blockSize: "32px",
+      });
+      const pop = document.createElement("div");
+      pop.id = "probe-pop";
+      pop.className = "pop";
+      pop.setAttribute("popover", "manual");
+      for (let n = 0; n < 14; n++) {
+        const row = document.createElement("div");
+        row.style.blockSize = "36px";
+        pop.append(row);
+      }
+      document.body.append(anchor, pop);
+      pop.showPopover();
+      placePopover(pop, anchor, { below: false }); // squeezed to the little room that the short window has
+    });
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const after = await page.evaluate(async () => {
+      const { placePopover } = await import("/js/dom.js");
+      const anchor = document.getElementById("probe-anchor");
+      anchor.style.insetBlockStart = "250px"; // 238px over it and 506px under it, for a menu that wants 480px
+      const pop = document.getElementById("probe-pop");
+      placePopover(pop, anchor, { below: false });
+      return { below: pop.hasAttribute("data-below"), height: pop.getBoundingClientRect().height };
+    });
+    assert.deepEqual({ below: after.below, height: Math.round(after.height) }, { below: true, height: 480 });
+    await context.close();
+  });
+
+  it("keeps both menus docked to the bottom of a phone, however high their button is", async () => {
+    const quiet = await startApp(); // its own, so that the chat is near the top of the drawer
+    try {
+      await makeProject(quiet, "Phone one");
+      const chatId = await makeChat(quiet, "a chat high on a phone");
+      const { page, context } = await open(browser, quiet, {
+        width: 360,
+        height: 640,
+        mobile: true,
+        hash: `#/c/${chatId}`,
+      });
+      await page.locator("#nav-open").click();
+      const docked = async (selector, what) => {
+        const sheet = await page.locator(selector).boundingBox();
+        const view = page.viewportSize();
+        assert.ok(
+          Math.abs(sheet.y + sheet.height - view.height) <= 1 && sheet.width === view.width,
+          `${what} is docked to the bottom: ${JSON.stringify(sheet)}`,
+        );
+      };
+      await page.getByRole("button", { name: "Options for a chat high on a phone" }).click();
+      await page.locator("#row-menu").waitFor();
+      await docked("#row-menu", "the row menu");
+      await page.getByRole("menuitem", { name: "Move to project…" }).click();
+      await page.locator("#effort-pop").waitFor();
+      await docked("#effort-pop", "the Move menu");
+      await context.close();
+    } finally {
+      quiet.stop();
+    }
+  });
+
+  it("opens the Move menu under the chat's button when it fits there", async () => {
+    const quiet = await startApp(); // its own, so that the chat is near the top of the sidebar
+    try {
+      await makeProject(quiet, "Move one");
+      await makeProject(quiet, "Move two");
+      const chatId = await makeChat(quiet, "a chat high in the sidebar");
+      const { page, context } = await open(browser, quiet, { hash: `#/c/${chatId}` });
+      await rowMenu(page, "Options for a chat high in the sidebar", "Move to project…");
+      const menu = page.locator("#effort-pop");
+      await menu.waitFor();
+      const button = await page.getByRole("button", { name: "Options for a chat high in the sidebar" }).boundingBox();
+      const box = await menu.boundingBox();
+      const gap = box.y - (button.y + button.height);
+      assert.ok(gap >= 0 && gap <= 12, `${gap}px under the button that led to it`);
+      await context.close();
+    } finally {
+      quiet.stop();
+    }
+  });
+
+  it("keeps a row menu next to its button, under it when there is room and over it when there is not", async () => {
+    const crowded = await startApp();
+    try {
+      await many(crowded, 18);
+      const chatId = await makeChat(crowded, "a chat at the bottom");
+      const { page, context } = await open(browser, crowded, { hash: `#/c/${chatId}` });
+      const where = async (label) => {
+        await page.getByRole("button", { name: label }).click();
+        const menu = page.locator("#row-menu");
+        await menu.waitFor();
+        const button = await page.getByRole("button", { name: label }).boundingBox();
+        const box = await menu.boundingBox();
+        await page.keyboard.press("Escape");
+        await menu.waitFor({ state: "hidden" });
+        return { button, box };
+      };
+      const view = page.viewportSize();
+      const top = await where("Options for Many 01");
+      assert.ok(inside(top.box, view), "the menu is on the screen");
+      const under = top.box.y - (top.button.y + top.button.height);
+      assert.ok(under >= 0 && under <= 12, `under a button high on the screen, ${under}px from it`);
+      const bottom = await where("Options for a chat at the bottom");
+      assert.ok(inside(bottom.box, view), "the menu is on the screen");
+      const over = bottom.button.y - (bottom.box.y + bottom.box.height);
+      assert.ok(over >= 0 && over <= 12, `over a button at the bottom of the sidebar, ${over}px from it`);
+      await context.close();
+    } finally {
+      crowded.stop();
+    }
+  });
+
+  it("does the same in the sheet on a phone", async () => {
+    const crowded = await startApp();
+    try {
+      await many(crowded, 18);
+      const chatId = await makeChat(crowded, "a phone chat among many");
+      const { page, context } = await open(browser, crowded, {
+        width: 360,
+        height: 640,
+        mobile: true,
+        hash: `#/c/${chatId}`,
+      });
+      await page.locator("#nav-open").click();
+      await rowMenu(page, "Options for a phone chat among many", "Move to project…");
+      const menu = page.locator("#effort-pop");
+      await menu.waitFor();
+      const view = page.viewportSize();
+      const sheet = await menu.boundingBox();
+      assert.ok(inside(sheet, view), "the sheet is on the screen");
+      assert.ok(
+        Math.abs(sheet.y + sheet.height - view.height) <= 1 && sheet.width === view.width,
+        "docked to the bottom",
+      );
+      const scrolls = await page.locator("#effort-pop [role=radiogroup]").evaluate((el) => ({
+        overflow: getComputedStyle(el).overflowY,
+        longer: el.scrollHeight > el.clientHeight,
+      }));
+      assert.deepEqual(scrolls, { overflow: "auto", longer: true }, "the rows scroll");
+      await context.close();
+    } finally {
+      crowded.stop();
+    }
+  });
+
+  it("keeps the keyboard on the chat's options button after a move", async () => {
+    await makeProject(app, "Keyboard move");
+    const chatId = await makeChat(app, "a chat moved by keyboard");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chatId}` });
+    await page.getByRole("button", { name: "Options for a chat moved by keyboard" }).focus();
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("ArrowDown"); // Move to project…
+    await page.keyboard.press("Enter");
+    await page.getByRole("radio", { name: "Keyboard move" }).focus();
+    await page.keyboard.press("Enter");
+    await toast(page, "Moved to Keyboard move.").waitFor();
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.getAttribute("aria-label")),
+      "Options for a chat moved by keyboard",
+    );
+    await context.close();
+  });
+
+  it("puts the keyboard on New project after a project is deleted from the keyboard", async () => {
+    await makeProject(app, "Keyboard delete");
+    const { page, context } = await open(browser, app);
+    await page.getByRole("button", { name: "Options for Keyboard delete" }).focus();
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("ArrowDown"); // Delete…
+    await page.keyboard.press("Enter");
+    const dlg = dialog(page, "Delete this project?");
+    await dlg.waitFor();
+    await dlg.getByRole("button", { name: "Delete project" }).focus();
+    await page.keyboard.press("Enter");
+    await toast(page, "Project deleted.").waitFor();
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "new-project");
+    await context.close();
+  });
+
+  it("does not let a long project name widen a phone", async () => {
+    const name = "W".repeat(80);
+    const project = await makeProject(app, name);
+    const chatId = await makeChat(app, "a chat in a long project", project.id);
+    const { page, context } = await open(browser, app, {
+      width: 320,
+      height: 640,
+      mobile: true,
+      hash: `#/c/${chatId}`,
+    });
+    // On a phone, overflowing content makes the browser widen the layout viewport, so scrollWidth never exceeds
+    // innerWidth: compare with the width the page was asked to fit.
+    const sideways = () =>
+      page.evaluate(
+        (width) => document.documentElement.scrollWidth > width || window.innerWidth > width,
+        page.viewportSize().width,
+      );
+    await page.locator("#title-sub").filter({ hasText: "Project: WWW" }).waitFor();
+    assert.equal(await sideways(), false, "the title line");
+    await page.locator("#nav-open").click();
+    await page.getByRole("button", { name: `New chat in ${name}` }).click();
+    await page.getByRole("heading", { name: `New chat in ${name}` }).waitFor();
+    assert.equal(await sideways(), false, "the empty state");
+    await page.locator("#nav-open").click();
+    await rowMenu(page, `Options for ${name}`, "Delete…");
+    const dlg = dialog(page, "Delete this project?");
+    await dlg.waitFor();
+    assert.ok(inside(await dlg.boundingBox(), page.viewportSize()), "the delete dialog fits");
+    assert.equal(await sideways(), false, "with the delete dialog open");
+    await context.close();
+  });
+
+  it("leaves a chat that was deleted with its project even when the page had not loaded it", async () => {
+    const project = await makeProject(app, "Unlisted");
+    const { page, context } = await open(browser, app); // loaded before the chat exists, so its list lacks it
+    const chatId = await makeChat(app, "a chat the list does not know", project.id);
+    await page.evaluate((id) => (location.hash = `#/c/${id}`), chatId);
+    await page.locator("#title-sub").filter({ hasText: "Project: Unlisted" }).waitFor();
+    await rowMenu(page, "Options for Unlisted", "Delete…");
+    const dlg = dialog(page, "Delete this project?");
+    await dlg.getByRole("checkbox", { name: "Also delete its 1 chat" }).check();
+    await dlg.getByRole("button", { name: "Delete project" }).click();
+    await dlg.waitFor({ state: "detached" });
+    await page.getByRole("heading", { name: /^New chat on / }).waitFor();
+    assert.equal((await fetch(`${app.url}/api/chats/${chatId}`)).status, 404);
+    await context.close();
+  });
+});
+
 describe("Settings", () => {
   it("says that deleting all chats leaves the projects", async () => {
     await makeProject(app, "Stays");

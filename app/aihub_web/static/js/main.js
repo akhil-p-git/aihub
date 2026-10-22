@@ -795,6 +795,7 @@ async function deleteProject(project) {
   if (!current) return renderSidebarNow();
   const choice = await openDeleteProject({ project: current, chatCount: current.chat_count });
   if (!choice) return;
+  const hadFocus = els.nav.contains(document.activeElement);
   try {
     await api.del(`/api/projects/${project.id}`, { chats: choice.chats });
   } catch (err) {
@@ -810,12 +811,16 @@ async function deleteProject(project) {
   state.projects = state.projects.filter((p) => p.id !== project.id);
   setOpen(project.id, false);
   if (state.draftProject === project.id) state.draftProject = null;
-  if (state.chat && doomed.has(state.chat.id)) go("#/");
+  // The open chat goes too if it was one of those, including one that the list of loaded chats does not hold.
+  const openChatGone =
+    state.chat && (doomed.has(state.chat.id) || (choice.chats === "delete" && state.chat.project_id === project.id));
+  if (openChatGone) go("#/");
   else {
     if (state.chat?.project_id === project.id) state.chat = { ...state.chat, project_id: null };
     renderSidebarNow();
     renderTitle();
     if (!state.chat) renderRoute();
+    if (hadFocus) els.nav.querySelector("#new-project")?.focus();
   }
   toast("Project deleted.");
 }
@@ -827,6 +832,7 @@ function chooseProjectFor(chat, anchor) {
     choices: [["none", "No project"], ...state.projects.map((project) => [project.id, project.name])],
     selected: chat.project_id ?? "none",
     text: "",
+    below: true,
     onSelect: (value) => moveChat(chat, value === "none" ? null : value),
   });
 }
@@ -835,6 +841,7 @@ async function moveChat(chat, projectId) {
   const was = projectById(chat.project_id)?.name;
   try {
     const updated = await api.patch(`/api/chats/${chat.id}`, { project_id: projectId });
+    const hadFocus = els.nav.contains(document.activeElement); // the list is about to be rebuilt under it
     upsertChat(updated);
     if (state.chat?.id === chat.id) {
       state.chat = { ...state.chat, project_id: updated.project_id };
@@ -842,6 +849,7 @@ async function moveChat(chat, projectId) {
     }
     if (projectId) setOpen(projectId, true);
     renderSidebarNow();
+    if (hadFocus) els.nav.querySelector(`.chat-row[data-id="${chat.id}"] .menu-btn`)?.focus();
     toast(projectId ? `Moved to ${projectById(projectId)?.name}.` : `Removed from ${was ?? "its project"}.`);
   } catch (err) {
     toast(err.code === "no_project" ? "That project was deleted." : err.message);

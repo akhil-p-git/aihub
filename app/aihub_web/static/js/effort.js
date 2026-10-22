@@ -43,7 +43,7 @@ function build() {
 }
 
 /** `rows` are { value, content[] }; `selected` is the value that is checked. */
-function show({ anchor, onSelect, title, rows, selected, text }) {
+function show({ anchor, onSelect, title, rows, selected, text, below = false }) {
   if (!pop) build();
   if (closedAt && performance.now() - closedAt < 250) return;
   current = { anchor, onSelect };
@@ -69,7 +69,7 @@ function show({ anchor, onSelect, title, rows, selected, text }) {
   note.textContent = text;
   anchor.setAttribute("aria-expanded", "true");
   pop.showPopover();
-  placePopover(pop, anchor);
+  placePopover(pop, anchor, { below });
   group.querySelector('[aria-checked="true"]')?.focus();
 }
 
@@ -88,11 +88,12 @@ export function openEffortMenu({ anchor, levels, selected, paid, onSelect }) {
 }
 
 /** `choices` are [value, label] pairs; `text` is the note under them. */
-export function openChoiceMenu({ anchor, title, choices, selected, text, onSelect }) {
+export function openChoiceMenu({ anchor, title, choices, selected, text, onSelect, below }) {
   show({
     anchor,
     onSelect,
     title,
+    below,
     selected,
     rows: choices.map(([value, label]) => ({ value, content: [h("span", {}, label)] })),
     text,

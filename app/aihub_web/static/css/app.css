@@ -323,6 +323,7 @@
   .title-wrap { flex: 1; min-inline-size: 0; }
   .title { font-size: var(--text-md); font-weight: 600; letter-spacing: -0.005em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .title-sub { display: flex; flex-wrap: wrap; gap: 0 var(--s-3); font-size: var(--text-xs); color: var(--muted); }
+  .title-sub > span { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Empty state: where the next prompt goes */
   .route { margin-block: auto; padding-block: var(--s-12); display: grid; gap: var(--s-3); }
@@ -512,14 +513,16 @@
     border: 0; border-radius: var(--r-lg); background: var(--raised); color: var(--ink);
     box-shadow: var(--shadow-pop);
     inset-inline-start: var(--pop-x, var(--s-4)); inset-block-end: var(--pop-bottom, 6rem);
-    inline-size: min(26rem, calc(100vw - 2rem)); max-block-size: min(30rem, 70dvh);
+    inline-size: min(26rem, calc(100vw - 2rem)); max-block-size: min(30rem, 70dvh, var(--pop-max, 100dvh));
     overflow: hidden; display: none; flex-direction: column;
     &:popover-open { display: flex; }
     &::backdrop { background: transparent; }
   }
   .pop-head { display: none; }
+  .pop[data-below] { inset-block: var(--pop-top) auto; }
   .pop-effort { inline-size: min(16rem, calc(100vw - 2rem)); }
-  .pop-menu { inline-size: 12rem; inset-block: var(--pop-top, 4rem) auto; }
+  .pop-effort [role="radiogroup"] { min-block-size: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .pop-menu { inline-size: 12rem; }
   @media (max-width: 40rem) {
     .pop {
       inset-inline: 0; inset-block: auto 0; inline-size: auto; max-block-size: 78dvh;
