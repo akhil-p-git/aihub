@@ -33,8 +33,11 @@ async function waitFor(url, what, child) {
   throw new Error(`${what} did not come up at ${url}`);
 }
 
-/** keys: whether the OpenRouter and Anthropic keys are set. seedTurns: preload one chat with that many exchanges. */
-export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0 } = {}) {
+/**
+ * keys: whether the OpenRouter and Anthropic keys are set. seedTurns: preload one chat with that many exchanges.
+ * images: set up image generation against a fake engine; `engine` then reads and steers it (see fake_engine.py).
+ */
+export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0, images = false } = {}) {
   const [fakePort, appPort] = [await freePort(), await freePort()];
   const dir = mkdtempSync(join(tmpdir(), "aihub-e2e-"));
   const python = join(root, ".venv", "bin", "python");
@@ -42,6 +45,22 @@ export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0 
   const fake = spawn(python, [join(root, "tests", "e2e", "fake_providers.py"), String(fakePort)], { stdio: "ignore" });
   const fakeUrl = `http://127.0.0.1:${fakePort}`;
   await waitFor(`${fakeUrl}/api/tags`, "fake providers", fake);
+
+  let engineProcess = null;
+  let engineUrl = "";
+  if (images) {
+    const enginePort = await freePort();
+    engineUrl = `http://127.0.0.1:${enginePort}`;
+    engineProcess = spawn(
+      python,
+      [join(root, "tests", "e2e", "fake_engine.py"), join(dir, "engine.sock"), String(enginePort)],
+      {
+        env: { PATH: process.env.PATH, PYTHONPATH: join(root, "app") },
+        stdio: process.env.E2E_LOG ? "inherit" : "ignore",
+      },
+    );
+    await waitFor(`${engineUrl}/__calls`, "fake image engine", engineProcess);
+  }
 
   const config = join(dir, "web.yaml");
   writeFileSync(
@@ -52,6 +71,7 @@ export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0 
       `ollama: { url: "${fakeUrl}" }`,
       `openrouter: { url: "${fakeUrl}/api/v1" }`,
       `anthropic: { url: "${fakeUrl}" }`,
+      ...(images ? [`images: { socket: "${join(dir, "engine.sock")}" }`] : []),
     ].join("\n"),
   );
   let seededChat = null;
@@ -79,9 +99,15 @@ export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0 
     fakeUrl,
     seededChat,
     requests: async () => (await fetch(`${fakeUrl}/__requests`)).json(),
+    engine: images && {
+      calls: async () => (await fetch(`${engineUrl}/__calls`)).json(),
+      submitted: async () => (await fetch(`${engineUrl}/__submitted`)).json(),
+      release: (count = 1) => fetch(`${engineUrl}/__release?count=${count}`, { method: "POST" }),
+    },
     stop: () => {
       app.kill("SIGTERM");
       fake.kill("SIGTERM");
+      engineProcess?.kill("SIGTERM");
     },
   };
 }
