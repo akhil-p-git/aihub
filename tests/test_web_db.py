@@ -785,6 +785,37 @@ class TestBackup:
         ]
         s.close()
 
+    def test_a_link_that_looks_like_a_copy_is_not_followed_or_removed(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        [real] = backups_of(path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        precious = elsewhere / "precious.bak"
+        shutil.copy(
+            real, precious
+        )  # marked as a copy in its header, but not one of ours to remove
+        before = precious.read_bytes()
+        link = tmp_path / "chats.db.v1-link.bak"
+        link.symlink_to(precious)
+        clock.advance(days=400)
+        s.purge_expired(30)
+        s.delete_all()
+        assert link.is_symlink() and precious.read_bytes() == before
+        assert not real.exists(), "the real copy did go"
+        s.close()
+
+    def test_shredding_refuses_a_link(self, tmp_path: Path) -> None:
+        target = tmp_path / "target"
+        target.write_bytes(b"keep me")
+        link = tmp_path / "link"
+        link.symlink_to(target)
+        with pytest.raises(OSError):
+            db_module.shred(link)
+        assert target.read_bytes() == b"keep me" and link.is_symlink()
+
 
 class TestMigrationToProjects:
     """chats-v2.db is a real version 2 file: the db.py of commit 21d5fab (schema 2) opened chats-v1.db, which upgraded

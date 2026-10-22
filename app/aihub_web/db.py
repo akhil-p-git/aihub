@@ -100,13 +100,14 @@ SCHEMA_VERSION = max(MIGRATIONS)
 
 def shred(path: Path) -> None:
     """Overwrite a file with zeroes, then remove it: what secure_delete does for rows, and as best effort as it is
-    (a disk that writes copy-on-write may keep the old blocks)."""
-    remaining = path.stat().st_size
-    with open(path, "r+b") as file:
+    (a disk that writes copy-on-write may keep the old blocks). A link is refused, never followed."""
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "wb") as file:
+        remaining = os.fstat(fd).st_size
         while remaining > 0:
             remaining -= file.write(bytes(min(remaining, 1 << 20)))
         file.flush()
-        os.fsync(file.fileno())
+        os.fsync(fd)
     path.unlink()
 
 
@@ -274,6 +275,8 @@ class Store:
         """The copies this app made: named like one, and marked as one in the file's header."""
         found = []
         for path in sorted(self._path.parent.glob(f"{self._path.name}.v*.bak")):
+            if path.is_symlink() or not path.is_file():
+                continue
             try:
                 with open(path, "rb") as file:
                     header = file.read(100)
