@@ -13,11 +13,14 @@ import {
   formatPrice,
   formatPriceLong,
   formatSpeed,
+  formatWhen,
   groupChats,
   levelLabel,
   routeFor,
   shapeNote,
   shortName,
+  taskStatus,
+  taskNext,
 } from "../../app/aihub_web/static/js/format.js";
 
 const DAY = 86_400_000;
@@ -212,5 +215,111 @@ describe("estimateTokens: the server's rule, so the project dialog counts what i
   it("counts characters, not UTF-16 units: an emoji is one", () => {
     assert.equal(estimateTokens("😀😀😀"), 2);
     assert.equal(estimateTokens("é".repeat(6)), 3);
+  });
+});
+
+describe("formatWhen", () => {
+  const at = (...parts) => Date.UTC(...parts);
+  const cases = [
+    [at(2026, 9, 20, 8, 5), "today 08:05"], // the same day, earlier than now
+    [at(2026, 9, 20, 23, 59), "today 23:59"],
+    [at(2026, 9, 21, 0, 0), "tomorrow 00:00"],
+    [at(2026, 9, 19, 22, 0), "yesterday 22:00"],
+    [at(2026, 9, 22, 7, 0), "Thu 07:00"], // within the next week: the day of the week
+    [at(2026, 9, 26, 7, 0), "Mon 07:00"],
+    [at(2026, 9, 27, 7, 0), "27 Oct 07:00"], // a week or more ahead: the date
+    [at(2026, 9, 12, 9, 30), "12 Oct 09:30"], // more than a day ago: the date
+    [at(2027, 0, 4, 12, 0), "4 Jan 2027 12:00"], // another year says the year
+  ];
+  for (const [ms, text] of cases) {
+    it(`${new Date(ms).toISOString()} reads "${text}"`, () => assert.equal(formatWhen(ms, NOW), text));
+  }
+});
+
+describe("taskStatus", () => {
+  const task = (changes) => ({
+    running: false,
+    enabled: true,
+    last_status: null,
+    last_run_at: null,
+    last_error: null,
+    ...changes,
+  });
+  const ran = Date.UTC(2026, 9, 20, 8, 2);
+
+  it("says a task that never ran has not run", () => {
+    assert.deepEqual(taskStatus(task({}), NOW), { kind: "none", label: "Not run yet" });
+  });
+
+  it("says a task that is running is running, whatever it did last", () => {
+    assert.deepEqual(taskStatus(task({ running: true, last_status: "error", last_run_at: ran }), NOW), {
+      kind: "running",
+      label: "Running now",
+    });
+  });
+
+  it("says when a run was done", () => {
+    assert.deepEqual(taskStatus(task({ last_status: "done", last_run_at: ran }), NOW), {
+      kind: "done",
+      label: "Done today 08:02",
+    });
+  });
+
+  it("gives the reason of a run that failed, was stopped, or was skipped", () => {
+    assert.deepEqual(taskStatus(task({ last_status: "error", last_run_at: ran, last_error: "Gone." }), NOW), {
+      kind: "error",
+      label: "Failed today 08:02",
+      reason: "Gone.",
+    });
+    assert.deepEqual(taskStatus(task({ last_status: "stopped", last_run_at: ran, last_error: "Too long." }), NOW), {
+      kind: "error",
+      label: "Stopped today 08:02",
+      reason: "Too long.",
+    });
+    assert.deepEqual(taskStatus(task({ last_status: "skipped", last_run_at: ran, last_error: "Late." }), NOW), {
+      kind: "skipped",
+      label: "Skipped today 08:02",
+      reason: "Late.",
+    });
+  });
+
+  it("explains a task the scheduler switched off with the scheduler's own words", () => {
+    const off = task({
+      enabled: false,
+      switched_off: true,
+      last_status: "error",
+      last_run_at: ran,
+      last_error: "Switched off after 3 failed runs in a row. The last one: Gone.",
+    });
+    assert.deepEqual(taskStatus(off, NOW), {
+      kind: "off",
+      label: "Switched off",
+      reason: "Switched off after 3 failed runs in a row. The last one: Gone.",
+    });
+  });
+
+  it("does not call a task that was paused by hand switched off", () => {
+    assert.equal(taskStatus(task({ enabled: false, last_status: "done", last_run_at: ran }), NOW).kind, "done");
+  });
+});
+
+describe("taskNext", () => {
+  const next = (changes) => taskNext({ enabled: true, next_run_at: null, ...changes }, NOW);
+
+  it("says nothing for a task that is off", () => {
+    assert.equal(next({ enabled: false, next_run_at: NOW + DAY }), null);
+  });
+
+  it("says when the next run is", () => {
+    assert.equal(next({ next_run_at: Date.UTC(2026, 9, 21, 8, 0) }), "Next run tomorrow 08:00");
+  });
+
+  it("says a run that is due is due, since it starts within seconds or waits for a free model", () => {
+    assert.equal(next({ next_run_at: NOW - 1000 }), "Due now");
+    assert.equal(next({ next_run_at: NOW }), "Due now");
+  });
+
+  it("says nothing without a next run", () => {
+    assert.equal(next({ next_run_at: null }), null);
   });
 });
