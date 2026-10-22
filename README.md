@@ -84,6 +84,25 @@ current syntax, point it at `http://127.0.0.1:8787`, and add the machine's tailn
 Anthropic prompt caching. Leaving a chat while a text reply streams stops that reply (the part so far is kept);
 an image being made carries on (see Images). It has been checked in Chromium; Firefox, Safari and iOS have not.
 
+### Projects
+A project is a name and some instructions that the chats in it share. The sidebar has a "Projects" section above the
+day groups: "New project" asks for a name (up to 80 characters) and instructions (up to 4,000), and each project is a
+row you open to see its chats, with "New chat in <project>" and an options menu (Edit, Delete). A chat made from the
+project, or moved into it from its own menu ("Move to project…", or "No project" to take it out), is told the
+project's instructions after your standing ones, at every message, so an edit applies to the next message of a chat
+already in it. The title line says "Project: <name>". Image models are not given them: an image prompt goes to the
+engine as typed.
+
+Instructions use up a model's memory like anything else: about three characters make a token, the dialog shows the
+count, and the whole system prompt is taken off what the chat history may use. A local model has 8,192 tokens here, so
+keep project instructions short; 4,000 characters is a fifth of the room a long chat has.
+
+Deleting a project keeps its chats (they show with the others) unless you tick "Also delete its chats", which removes
+them with their text and images. A project is settings, not chat content, so the 30-day retention does not remove it
+and "Delete all chats" leaves it. There can be 100 projects. Which projects are open is remembered per browser. The
+list holds the newest 200 chats in all, so a project's oldest chats may not show in it once more than that are newer.
+Project files are not built: a local model's window is too small to paste them in.
+
 ### Images
 Optional, and free: the images are made on this PC's GPU by stable-diffusion.cpp's `sd-server`, which runs in its own
 sandboxed user unit with no network (`systemd/aihub-images.service`, `docs/adr/0001-image-engine.md`). Nothing is sent
