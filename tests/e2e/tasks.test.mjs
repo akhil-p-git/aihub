@@ -45,6 +45,7 @@ async function makeChat(base, text) {
     .split("\n")
     .map((line) => JSON.parse(line));
   assert.equal(events.at(-1).t, "done");
+  return events[0].chat.id;
 }
 
 const makeTask = (base, name, fields = {}) =>
@@ -106,6 +107,15 @@ async function focusIs(page, expected, describe) {
     assert.fail(`focus never reached ${describe} "${expected}"; it is on ${now}`);
   }
 }
+
+/** Marks the cards that are there, so that a rebuilt card (which does not have the mark) can be told from them. */
+const markCards = (page) =>
+  page.evaluate(() => document.querySelectorAll(".task").forEach((el) => (el.dataset.probe = "old")));
+const cardsRebuilt = (page) =>
+  page.waitForFunction(
+    () => document.querySelectorAll(".task").length > 0 && document.querySelectorAll(".task[data-probe]").length === 0,
+  );
+const refreshNow = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
 
 const today = () => {
   const now = new Date();
@@ -876,7 +886,7 @@ describe("on a phone", () => {
     it(`fits at ${width} px with a long name, and every control can be touched`, async () => {
       await withApp(async (fresh) => {
         const name = "A".repeat(60);
-        await makeTask(fresh, name, { prompt: "word ".repeat(200) });
+        await runAndWait(fresh, await makeTask(fresh, name, { prompt: "word ".repeat(200) })); // so that it has a link
         const { page, context } = await open(browser, fresh, { width, height, mobile: true });
         await page.locator("#nav-open").click();
         await sidebarLink(page).click();
@@ -892,6 +902,7 @@ describe("on a phone", () => {
           mine.getByRole("button", { name: `Run now: ${name}` }),
           mine.getByRole("button", { name: `Edit: ${name}` }),
           mine.getByRole("button", { name: `Delete: ${name}` }),
+          mine.getByRole("link", { name: `Open chat: ${name}` }),
           mine.getByRole("switch"),
         ]) {
           const box = await control.boundingBox();
@@ -957,11 +968,16 @@ describe("accessibility", () => {
       const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
       const mine = card(page, "By keyboard");
       await mine.getByRole("switch").focus();
+      await markCards(page);
       await page.keyboard.press("Space"); // off
-      await until(async () => (await tasksOf(fresh))[0].enabled === false, "switched off by key");
-      await page.keyboard.press("Space"); // on again
-      await until(async () => (await tasksOf(fresh))[0].enabled === true, "switched on by key");
+      await cardsRebuilt(page); // the page redraws the cards, and the keyboard has to be on the new switch
       await focusIs(page, "switch", "role");
+      assert.equal((await tasksOf(fresh))[0].enabled, false);
+      await markCards(page);
+      await page.keyboard.press("Space"); // on again
+      await cardsRebuilt(page);
+      await focusIs(page, "switch", "role");
+      assert.equal((await tasksOf(fresh))[0].enabled, true);
 
       await mine.getByRole("button", { name: "Edit: By keyboard" }).focus();
       await page.keyboard.press("Enter");
@@ -971,6 +987,188 @@ describe("accessibility", () => {
       await page.keyboard.press("Escape");
       await dlg.waitFor({ state: "detached" });
       await focusIs(page, "Edit: By keyboard", "label");
+      await context.close();
+    });
+  });
+});
+
+describe("what a review found", () => {
+  it("shows what is wrong where it can be seen, even on a short screen", async () => {
+    await withApp(async (fresh) => {
+      const { page, context } = await open(browser, fresh, { width: 360, height: 520, mobile: true, hash: "#/tasks" });
+      await page.getByRole("button", { name: "New task" }).click();
+      const dlg = dialog(page, "New task");
+      await dlg.waitFor();
+      const onScreen = async (locator, what) => {
+        const box = await locator.boundingBox();
+        assert.ok(
+          box.y >= 0 && box.y + box.height <= page.viewportSize().height,
+          `${what} is on the screen: ${JSON.stringify(box)}`,
+        );
+      };
+
+      await dlg.getByRole("button", { name: "Save" }).click();
+      const empty = dlg.getByRole("status").filter({ hasText: "Give the task a name." });
+      await empty.waitFor();
+      await onScreen(empty, "what is missing");
+
+      await page.route("**/api/tasks", (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({
+              status: 409,
+              contentType: "application/json",
+              body: JSON.stringify({
+                error: { code: "too_many_tasks", message: "You can have 50 scheduled tasks. Delete one to make room." },
+              }),
+            })
+          : route.continue(),
+      );
+      await dlg.getByLabel("Name", { exact: true }).fill("One too many");
+      await dlg.getByLabel("Prompt").fill("Hi");
+      await dlg.getByRole("button", { name: "Save" }).click();
+      const refused = dlg.getByRole("status").filter({ hasText: "Delete one to make room." });
+      await refused.waitFor();
+      await onScreen(refused, "the server's reason");
+      await context.close();
+    });
+  });
+
+  it("keeps the keyboard on the Open chat link when the cards are rebuilt", async () => {
+    await withApp(async (fresh) => {
+      const task = await makeTask(fresh, "Linked");
+      await runAndWait(fresh, task);
+      const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
+      await card(page, "Linked").getByRole("link", { name: "Open chat: Linked" }).focus();
+      await markCards(page);
+      await call(fresh, "PATCH", `/api/tasks/${task.id}`, { prompt: "A different prompt" }); // something the card says
+      await refreshNow(page);
+      await cardsRebuilt(page);
+      await focusIs(page, "Open chat: Linked", "label");
+      await context.close();
+    });
+  });
+
+  it("keeps the keyboard on a chat in the sidebar when the window is looked at again", async () => {
+    await withApp(async (fresh) => {
+      await makeChat(fresh, "First chat");
+      const { page, context } = await open(browser, fresh);
+      const link = page.locator("#chat-nav").getByRole("link", { name: "First chat" });
+      await link.focus();
+      const row = () => page.evaluate(() => document.querySelector("#chat-nav .chat-row")?.dataset.probe ?? null);
+      await page.evaluate(() => (document.querySelector("#chat-nav .chat-row").dataset.probe = "same"));
+
+      const asked = page.waitForResponse((r) => r.url().endsWith("/api/chats") && r.request().method() === "GET");
+      await refreshNow(page);
+      await asked;
+      await page.waitForTimeout(150);
+      assert.equal(await row(), "same", "nothing changed, so the list was not rebuilt");
+      await focusIs(page, "First chat", "text");
+
+      await makeChat(fresh, "A chat made meanwhile"); // the list changes: it is rebuilt, and the keyboard goes with it
+      await refreshNow(page);
+      await page.locator("#chat-nav").getByRole("link", { name: "A chat made meanwhile" }).waitFor();
+      assert.equal(await row(), null, "the list was rebuilt");
+      await focusIs(page, "First chat", "text");
+      await context.close();
+    });
+  });
+
+  it("puts the keyboard back on Delete when the dialog is cancelled after the cards were rebuilt", async () => {
+    await withApp(async (fresh) => {
+      const task = await makeTask(fresh, "To keep");
+      const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
+      await card(page, "To keep").getByRole("button", { name: "Delete: To keep" }).click();
+      const dlg = dialog(page, "Delete this task?");
+      await dlg.waitFor();
+      await markCards(page);
+      await call(fresh, "PATCH", `/api/tasks/${task.id}`, { prompt: "Changed while the question was open" });
+      await refreshNow(page); // the cards are rebuilt behind the dialog, and the button that opened it goes
+      await cardsRebuilt(page);
+      await dlg.getByRole("button", { name: "Cancel" }).click();
+      await focusIs(page, "Delete: To keep", "label");
+      await context.close();
+    });
+  });
+
+  it("has a skip link that goes somewhere on this page", async () => {
+    await withApp(async (fresh) => {
+      const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
+      await page.keyboard.press("Tab");
+      await focusIs(page, "Skip to the task list", "text");
+      await page.keyboard.press("Enter");
+      await focusIs(page, "New task", "text");
+      await page.getByRole("link", { name: "aihub, start a new chat" }).click();
+      await page.getByRole("textbox", { name: "Message" }).waitFor();
+      assert.equal(await page.locator(".skip").innerText(), "Skip to the message box"); // and back again
+      await context.close();
+    });
+  });
+
+  it("does not bring back a task that was deleted while an older list was on its way", async () => {
+    await withApp(async (fresh) => {
+      await makeTask(fresh, "Doomed");
+      const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
+      await card(page, "Doomed").waitFor();
+      let hold = false;
+      let captured;
+      const answered = new Promise((resolve) => (captured = resolve));
+      await page.route("**/api/tasks", async (route) => {
+        if (route.request().method() !== "GET" || !hold) return route.continue();
+        hold = false;
+        const answer = await route.fetch(); // the list as it is now, with the task in it
+        captured();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await route.fulfill({ response: answer });
+      });
+      hold = true;
+      await refreshNow(page);
+      await answered;
+      await card(page, "Doomed").getByRole("button", { name: "Delete: Doomed" }).click();
+      await dialog(page, "Delete this task?").getByRole("button", { name: "Delete task" }).click();
+      await toast(page, "Task deleted.").waitFor();
+      await page.waitForTimeout(1600); // the old list arrives
+      assert.equal(await card(page, "Doomed").count(), 0, "the deleted task did not come back");
+      await context.close();
+    });
+  });
+
+  it("does not let a chat that was still loading take the page back from the tasks page", async () => {
+    await withApp(async (fresh) => {
+      const chatId = await makeChat(fresh, "Slow to load");
+      const { page, context } = await open(browser, fresh);
+      await page.route(`**/api/chats/${chatId}`, async (route) => {
+        const answer = await route.fetch();
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        await route.fulfill({ response: answer });
+      });
+      await page.evaluate((id) => (location.hash = `#/c/${id}`), chatId);
+      await page.waitForTimeout(100);
+      await page.evaluate(() => (location.hash = "#/tasks"));
+      await page.getByRole("heading", { level: 1, name: "Scheduled tasks" }).waitFor();
+      await page.waitForTimeout(1800); // the chat's answer arrives
+      assert.equal(await page.evaluate(() => document.querySelector("h1").textContent), "Scheduled tasks");
+      assert.equal(await page.evaluate(() => document.title), "Scheduled tasks - aihub");
+      const current = await page.locator('#sidebar [aria-current="page"]').allInnerTexts();
+      assert.deepEqual(current, ["Scheduled tasks"], "only the tasks link is the current page");
+      await context.close();
+    });
+  });
+
+  it("drops a card that a failed save showed to be gone", async () => {
+    await withApp(async (fresh) => {
+      const task = await makeTask(fresh, "Ghost");
+      const { page, context } = await open(browser, fresh, { hash: "#/tasks" });
+      await card(page, "Ghost").getByRole("button", { name: "Edit: Ghost" }).click();
+      const dlg = dialog(page, "Edit task");
+      await dlg.waitFor();
+      await call(fresh, "DELETE", `/api/tasks/${task.id}`); // deleted somewhere else
+      await dlg.getByLabel("Name", { exact: true }).fill("Ghost, renamed");
+      await dlg.getByRole("button", { name: "Save" }).click();
+      await dlg.getByRole("status").filter({ hasText: "That task no longer exists." }).waitFor();
+      await page.keyboard.press("Escape");
+      await dlg.waitFor({ state: "detached" });
+      await page.getByText("No scheduled tasks yet.").waitFor({ timeout: 5000 });
+      assert.equal(await card(page, "Ghost").count(), 0);
       await context.close();
     });
   });

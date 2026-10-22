@@ -303,12 +303,12 @@ export function openTaskDialog({ task = null, models, projects, onSave }) {
     when,
     h("div", { class: "field" }, h("label", { for: "task-project" }, "Project"), project),
     h("label", { class: "check" }, enabled, h("span", {}, "Run on this schedule")),
-    status,
   );
   const cancel = h("button", { class: "btn", type: "button" }, "Cancel");
   // Not disabled while it saves: a focused button that turns disabled drops the keyboard out of the dialog.
   const save = h("button", { class: "btn", type: "submit", form: "task-form", "data-kind": "primary" }, "Save");
-  const dialog = modal(task ? "Edit task" : "New task", form, h("div", { class: "dlg-foot" }, cancel, save));
+  // In the footer, which stays in view when the form scrolls: a message below the fold is read by a screen reader and missed by everyone else.
+  const dialog = modal(task ? "Edit task" : "New task", form, h("div", { class: "dlg-foot" }, status, cancel, save));
   cancel.addEventListener("click", () => dialog.close());
   let saving = false;
   form.addEventListener("submit", async (event) => {

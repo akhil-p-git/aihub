@@ -31,6 +31,7 @@ import { renderTasks } from "./tasks.js";
 import { toast } from "./toast.js";
 
 const $ = (id) => document.getElementById(id);
+const skipLink = document.querySelector(".skip");
 const els = {
   app: $("app"),
   main: $("main"),
@@ -163,7 +164,20 @@ const closeDrawer = () => !wide.matches && els.app.dataset.nav === "open" && set
 
 // ---- rendering
 
+/** How to find again each kind of control in the chat list, so that a list that is rebuilt can give the keyboard back. */
+const SIDEBAR_KEYS = [
+  [".chat-link", (el) => `.chat-row[data-id="${el.closest(".chat-row").dataset.id}"] .chat-link`],
+  ["[data-menu]", (el) => `[data-menu="${el.dataset.menu}"]`],
+  ["[data-toggle]", (el) => `[data-toggle="${el.dataset.toggle}"]`],
+  ["[data-new-in]", (el) => `[data-new-in="${el.dataset.newIn}"]`],
+  ["[data-project-menu]", (el) => `[data-project-menu="${el.dataset.projectMenu}"]`],
+  ["#new-project", () => "#new-project"],
+];
+
 function renderSidebarNow() {
+  const focused = els.nav.contains(document.activeElement)
+    ? SIDEBAR_KEYS.find(([match]) => document.activeElement.matches(match))?.[1](document.activeElement)
+    : null;
   renderSidebar(els.nav, {
     chats: state.results ?? state.chats,
     projects: state.projects,
@@ -171,6 +185,7 @@ function renderSidebarNow() {
     current: state.chat?.id,
     query: state.query,
   });
+  if (focused) els.nav.querySelector(focused)?.focus();
 }
 
 function renderTitle() {
@@ -993,7 +1008,9 @@ function whatStays() {
 }
 
 async function refreshChats() {
-  state.chats = (await api.get("/api/chats")).chats;
+  const { chats } = await api.get("/api/chats");
+  if (JSON.stringify(chats) === JSON.stringify(state.chats)) return; // nothing new: leave the list, and the keyboard in it
+  state.chats = chats;
   if (!state.query) renderSidebarNow();
 }
 
@@ -1051,8 +1068,10 @@ async function refreshTasks() {
 }
 
 function showTasks() {
+  ++state.seq; // a chat that is still being fetched must not take the page back when it arrives
   leaveRun();
   state.view = "tasks";
+  skipLink.textContent = "Skip to the task list";
   state.chat = null;
   state.messages = [];
   els.app.dataset.view = "tasks";
@@ -1068,6 +1087,7 @@ function showTasks() {
 function leaveTasks() {
   if (state.view !== "tasks") return;
   state.view = "chat";
+  skipLink.textContent = "Skip to the message box";
   els.app.dataset.view = "chat";
   els.openTasks.removeAttribute("aria-current");
   clearTimeout(tasksTimer);
@@ -1113,7 +1133,12 @@ function editTask(task) {
     projects: state.projects,
     onSave: async (changes) => {
       if (!Object.keys(changes).length) return;
-      await api.patch(`/api/tasks/${task.id}`, changes);
+      try {
+        await api.patch(`/api/tasks/${task.id}`, changes);
+      } catch (err) {
+        if (err.code === "no_task") refreshTasks().catch(armTaskPolling); // gone: the list must stop showing it
+        throw err;
+      }
       await refreshTasks().catch(armTaskPolling);
     },
   });
@@ -1126,6 +1151,8 @@ async function deleteTask(task) {
     text: `“${task.name}” will be deleted. Its chats stay in your list.`,
     confirm: "Delete task",
   });
+  // The dialog gives focus back to the button that opened it, which is gone if the cards were rebuilt behind it.
+  focusTaskControl(`${task.id}:delete`);
   if (!ok) return;
   try {
     await api.del(`/api/tasks/${task.id}`);
@@ -1136,6 +1163,7 @@ async function deleteTask(task) {
   renderTasksNow();
   els.newTask.focus();
   toast("Task deleted.");
+  refreshTasks().catch(armTaskPolling); // a list that was still on its way is now out of date, and is dropped
   refreshChats().catch(() => {}); // its chats lose the mark
 }
 
@@ -1210,10 +1238,10 @@ function wire() {
   });
   els.jump.addEventListener("click", scrollToBottom);
   window.addEventListener("hashchange", () => isRoute(location.hash) && route());
-  document.querySelector(".skip").addEventListener("click", (event) => {
+  skipLink.addEventListener("click", (event) => {
     event.preventDefault(); // a fragment jump would leave the chat
     closeDrawer(); // the page behind an open drawer is inert and cannot take focus
-    els.input.focus();
+    (state.view === "tasks" ? els.newTask : els.input).focus(); // the composer is put away on the tasks page
   });
   wide.addEventListener("change", () => setNav(wide.matches ? store.get("aihub.nav") !== "closed" : false));
 

@@ -73,7 +73,15 @@ function card(task, { byId, projectById, now }) {
           : h("span", {}, status.label),
       status.reason ? h("span", { class: "task-reason" }, status.reason) : null,
       task.last_chat_id && status.kind !== "running"
-        ? h("a", { href: `#/c/${task.last_chat_id}`, "aria-label": `Open chat: ${task.name}` }, "Open chat")
+        ? h(
+            "a",
+            {
+              href: `#/c/${task.last_chat_id}`,
+              "data-key": `${task.id}:open`,
+              "aria-label": `Open chat: ${task.name}`,
+            },
+            "Open chat",
+          )
         : null,
     ),
     next ? h("p", { class: "task-next" }, next) : null,

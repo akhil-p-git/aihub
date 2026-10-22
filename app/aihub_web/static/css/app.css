@@ -581,7 +581,9 @@
       linear-gradient(var(--line), transparent) top / 100% 0.5rem no-repeat scroll,
       linear-gradient(transparent, var(--line)) bottom / 100% 0.5rem no-repeat scroll;
   }
-  .dlg-foot { display: flex; justify-content: flex-end; gap: var(--s-2); padding: 0 var(--s-6) var(--s-6); }
+  .dlg-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-2); padding: 0 var(--s-6) var(--s-6); }
+  .dlg-foot .action-status { flex: 1 0 100%; order: -1; overflow-wrap: anywhere; }
+  .dlg-foot .action-status:empty { display: none; }
   .field { display: grid; gap: var(--s-2); }
   .field > label, .field > .label { font-size: var(--text-sm); font-weight: 600; }
   .field .hint { font-size: var(--text-xs); color: var(--muted); font-weight: 400; }
@@ -613,6 +615,7 @@
   .task-reason { flex-basis: 100%; overflow-wrap: anywhere; }
   .task-status:is([data-kind="error"], [data-kind="off"]) .task-reason { color: var(--danger); }
   .task-status a { color: var(--primary); }
+  @media (pointer: coarse) { .task-status a { display: inline-flex; align-items: center; min-block-size: var(--hit); } }
   .task-next { font-size: var(--text-sm); color: var(--muted); }
   .task-actions { display: flex; flex-wrap: wrap; gap: var(--s-2); padding-block-start: var(--s-1); }
   .task-actions .btn { box-shadow: inset 0 0 0 1px var(--line-strong); }
