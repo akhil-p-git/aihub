@@ -45,6 +45,9 @@ CHARS_PER_TOKEN = 3
 # Leave a quarter of the context for the reply.
 CONTEXT_SHARE = 0.75
 TASK_MODEL_MESSAGE = "A scheduled task can only use a text model that runs on this PC."
+UNEXPECTED_MESSAGE = (
+    "The server hit an unexpected error. The service log has the details."
+)
 
 
 class ApiError(Exception):
@@ -548,10 +551,7 @@ class ChatService:
         except Exception:
             log.exception("reply failed in chat %s", turn.chat.id)
             status = "error"
-            error = {
-                "code": "internal",
-                "message": "The server hit an unexpected error. The service log has the details.",
-            }
+            error = {"code": "internal", "message": UNEXPECTED_MESSAGE}
         except BaseException:
             status = "stopped"  # the reader went away or pressed Stop
             raise

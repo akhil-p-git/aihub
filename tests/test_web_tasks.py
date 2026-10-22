@@ -1,21 +1,43 @@
-"""Running a scheduled task once: its prompt goes through the chat service, with nobody watching."""
+"""Scheduled tasks: one run, whose prompt goes through the chat service with nobody watching, and the scheduler
+that starts the tasks that are due."""
 
 import asyncio
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
-from aihub_web.chat import ChatRequest
+from aihub_web.chat import ChatRequest, ChatService
 from aihub_web.config import Limits
 from aihub_web.db import Store, Task
 from aihub_web.providers import Finish, ProviderError, Text, Thinking
-from aihub_web.tasks import RunResult, run_task
-from helpers import HANG, HOLD, FakeEngine, finished, generating, make_service
+from aihub_web.tasks import (
+    RUN_LIMIT_SECONDS,
+    RunResult,
+    Scheduler,
+    finish_run,
+    start_run,
+)
+from helpers import HANG, HOLD, Clock, FakeEngine, finished, generating, make_service
 
 LOCAL = "ollama/qwen3:8b"  # off / on
 FREE = "openrouter/google/gemma-4-31b-it:free"
 HAIKU = "anthropic/claude-haiku-5-5"
 IMAGE = "images/zimage"
 DAILY = {"kind": "daily", "time": "08:00"}
+
+
+DAY = date(2027, 1, 15)
+
+
+async def run_task(
+    service: ChatService, task: Task, *, limit: float = RUN_LIMIT_SECONDS
+) -> RunResult:
+    """One run from its start to its end, as the scheduler does it."""
+    started = start_run(service, task, DAY)
+    if isinstance(started, RunResult):
+        return started
+    return await finish_run(service, started, limit)
 
 
 def a_task(store: Store, **fields) -> Task:
@@ -38,7 +60,7 @@ class TestRunning:
         (chat,) = store.list_chats()
         assert result == RunResult("done", chat.id, None)
         assert (chat.title, chat.task_id, chat.model) == (
-            "Morning digest",
+            "Morning digest, 15 Jan 2027",
             task.id,
             LOCAL,
         )
@@ -233,3 +255,444 @@ class TestWhatIsRefused:
         assert (result.status, result.chat_id) == ("error", None)
         assert result.error == "Messages are limited to 10 characters."
         assert store.list_chats() == []
+
+
+def utc_ms(text: str) -> int:
+    """Milliseconds since the epoch of a UTC time like '2027-01-15 08:00'."""
+    return int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp() * 1000)
+
+
+HOURLY = {"kind": "hourly", "every": 1}
+
+
+@pytest.fixture(autouse=True)
+def utc(tz: Callable[[str], None]) -> None:
+    tz("UTC")
+
+
+async def scheduling(tmp_path: Path, **config):
+    """A scheduler over a real store and service, on a clock that starts at 2027-01-15 08:00:00 UTC.
+    Returns (scheduler, service, store, providers, clock)."""
+    clock = Clock()
+    service, store, providers = await make_service(tmp_path, clock=clock, **config)
+    scheduler = Scheduler(store, service, now=clock, limit=0.2)
+    return scheduler, service, store, providers, clock
+
+
+@pytest.mark.anyio
+class TestWhatIsDue:
+    async def test_a_task_that_is_not_due_is_left_alone(self, tmp_path: Path) -> None:
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00:01"))
+        await scheduler.tick()
+        assert store.list_chats() == []
+        assert store.get_task(task.id) == task
+
+    async def test_a_task_that_is_off_never_runs(self, tmp_path: Path) -> None:
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        a_task(store, enabled=False, next_run_at=utc_ms("2027-01-15 07:00"))
+        await scheduler.tick()
+        assert store.list_chats() == []
+
+    async def test_a_due_task_runs_and_its_next_run_comes_from_the_schedule(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, _, clock = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        clock.advance(5)
+
+        await scheduler.tick()
+
+        (chat,) = store.list_chats()
+        done = store.get_task(task.id)
+        assert (done.last_status, done.last_error, done.failures) == ("done", None, 0)
+        assert (done.last_chat_id, done.last_run_at) == (
+            chat.id,
+            utc_ms("2027-01-15 08:00:05"),
+        )
+        assert chat.title == "Morning digest, 15 Jan 2027"
+        assert done.next_run_at == utc_ms("2027-01-16 08:00")
+        await scheduler.tick()  # nothing is due any more
+        assert len(store.list_chats()) == 1
+
+    async def test_a_clock_set_back_does_not_run_it_a_second_time(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, _, clock = await scheduling(tmp_path)
+        a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        await scheduler.tick()  # runs at 08:00
+        clock.advance(-3 * 3600)  # the clock is set back to 05:00 ...
+        await scheduler.tick()
+        clock.advance(3 * 3600 + 5)  # ... and reaches 08:00 again
+        await scheduler.tick()
+        assert len(store.list_chats()) == 1
+
+    async def test_every_time_that_was_missed_collapses_into_one_run(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        task = a_task(
+            store, schedule=HOURLY, next_run_at=utc_ms("2027-01-15 02:00")
+        )  # six hours ago
+        await scheduler.tick()
+        assert len(store.list_chats()) == 1
+        assert store.get_task(task.id).next_run_at == utc_ms("2027-01-15 09:00")
+
+    async def test_twelve_hours_late_still_runs(self, tmp_path: Path) -> None:
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        a_task(store, next_run_at=utc_ms("2027-01-14 20:00"))  # exactly 12 h before
+        await scheduler.tick()
+        assert len(store.list_chats()) == 1
+
+    async def test_a_moment_over_twelve_hours_is_skipped_and_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-14 20:00") - 1)
+        store.update_task(task.id, {"failures": 1})
+
+        await scheduler.tick()
+
+        assert store.list_chats() == []
+        skipped = store.get_task(task.id)
+        assert (skipped.last_status, skipped.last_chat_id, skipped.failures) == (
+            "skipped",
+            None,
+            1,
+        )
+        assert skipped.last_error == (
+            "Skipped: it was due more than 12 hours before the app could run it."
+        )
+        assert skipped.last_run_at == utc_ms("2027-01-15 08:00")
+        assert skipped.next_run_at == utc_ms("2027-01-16 08:00")
+
+
+@pytest.mark.anyio
+class TestWhenARunFails:
+    async def test_the_failure_is_recorded_and_the_next_run_still_comes(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        providers["ollama"].script = [
+            ProviderError("Ollama stopped answering.", "upstream")
+        ]
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        await scheduler.tick()
+
+        (chat,) = store.list_chats()
+        failed = store.get_task(task.id)
+        assert (failed.last_status, failed.last_error, failed.failures) == (
+            "error",
+            "Ollama stopped answering.",
+            1,
+        )
+        assert failed.enabled and failed.last_chat_id == chat.id
+        assert failed.next_run_at == utc_ms("2027-01-16 08:00")
+
+    async def test_three_failures_in_a_row_switch_it_off_and_say_why(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, clock = await scheduling(tmp_path)
+        providers["ollama"].script = [
+            ProviderError("Ollama stopped answering.", "upstream")
+        ]
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        for _ in range(3):
+            await scheduler.tick()
+            clock.advance(days=1)
+
+        off = store.get_task(task.id)
+        assert (off.enabled, off.next_run_at, off.failures) == (False, None, 3)
+        assert off.last_status == "error"
+        assert off.last_error == (
+            "Switched off after 3 failed runs in a row. The last one: Ollama stopped answering."
+        )
+        before = len(store.list_chats())
+        clock.advance(days=3)
+        await scheduler.tick()
+        assert len(store.list_chats()) == before  # and it stays off
+
+    async def test_a_good_run_resets_the_count(self, tmp_path: Path) -> None:
+        scheduler, _, store, providers, clock = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        bad = [ProviderError("Ollama stopped answering.", "upstream")]
+        good = [Text("fine"), Finish("stop")]
+        for script in (bad, bad, good, bad, bad):
+            providers["ollama"].script = script
+            await scheduler.tick()
+            clock.advance(days=1)
+        later = store.get_task(task.id)
+        assert later.enabled and later.failures == 2
+
+    async def test_a_run_stopped_at_the_time_limit_counts_as_a_failure(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(
+            tmp_path
+        )  # a limit of 0.2 s
+        providers["ollama"].script = [Text("Half an"), HANG]
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        await scheduler.tick()
+
+        stopped = store.get_task(task.id)
+        assert (stopped.last_status, stopped.failures) == ("stopped", 1)
+        assert stopped.last_error == "Stopped: the run took longer than the time limit."
+
+    async def test_a_cloud_model_is_refused_again_at_run_time_with_no_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        """The API refuses one at creation; a row that got in some other way must still never reach a cloud."""
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, model=HAIKU, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        await scheduler.tick()
+
+        refused = store.get_task(task.id)
+        assert (refused.last_status, refused.failures) == ("error", 1)
+        assert refused.last_error == (
+            "A scheduled task can only use a text model that runs on this PC."
+        )
+        assert store.list_chats() == []
+        assert all(not provider.requests for provider in providers.values())
+
+    async def test_a_busy_service_leaves_it_due_and_counts_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, service, store, providers, clock = await scheduling(
+            tmp_path, limits=Limits(max_concurrent=1)
+        )
+        started = asyncio.Event()
+        providers["ollama"].script = [started.set, HANG]
+        first = service.stream(service.prepare(ChatRequest(text="first", model=LOCAL)))
+        await anext(first)
+        pending = asyncio.create_task(anext(first))
+        await started.wait()  # the only slot is taken
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        await scheduler.tick()
+
+        waiting = store.get_task(task.id)
+        assert (waiting.last_status, waiting.failures) == (None, 0)
+        assert waiting.next_run_at == utc_ms("2027-01-15 08:00")  # still due
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        providers["ollama"].script = [Text("fine"), Finish("stop")]
+        clock.advance(30)
+        await scheduler.tick()  # the next tick
+        assert store.get_task(task.id).last_status == "done"
+
+    async def test_a_busy_service_for_more_than_twelve_hours_skips_the_run(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, _, clock = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        clock.advance(12 * 3600 + 30)  # nothing ran it in all that time
+        await scheduler.tick()
+        assert store.get_task(task.id).last_status == "skipped"
+
+
+@pytest.mark.anyio
+class TestOneAtATime:
+    async def test_due_tasks_run_one_after_the_other_earliest_first(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        seen: list[tuple[str, set[str]]] = []
+        providers["ollama"].script = [
+            lambda: seen.append(("run", set(scheduler.running))),
+            Text("fine"),
+            Finish("stop"),
+        ]
+        late = a_task(store, next_run_at=utc_ms("2027-01-15 07:00"))
+        early = a_task(store, next_run_at=utc_ms("2027-01-15 06:00"))
+
+        await scheduler.tick()
+
+        assert seen == [("run", {early.id}), ("run", {late.id})]
+        assert scheduler.running == set()
+        assert [store.get_task(i).last_status for i in (early.id, late.id)] == [
+            "done",
+            "done",
+        ]
+
+    async def test_the_next_run_is_set_before_the_reply_starts(
+        self, tmp_path: Path
+    ) -> None:
+        """If the process dies mid-run and is started again, the run must not come round again at once."""
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        during: list[int | None] = []
+        providers["ollama"].script = [
+            lambda: during.append(store.get_task(task.id).next_run_at),
+            Text("fine"),
+            Finish("stop"),
+        ]
+        await scheduler.tick()
+        assert during == [utc_ms("2027-01-16 08:00")]
+
+    async def test_cancelling_a_run_is_no_failure_and_it_is_not_repeated(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        started = asyncio.Event()
+        providers["ollama"].script = [Text("Half an"), started.set, HANG]
+
+        ticking = asyncio.create_task(scheduler.tick())
+        await started.wait()
+        ticking.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ticking
+
+        left = store.get_task(task.id)
+        assert (left.failures, left.last_status) == (0, None)
+        assert left.next_run_at == utc_ms("2027-01-16 08:00")
+        assert scheduler.running == set()
+        (chat,) = store.list_chats()
+        assert store.messages(chat.id)[-1].status == "stopped"  # what arrived is kept
+
+    async def test_an_unexpected_error_is_recorded_and_the_others_still_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scheduler, service, store, _, _ = await scheduling(tmp_path)
+        broken = a_task(store, next_run_at=utc_ms("2027-01-15 06:00"))
+        fine = a_task(store, next_run_at=utc_ms("2027-01-15 07:00"))
+        real = service.prepare
+
+        def prepare(body, **kwargs):
+            if kwargs["task_id"] == broken.id:
+                raise RuntimeError("a bug")
+            return real(body, **kwargs)
+
+        monkeypatch.setattr(service, "prepare", prepare)
+
+        await scheduler.tick()
+
+        failed = store.get_task(broken.id)
+        assert (failed.last_status, failed.failures) == ("error", 1)
+        assert failed.last_error == (
+            "The server hit an unexpected error. The service log has the details."
+        )
+        assert store.get_task(fine.id).last_status == "done"
+
+    async def test_a_task_switched_off_while_an_earlier_one_runs_is_not_started(
+        self, tmp_path: Path
+    ) -> None:
+        """A run takes minutes, so the list of what was due is out of date by the time its turn comes."""
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        first = a_task(store, next_run_at=utc_ms("2027-01-15 06:00"))
+        second = a_task(store, next_run_at=utc_ms("2027-01-15 07:00"))
+        providers["ollama"].script = [
+            lambda: store.update_task(second.id, {"enabled": False}),
+            Text("fine"),
+            Finish("stop"),
+        ]
+
+        await scheduler.tick()
+
+        assert store.get_task(first.id).last_status == "done"
+        assert store.get_task(second.id).last_status is None
+        assert len(store.list_chats()) == 1
+
+    async def test_a_schedule_that_cannot_be_read_switches_the_task_off(
+        self, tmp_path: Path
+    ) -> None:
+        """Left due, it would make a chat on every tick."""
+        scheduler, _, store, _, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        store.update_task(task.id, {"schedule": {"kind": "fortnightly"}})
+
+        await scheduler.tick()
+
+        off = store.get_task(task.id)
+        assert (off.enabled, off.next_run_at, off.last_status) == (False, None, "error")
+        assert off.last_error == "Switched off: its schedule could not be read."
+        assert store.list_chats() == []
+
+    async def test_a_failure_inside_the_service_is_recorded_with_its_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scheduler, service, store, _, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        async def stream(turn):
+            raise RuntimeError("a bug")
+            yield
+
+        monkeypatch.setattr(service, "stream", stream)
+
+        await scheduler.tick()
+
+        (chat,) = store.list_chats()
+        failed = store.get_task(task.id)
+        assert (failed.last_status, failed.last_chat_id, failed.failures) == (
+            "error",
+            chat.id,
+            1,
+        )
+        assert scheduler.running == set()
+
+    @pytest.mark.parametrize(
+        "ending", [[Text("fine"), Finish("stop")], [ProviderError("Gone.", "upstream")]]
+    )
+    async def test_a_task_deleted_during_its_run_leaves_only_its_chat(
+        self, tmp_path: Path, ending: list
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        providers["ollama"].script = [lambda: store.delete_task(task.id), *ending]
+        await scheduler.tick()
+        assert store.get_task(task.id) is None
+        (chat,) = store.list_chats()
+        assert chat.task_id is None
+
+    async def test_a_task_switched_off_during_its_run_stays_off(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        providers["ollama"].script = [
+            lambda: store.update_task(task.id, {"enabled": False, "next_run_at": None}),
+            Text("fine"),
+            Finish("stop"),
+        ]
+        await scheduler.tick()
+        off = store.get_task(task.id)
+        assert (off.enabled, off.next_run_at, off.last_status) == (False, None, "done")
+
+
+@pytest.mark.anyio
+class TestTheLoop:
+    async def test_it_ticks_until_cancelled_and_survives_a_failing_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock()
+        service, store, _ = await make_service(tmp_path, clock=clock)
+        scheduler = Scheduler(store, service, now=clock, tick=0.01)
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        real = store.due_tasks
+        calls = []
+
+        def due_tasks(now_ms: int):
+            calls.append(now_ms)
+            if len(calls) == 1:
+                raise RuntimeError("the database is busy")
+            return real(now_ms)
+
+        monkeypatch.setattr(store, "due_tasks", due_tasks)
+
+        looping = asyncio.create_task(scheduler.run_forever())
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if store.get_task(task.id).last_status == "done":
+                break
+        looping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await looping
+
+        assert store.get_task(task.id).last_status == "done"
+        assert len(calls) >= 2
