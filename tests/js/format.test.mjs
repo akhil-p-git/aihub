@@ -175,6 +175,19 @@ describe("routeFor: where the next prompt goes", () => {
     });
     assert.match(router.text, /don't keep prompts/);
   });
+  it("an Ollama cloud model says that the prompt leaves the PC and may be billed", () => {
+    const route = routeFor({
+      name: "muse-spark-open:cloud",
+      tier: "paid",
+      provider: "ollama",
+      remote: true,
+    });
+    assert.equal(route.title, "New chat on muse-spark-open:cloud");
+    assert.match(route.text, /Ollama's cloud \(ollama\.com\), not on this PC/);
+    assert.match(route.text, /prompt leaves the machine/);
+    assert.match(route.text, /bill/);
+    assert.doesNotMatch(route.text, /Nothing leaves|OpenRouter|Claude/);
+  });
   it("image models make an image on the PC and say that local chat pauses meanwhile", () => {
     const route = routeFor({ name: "Z-Image Turbo", tier: "local", provider: "images", output: "image" });
     assert.equal(route.title, "Image mode on Z-Image Turbo");

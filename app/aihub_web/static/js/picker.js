@@ -9,7 +9,7 @@ const GROUPS = [
   ["free", "Free, in the cloud", (m) => m.tier === "free"],
   ["local", "On this PC", (m) => m.tier === "local" && !makesImages(m)],
   ["images", "Makes images", (m) => m.tier === "local" && makesImages(m)],
-  ["paid", "Paid, billed to your credits", (m) => m.tier === "paid"],
+  ["paid", "Paid", (m) => m.tier === "paid"],
 ];
 
 let pop;

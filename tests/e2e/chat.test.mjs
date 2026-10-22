@@ -379,6 +379,34 @@ describe("model and intensity", () => {
     );
     await context.close();
   });
+
+  it("files an Ollama cloud model under Paid, not On this PC, and says where its prompt goes", async () => {
+    const { page, context } = await open(browser, app);
+    await page.route("**/api/bootstrap", async (route) => {
+      const response = await route.fetch();
+      const json = await response.json();
+      const local = json.models.find((m) => m.provider === "ollama");
+      json.models.push({
+        ...local,
+        id: "ollama/muse-spark-open:cloud",
+        name: "muse-spark-open:cloud",
+        tier: "paid",
+        remote: true,
+        efforts: null,
+      });
+      await route.fulfill({ response, json });
+    });
+    await page.reload();
+    await page.getByRole("button", { name: /Change model$/ }).click();
+    const paid = page.getByRole("group", { name: "Paid", exact: true });
+    await paid.getByRole("option", { name: /muse-spark-open:cloud/ }).waitFor();
+    const onThisPc = page.getByRole("group", { name: "On this PC", exact: true });
+    assert.equal(await onThisPc.getByRole("option", { name: /muse-spark-open:cloud/ }).count(), 0);
+    await paid.getByRole("option", { name: /muse-spark-open:cloud/ }).click();
+    const note = await page.locator("body").innerText();
+    assert.match(note, /Runs on Ollama's cloud \(ollama\.com\), not on this PC/);
+    await context.close();
+  });
 });
 
 describe("the chat list", () => {

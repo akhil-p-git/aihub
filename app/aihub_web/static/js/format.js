@@ -131,6 +131,12 @@ export function routeFor(model) {
   }
   const title = `New chat on ${shortName(model.name)}`;
   const until = model.expires ? ` Free until ${formatDay(model.expires)}.` : "";
+  if (model.remote) {
+    return {
+      title,
+      text: "Runs on Ollama's cloud (ollama.com), not on this PC. Your prompt leaves the machine, and Ollama may bill it to your plan.",
+    };
+  }
   if (model.tier === "local") {
     return { title, text: "Runs on this PC through Ollama. Nothing leaves the machine." };
   }
