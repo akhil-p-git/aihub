@@ -47,7 +47,7 @@ only what that model accepts. New chats start at Low, or at Off where a model ha
 **Storage and retention.** Chats live only in `state/web/chats.db` (SQLite, mode 600, `secure_delete` on). A chat is
 deleted 30 days after its last message (`retention_days`): once at start-up and then every hour, and the
 checkpoint that follows moves the deleted text out of the write-ahead log too. Renaming a chat does not count as
-activity. The sidebar says so, and a chat in its last week shows "Deletes in N days". Settings has "Delete all chats".
+activity. The sidebar says so, and a chat in its last week shows "Deletes in N days". Settings has "Delete all chats" (projects and scheduled tasks stay).
 
 **Upgrading the database.** The schema has a version (`PRAGMA user_version`: 2 added images, 3 added projects, 4 added scheduled tasks). Starting a
 newer build on an older file upgrades it in place, one transaction per step, and first copies the file with SQLite's
@@ -102,6 +102,34 @@ them with their text and images. A project is settings, not chat content, so the
 and "Delete all chats" leaves it. There can be 100 projects. Which projects are open is remembered per browser. The
 list holds the newest 200 chats in all, so a project's oldest chats may not show in it once more than that are newer.
 Project files are not built: a local model's window is too small to paste them in.
+
+### Scheduled tasks
+A scheduled task is a prompt that aihub sends for you on a schedule, to a model on this PC. Each run makes a new chat
+named "<task>, <date>" (in the task's project, if it has one) with the prompt and the reply in it. That chat is an
+ordinary one, with a clock before its title in the list and the usual 30 days of retention. "Scheduled tasks" in the
+sidebar, above Settings, opens the page: one card for each task, with an on/off switch, the schedule in words, the
+model, how the last run went (with a link to its chat), when the next one is, and the buttons Run now, Edit and Delete.
+
+A schedule is every 1, 2, 3, 4, 6, 8 or 12 hours (on the hour), every day, every weekday, or one day a week, on this
+PC's clock. When the clocks go forward, a time that was skipped runs the moment the clock passes it; when they go back,
+a time that happens twice runs once.
+
+Only local models, and the server enforces it, not the page. Making or editing a task with a cloud or image model is
+refused, a run checks again, and a model that is gone makes the run fail instead of falling back to another. A run sends
+the saved prompt with your standing instructions and the project's, the model has no tools, and it reads nothing else,
+so nothing a task does costs money or goes to a cloud provider.
+
+Tasks run inside `aihub-web` (or the desktop app), so only while it is running; there is no separate service. One task
+runs at a time, whether the schedule or Run now started it, and a run that finds replies streaming or an image being
+made waits for the next check (every 30 seconds). A run is stopped after 15 minutes. A task that was due while aihub was
+off runs once when it starts if it was due less than 12 hours before, and is skipped (the card says "Skipped") if it
+was due longer ago; several missed times count as one. Closing aihub in the middle of a run keeps what had arrived and
+does not run it again. A run that fails, is stopped, or gets no answer counts as a failure: three in a row switch the
+task off, and its card says why. Switching it on again starts the count afresh.
+
+There can be 50 tasks. They are settings, so the 30-day retention does not remove them and "Delete all chats" leaves
+them; deleting a task keeps its chats. The next run of each is stored, set from its schedule and never from its last
+run, so a clock that is set back cannot run a task twice.
 
 ### Images
 Optional, and free: the images are made on this PC's GPU by stable-diffusion.cpp's `sd-server`, which runs in its own
