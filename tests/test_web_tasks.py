@@ -133,7 +133,7 @@ class TestRunning:
 
         assert (result.status, result.error) == (
             "stopped",
-            "Stopped: the run took longer than the time limit.",
+            "The run took longer than the time limit.",
         )
         reply = store.messages(result.chat_id)[-1]
         assert (reply.content, reply.status) == ("Half an", "stopped")
@@ -365,7 +365,7 @@ class TestWhatIsDue:
             1,
         )
         assert skipped.last_error == (
-            "Skipped: it was due more than 12 hours before the app could run it."
+            "It was due more than 12 hours before the app could run it."
         )
         assert skipped.last_run_at == utc_ms("2027-01-15 08:00")
         assert skipped.next_run_at == utc_ms("2027-01-16 08:00")
@@ -442,7 +442,7 @@ class TestWhenARunFails:
 
         stopped = store.get_task(task.id)
         assert (stopped.last_status, stopped.failures) == ("stopped", 1)
-        assert stopped.last_error == "Stopped: the run took longer than the time limit."
+        assert stopped.last_error == "The run took longer than the time limit."
 
     async def test_a_cloud_model_is_refused_again_at_run_time_with_no_fallback(
         self, tmp_path: Path

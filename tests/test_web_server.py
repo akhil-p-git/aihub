@@ -1652,6 +1652,7 @@ class TestTasksApi:
             False,
             None,
         )
+        assert made["switched_off"] is False
         assert re.fullmatch(r"[0-9a-f]{16}", made["id"])
         assert tasks_of(tasks_api) == [made]
         assert tasks_api.get("/api/bootstrap").json()["tasks"] == [made]
@@ -1841,6 +1842,33 @@ class TestEditingTasks:
                 None,
             )
             assert (on["last_run_at"], on["next_run_at"]) == (None, TOMORROW)
+
+    def test_a_task_says_whether_the_scheduler_switched_it_off(
+        self, tmp_path: Path, tz
+    ) -> None:
+        """So that the page can tell it from a task that was paused by hand, without knowing the words."""
+        gone = "The last one: Gone."
+
+        def seed(store: Store) -> None:
+            for name, enabled, error in (
+                (
+                    "Switched off",
+                    False,
+                    f"Switched off after 3 failed runs in a row. {gone}",
+                ),
+                ("Paused", False, "Gone."),
+                (
+                    "Running again",
+                    True,
+                    f"Switched off after 3 failed runs in a row. {gone}",
+                ),
+            ):
+                task = seeded_task(store, enabled=enabled)
+                store.update_task(task.id, {"name": name, "last_error": error})
+
+        with tasks_app(tmp_path, tz, seed=seed) as client:
+            flags = {t["name"]: t["switched_off"] for t in tasks_of(client)}
+        assert flags == {"Switched off": True, "Paused": False, "Running again": False}
 
     def test_pausing_by_hand_keeps_the_last_result(self, tmp_path: Path, tz) -> None:
         def seed(store: Store) -> None:

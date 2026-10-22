@@ -46,7 +46,7 @@ from .providers import Provider, build_providers
 from .providers.images import EngineClient
 from .schedule import Schedule, describe, next_run, parse_schedule
 from .security import SecurityMiddleware
-from .tasks import SWITCHED_OFF, TICK_SECONDS, RunResult, Scheduler
+from .tasks import TICK_SECONDS, RunResult, Scheduler, switched_off
 
 log = logging.getLogger(__name__)
 
@@ -299,6 +299,7 @@ def task_json(ctx: Context, task: Task) -> dict[str, object]:
         **task.to_json(),
         "schedule_text": words,
         "running": task.id in ctx.scheduler.running,
+        "switched_off": switched_off(task),
     }
 
 
@@ -540,7 +541,7 @@ async def patch_task(request: Request) -> Response:
     if enabled and not task.enabled:
         changes["failures"] = 0
         # If the scheduler switched it off, the reason is gone and so is the explanation of it.
-        if (task.last_error or "").startswith(SWITCHED_OFF):
+        if switched_off(task):
             changes.update(
                 last_status=None, last_error=None, last_chat_id=None, last_run_at=None
             )

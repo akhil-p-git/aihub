@@ -28,7 +28,7 @@ CATCH_UP_MS = 12 * 3_600_000
 MAX_FAILURES = 3
 # How the explanation of a task that the scheduler switched off begins. Switching it on again clears it.
 SWITCHED_OFF = "Switched off"
-SKIPPED = "Skipped: it was due more than 12 hours before the app could run it."
+SKIPPED = "It was due more than 12 hours before the app could run it."
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +50,11 @@ class Started:
     @property
     def chat_id(self) -> str:
         return self.turn.chat.id
+
+
+def switched_off(task: Task) -> bool:
+    """Whether the scheduler switched the task off, which its explanation says, as against a person pausing it."""
+    return not task.enabled and (task.last_error or "").startswith(SWITCHED_OFF)
 
 
 def next_run_of(task: Task, after_ms: int) -> int:
@@ -86,7 +91,7 @@ async def finish_run(
         return RunResult(
             "stopped",
             started.chat_id,
-            "Stopped: the run took longer than the time limit.",
+            "The run took longer than the time limit.",
         )
 
     reply = last["message"]
