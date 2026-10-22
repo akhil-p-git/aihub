@@ -239,11 +239,13 @@ class Scheduler:
         task = self._store.get_task(task_id)
         if task is None:  # deleted during the run: its chat stays, with no task
             return
+        # A chat that was deleted during its run is gone, and a task cannot link to it.
+        chat = result.chat_id and self._store.get_chat(result.chat_id)
         changes: dict[str, object] = {
             "last_run_at": ran_at,
             "last_status": result.status,
             "last_error": result.error,
-            "last_chat_id": result.chat_id,
+            "last_chat_id": chat.id if chat else None,
         }
         if result.status == "done":
             changes["failures"] = 0
