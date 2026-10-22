@@ -16,7 +16,9 @@ This is the web chat, run as a systemd user service and opened in a browser. It 
   `ollama pull qwen3:8b` makes it work at once. `ollama pull qwen3:4b` (2.5 GB) is smaller; then put
   `ollama/qwen3:4b` in `default_models`. Any Ollama model that can chat shows up in the picker by itself.
   Without Ollama the page still opens, and the local models are marked "Ollama isn't responding".
-- Optional: keys for OpenRouter and Claude (see "Add a key" below), and an NVIDIA GPU for images (see Images).
+- Optional: keys for OpenRouter and Claude (see "Add a key" below).
+- Optional, for image generation: an **NVIDIA GPU** is required. The image engine is built with CUDA and the unit uses
+  `/dev/nvidia*`, so without one the chat works but images do not (see Images).
 
 **Install**
 
@@ -59,7 +61,7 @@ so restart it after every change. The spend limit on the key, not this app, is t
 models and the Claude models are chosen in `~/.config/aihub/web.yaml` (`paid_models`, `anthropic.models`). `default_models`
 must stay free or local, so a forgotten chat cannot spend your credits. The desktop app reads the same keys file.
 
-**Images** need more: an NVIDIA GPU, `sd-server` built from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+**Images** need an NVIDIA GPU, and more: `sd-server` built from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
 with CUDA (this repo was tested with commit `0518b34`) at `~/work/aihub-images/bin/sd-server`, and the model files named in
 `systemd/images/models.json` under `~/work/aihub-images/models/`: `z-image-turbo/` (`z_image_turbo-Q5_0.gguf`,
 `Qwen3-4B-Q4_K_M.gguf`, `ae.safetensors`) and `flux2-klein-4b/` (`flux-2-klein-4b-Q8_0.gguf`, `Qwen3-4B-Q4_K_M.gguf`,
