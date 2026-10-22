@@ -49,6 +49,18 @@ deleted 30 days after its last message (`retention_days`): once at start-up and 
 checkpoint that follows moves the deleted text out of the write-ahead log too. Renaming a chat does not count as
 activity. The sidebar says so, and a chat in its last week shows "Deletes in N days". Settings has "Delete all chats".
 
+**Upgrading the database.** The schema has a version (`PRAGMA user_version`: 2 added images, 3 added projects). Starting a
+newer build on an older file upgrades it in place, one transaction per step, and first copies the file with SQLite's
+backup API to `chats.db.v<old>.bak` beside it (mode 600; a second copy of the same version is `chats.db.v<old>-2.bak`).
+If the copy cannot be made, the file is not upgraded. A copy holds chats as they were, so it is removed after
+`retention_days` and by "Delete all chats": copy it somewhere else first if you want to keep it longer. An older build
+refuses a newer file (`database schema 3 is newer than this app (2)`), and setting `user_version` back by hand does not
+help, because from version 3 the `chats` table has a `project_id` column that older code cannot read. To go back, stop the
+service, put the copy over the database (`cp state/web/chats.db.v2.bak state/web/chats.db`), delete `chats.db-wal` and
+`chats.db-shm` beside it, and start the older build. Chats made after the upgrade are not in the copy. The desktop app
+keeps its own database and its frozen copy of the backend, so after pulling a change that raises the schema version, run
+`build:backend` and `dist:linux` again before pointing it at a newer database.
+
 **Settings** are in `~/.config/aihub/web.yaml` (a copy of `config/web.example.yaml`; every value shown is the
 default, and unknown keys are an error). It holds the port, `allowed_hosts`, retention, default models, the Ollama
 context size, the paid OpenRouter models and their privacy routing, and the Claude price list used for the cost
@@ -97,12 +109,8 @@ model, which adds to its time.
 
 **Storage.** Images live in `state/web/chats.db` as WebP (the schema is version 2, one `images` table) and go with their
 chat, when it expires or is deleted. Image storage stops at 2 GiB, after which new images are refused until chats are
-deleted. Code from before images refuses a version 2 database. To go back to it, stop the service and run
-`sqlite3 ~/work/Dev/aihub/state/web/chats.db 'PRAGMA user_version=1'`: the old code ignores the table, and deleting a
-chat still removes its images. To come forward again, run the same with `user_version=2` first (the upgrade creates the
-table, so it fails on a version 1 file that already has it). The desktop app keeps its own database and its frozen copy
-of the backend, so after pulling this change run `build:backend` and `dist:linux` again before pointing it at a
-version 2 database.
+deleted. Code from before images refuses a database of version 2 or later: see "Upgrading the database" under Storage
+and retention for how to go back.
 
 **Exposure.** The engine is never reachable over the network, but the page's port is: if you put Tailscale in front of
 aihub (see Security), everyone the `allowed_hosts` list admits can make images and keep the GPU busy.
