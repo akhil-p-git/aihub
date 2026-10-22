@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .catalog import Catalog, ModelInfo
 from .config import Config
-from .db import Chat, Message, Store
+from .db import Chat, Message, Project, Store
 from .images import (
     IMAGE_STORE_CAP,
     MAX_PROMPT_CHARS,
@@ -174,10 +174,19 @@ def fit_history(
     return kept, len(turns) - len(kept)
 
 
-def system_prompt(instructions: str, today: date) -> str:
+def system_prompt(
+    instructions: str, today: date, project: Project | None = None
+) -> str:
+    """The date, then the user's standing instructions, then those of the chat's project. All three are the
+    user's own words, so all are trusted the same."""
     parts = [f"The current date is {today.isoformat()}."]
     if instructions.strip():
         parts.append("Standing instructions from the user:\n" + instructions.strip())
+    if project and project.instructions.strip():
+        parts.append(
+            f'Instructions for the project "{project.name}":\n'
+            + project.instructions.strip()
+        )
     return "\n\n".join(parts)
 
 
@@ -298,7 +307,10 @@ class ChatService:
                 or chat
             )
 
-        system = system_prompt(self._store.get_setting("instructions"), self._today())
+        project = self._store.get_project(chat.project_id) if chat.project_id else None
+        system = system_prompt(
+            self._store.get_setting("instructions"), self._today(), project
+        )
         turns, dropped = fit_history(
             build_history(self._store.messages(chat.id), self._image_names()),
             # The budget is for the whole request: what the system prompt takes, the history cannot.

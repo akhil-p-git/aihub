@@ -15,9 +15,10 @@ from aihub_web.chat import (
     cost_of,
     derive_title,
     fit_history,
+    system_prompt,
 )
 from aihub_web.config import Config, Limits
-from aihub_web.db import Message, Store
+from aihub_web.db import Message, Project, Store
 from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
 from helpers import (
     HANG,
@@ -1224,4 +1225,133 @@ class TestSharingTheGpu:
         )
         await run(service, text="a fox", model=IMAGE)
         assert ollama.resident == []
+        await service.images.shutdown()
+
+
+def a_project(name: str = "Trips", instructions: str = "Answer in French.") -> Project:
+    return Project("0123456789abcdef", name, instructions, 1, 1)
+
+
+class TestSystemPrompt:
+    def test_it_starts_with_the_date(self) -> None:
+        assert system_prompt("", TODAY) == "The current date is 2026-10-20."
+
+    def test_standing_instructions_follow_the_date(self) -> None:
+        assert system_prompt("  Be brief.\n", TODAY) == (
+            "The current date is 2026-10-20.\n\n"
+            "Standing instructions from the user:\nBe brief."
+        )
+
+    def test_a_projects_instructions_come_after_the_standing_ones(self) -> None:
+        assert system_prompt("Be brief.", TODAY, a_project()) == (
+            "The current date is 2026-10-20.\n\n"
+            "Standing instructions from the user:\nBe brief.\n\n"
+            'Instructions for the project "Trips":\nAnswer in French.'
+        )
+
+    def test_a_project_alone_adds_its_own_block(self) -> None:
+        assert system_prompt("", TODAY, a_project(instructions=" Use metric. ")) == (
+            "The current date is 2026-10-20.\n\n"
+            'Instructions for the project "Trips":\nUse metric.'
+        )
+
+    @pytest.mark.parametrize("empty", ["", "  \n "])
+    def test_a_project_without_instructions_adds_nothing(self, empty: str) -> None:
+        assert system_prompt("", TODAY, a_project(instructions=empty)) == (
+            "The current date is 2026-10-20."
+        )
+
+
+@pytest.mark.anyio
+class TestProjectInstructions:
+    async def test_a_chat_in_a_project_sends_its_instructions(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+        store.set_setting("instructions", "Be brief.")
+        project = store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", FREE, None, project.id)
+        await run(service, chat_id=chat.id, text="hello")
+        assert providers["openrouter"].requests[-1].system == system_prompt(
+            "Be brief.", TODAY, project
+        )
+
+    async def test_every_provider_gets_them(self, tmp_path: Path) -> None:
+        service, store, providers = await make_service(tmp_path)
+        project = store.create_project("Trips", "Answer in French.")
+        for model, provider in ((LOCAL, "ollama"), (HAIKU, "anthropic")):
+            chat = store.create_chat("c", model, None, project.id)
+            await run(service, chat_id=chat.id, text="hello")
+            assert 'Instructions for the project "Trips"' in (
+                providers[provider].requests[-1].system
+            )
+
+    async def test_a_chat_outside_any_project_sends_none(self, tmp_path: Path) -> None:
+        service, store, providers = await make_service(tmp_path)
+        store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", FREE, None)
+        await run(service, chat_id=chat.id, text="hello")
+        assert "Instructions for the project" not in (
+            providers["openrouter"].requests[-1].system
+        )
+
+    async def test_an_edit_applies_to_the_next_message_of_a_chat_already_in_the_project(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+        project = store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", FREE, None, project.id)
+        await run(service, chat_id=chat.id, text="one")
+        store.update_project(project.id, instructions="Answer in German.")
+        await run(service, chat_id=chat.id, text="two")
+        systems = [r.system for r in providers["openrouter"].requests]
+        assert "Answer in French." in systems[0] and "Answer in German." in systems[1]
+        assert "French" not in systems[1]
+
+    async def test_taking_a_chat_out_of_its_project_stops_them(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+        project = store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", FREE, None, project.id)
+        store.update_chat(chat.id, {"project_id": None})
+        await run(service, chat_id=chat.id, text="hello")
+        assert "French" not in providers["openrouter"].requests[-1].system
+
+    async def test_a_deleted_project_leaves_its_chats_with_none(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+        project = store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", FREE, None, project.id)
+        store.delete_project(project.id, delete_chats=False)
+        await run(service, chat_id=chat.id, text="hello")
+        assert "French" not in providers["openrouter"].requests[-1].system
+
+    async def test_the_instructions_use_up_history_budget_like_any_others(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, limits=Limits(cloud_context_tokens=1000)
+        )
+        project = store.create_project("Trips", "p" * 600)  # about 200 tokens
+        chat = store.create_chat("long", FREE, None, project.id)
+        for i in range(9):
+            store.add_message(chat.id, "user", f"question {i} " + "x" * 140)
+            store.add_message(chat.id, "assistant", f"answer {i} " + "y" * 140)
+        events = await run(service, chat_id=chat.id, text="latest")
+        assert [e["t"] for e in events].count("note") == 1
+
+    async def test_an_image_prompt_is_not_changed_by_them(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, providers = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        project = store.create_project("Trips", "Answer in French.")
+        chat = store.create_chat("c", IMAGE, None, project.id)
+        await run(service, chat_id=chat.id, text="a red fox", model=IMAGE)
+        assert [body["prompt"] for body in engine.submitted] == ["a red fox"]
+        assert not any(provider.requests for provider in providers.values())
         await service.images.shutdown()
