@@ -44,6 +44,7 @@ TITLE_LENGTH = 60
 CHARS_PER_TOKEN = 3
 # Leave a quarter of the context for the reply.
 CONTEXT_SHARE = 0.75
+TASK_MODEL_MESSAGE = "A scheduled task can only use a text model that runs on this PC."
 
 
 class ApiError(Exception):
@@ -252,21 +253,34 @@ class ChatService:
         # Set where image generation is: the jobs, and with them the GPU lock.
         self.images = images
 
-    def prepare(self, body: ChatRequest) -> Turn | ImageTurn:
-        """Everything that can be refused is refused here, before any bytes are streamed."""
+    def prepare(
+        self,
+        body: ChatRequest,
+        *,
+        title: str | None = None,
+        task_id: str | None = None,
+    ) -> Turn | ImageTurn:
+        """Everything that can be refused is refused here, before any bytes are streamed.
+
+        `title` and `task_id` are for the run of a scheduled task, which makes a new chat named for the task and
+        linked to it. A browser cannot send them. Nobody watches a task, so it never spends money or sends its
+        prompt away: only a text model on this PC is accepted for one.
+        """
         chat = self._store.get_chat(body.chat_id) if body.chat_id else None
         if body.chat_id and not chat:
             raise ApiError(404, "no_chat", "That chat no longer exists.")
         if body.project_id and self._store.get_project(body.project_id) is None:
             raise ApiError(404, "no_project", "That project no longer exists.")
         model = self._resolve_model(body.model or (chat.model if chat else None))
+        if task_id and model.provider != "ollama":
+            raise ApiError(422, "task_model", TASK_MODEL_MESSAGE)
         if model.output == "image":
             return self._prepare_image(body, chat, model)
         if body.shape:
             raise ApiError(422, "invalid", "shape/reference only apply to image models")
         lease = self._share_the_gpu(model)
         try:
-            turn = self._prepare_text(body, chat, model)
+            turn = self._prepare_text(body, chat, model, title, task_id)
         except BaseException:
             if lease:
                 lease.release()
@@ -285,7 +299,12 @@ class ChatService:
             raise ApiError(429, "busy_gpu", str(err)) from err
 
     def _prepare_text(
-        self, body: ChatRequest, chat: Chat | None, model: ModelInfo
+        self,
+        body: ChatRequest,
+        chat: Chat | None,
+        model: ModelInfo,
+        title: str | None,
+        task_id: str | None,
     ) -> Turn:
         effort = self._resolve_effort(
             model, body.effort or (chat.effort if chat else None)
@@ -310,7 +329,11 @@ class ChatService:
                 )
             if not chat:
                 chat = self._store.create_chat(
-                    derive_title(text), model.id, effort, body.project_id
+                    title or derive_title(text),
+                    model.id,
+                    effort,
+                    body.project_id,
+                    task_id,
                 )
             user = self._store.add_message(chat.id, "user", text)
         if (chat.model, chat.effort) != (model.id, effort):

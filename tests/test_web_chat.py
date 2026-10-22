@@ -1355,3 +1355,86 @@ class TestProjectInstructions:
         assert [body["prompt"] for body in engine.submitted] == ["a red fox"]
         assert not any(provider.requests for provider in providers.values())
         await service.images.shutdown()
+
+
+@pytest.mark.anyio
+class TestTaskTurns:
+    """A scheduled task enters through prepare() with a title and the task's id. Nobody is watching it, so it may
+    not spend money or send its prompt to a cloud: only a text model on this PC is accepted."""
+
+    @staticmethod
+    def a_task(store: Store):
+        return store.create_task(
+            "Morning digest",
+            prompt="Summarise my day.",
+            model=LOCAL,
+            effort=None,
+            schedule={"kind": "daily", "time": "08:00"},
+        )
+
+    async def test_the_chat_takes_the_tasks_title_and_link(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, _ = await make_service(tmp_path)
+        task = self.a_task(store)
+        turn = service.prepare(
+            ChatRequest(text="Summarise my day. Be brief.", model=LOCAL),
+            title="Morning digest",
+            task_id=task.id,
+        )
+        stored = store.get_chat(turn.chat.id)
+        assert (stored.title, stored.task_id) == ("Morning digest", task.id)
+
+    async def test_an_ordinary_chat_has_no_task_and_a_title_from_its_text(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, _ = await make_service(tmp_path)
+        turn = service.prepare(ChatRequest(text="Say hello please", model=LOCAL))
+        stored = store.get_chat(turn.chat.id)
+        assert (stored.title, stored.task_id) == ("Say hello please", None)
+
+    @pytest.mark.parametrize("model", [FREE, HAIKU])
+    async def test_a_cloud_model_is_refused_before_anything_is_stored(
+        self, tmp_path: Path, model: str
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+        task = self.a_task(store)
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(text="Summarise my day.", model=model),
+                title="Morning digest",
+                task_id=task.id,
+            )
+        assert (err.value.status, err.value.code) == (422, "task_model")
+        assert err.value.message == (
+            "A scheduled task can only use a text model that runs on this PC."
+        )
+        assert store.list_chats() == []
+        assert all(not provider.requests for provider in providers.values())
+
+    async def test_an_image_model_is_refused_before_a_job_starts(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        task = self.a_task(store)
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(text="a red fox", model=IMAGE),
+                title="Morning digest",
+                task_id=task.id,
+            )
+        assert (err.value.status, err.value.code) == (422, "task_model")
+        assert store.list_chats() == []
+        assert engine.submitted == []  # no job was made
+        await service.images.shutdown()
+
+    async def test_the_same_models_are_fine_outside_a_task(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, _ = await make_service(tmp_path)
+        for model in (FREE, HAIKU):
+            turn = service.prepare(ChatRequest(text="hello", model=model))
+            assert store.get_chat(turn.chat.id).task_id is None
