@@ -523,6 +523,47 @@ class TestOneAtATime:
             "done",
         ]
 
+    async def test_a_scheduled_run_waits_for_one_that_a_person_started(
+        self, tmp_path: Path
+    ) -> None:
+        """Only one task runs at a time, however it was started: both would be on the GPU at once."""
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        started = asyncio.Event()
+        providers["ollama"].script = [Text("Half an"), started.set, HANG]
+        by_hand = a_task(store)
+        due = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        scheduler.run_now(by_hand)
+        await started.wait()
+
+        await scheduler.tick()
+
+        assert len(store.list_chats()) == 1  # the one made by hand
+        waiting = store.get_task(due.id)
+        assert (waiting.last_status, waiting.failures) == (None, 0)
+        assert waiting.next_run_at == utc_ms("2027-01-15 08:00")  # still due
+        assert scheduler.running == {by_hand.id}
+
+        await scheduler.stop()
+        providers["ollama"].script = [Text("fine"), Finish("stop")]
+        await scheduler.tick()  # the hand-started run is over
+        assert store.get_task(due.id).last_status == "done"
+
+    async def test_nor_does_it_start_the_same_task_a_second_time(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        started = asyncio.Event()
+        providers["ollama"].script = [Text("Half an"), started.set, HANG]
+        task = a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+        scheduler.run_now(task)  # by hand, a moment before it was due
+        await started.wait()
+
+        await scheduler.tick()
+
+        assert len(store.list_chats()) == 1
+        assert scheduler.running == {task.id}
+        await scheduler.stop()
+
     async def test_the_next_run_is_set_before_the_reply_starts(
         self, tmp_path: Path
     ) -> None:
