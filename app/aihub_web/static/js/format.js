@@ -102,12 +102,26 @@ export function formatDay(iso) {
 
 export const TIER_LABELS = { free: "Free", local: "Local", paid: "Paid" };
 
+export const SHAPES = { square: "Square", wide: "Wide", tall: "Tall" };
+
+/** How long one image takes in this shape, as the model's settings estimate it: "Square, about 23 s". */
+export function shapeNote(model, shape) {
+  const seconds = model?.est_s?.[shape];
+  return seconds ? `${SHAPES[shape]}, about ${seconds} s` : SHAPES[shape];
+}
+
 /** The sentence that says where the next prompt goes. */
 export function routeFor(model) {
   if (!model) {
     return {
       title: "No model available",
       text: "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
+    };
+  }
+  if (model.output === "image") {
+    return {
+      title: `Image mode on ${shortName(model.name)}`,
+      text: "Your prompt makes one image on this PC. Nothing leaves the machine; local chat models pause while it works.",
     };
   }
   const title = `New chat on ${shortName(model.name)}`;

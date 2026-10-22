@@ -15,6 +15,7 @@ import {
   groupChats,
   levelLabel,
   routeFor,
+  shapeNote,
   shortName,
 } from "../../app/aihub_web/static/js/format.js";
 
@@ -170,10 +171,31 @@ describe("routeFor: where the next prompt goes", () => {
     });
     assert.match(router.text, /don't keep prompts/);
   });
+  it("image models make an image on the PC and say that local chat pauses meanwhile", () => {
+    const route = routeFor({ name: "Z-Image Turbo", tier: "local", provider: "images", output: "image" });
+    assert.equal(route.title, "Image mode on Z-Image Turbo");
+    assert.equal(
+      route.text,
+      "Your prompt makes one image on this PC. Nothing leaves the machine; local chat models pause while it works.",
+    );
+    assert.doesNotMatch(route.text, /Ollama/, "an image model does not run through Ollama");
+  });
   it("says what to do when no model is usable, in words that are true for the service and the app", () => {
     assert.equal(
       routeFor(undefined).text,
       "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
     );
+  });
+});
+
+describe("shapeNote: what a shape costs in time", () => {
+  const model = { est_s: { square: 23, wide: 12, tall: 12 } };
+  it("names the shape and the model's estimate for it", () => {
+    assert.equal(shapeNote(model, "square"), "Square, about 23 s");
+    assert.equal(shapeNote(model, "tall"), "Tall, about 12 s");
+  });
+  it("names only the shape when the model has no estimate for it", () => {
+    assert.equal(shapeNote({ est_s: { square: 23 } }, "wide"), "Wide");
+    assert.equal(shapeNote(undefined, "wide"), "Wide");
   });
 });

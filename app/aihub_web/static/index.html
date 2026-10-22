@@ -65,7 +65,7 @@
 
     <form class="composer" id="composer" autocomplete="off">
       <div class="composer-box">
-        <label class="sr-only" for="composer-input">Message</label>
+        <label class="sr-only" for="composer-input" id="composer-label">Message</label>
         <textarea id="composer-input" name="message" rows="1" placeholder="Message…" enterkeyhint="send" autocapitalize="sentences"></textarea>
         <div class="composer-bar">
           <button class="chip" id="model-chip" type="button" aria-haspopup="listbox" aria-expanded="false" disabled>
@@ -75,6 +75,9 @@
           <button class="chip" id="effort-chip" type="button" aria-haspopup="true" aria-expanded="false" hidden>
             <span class="chip-bars" id="effort-bars"></span>
             <span class="chip-name" id="effort-name"></span>
+          </button>
+          <button class="chip" id="shape-chip" type="button" aria-haspopup="true" aria-expanded="false" hidden>
+            <span class="chip-name" id="shape-name"></span>
           </button>
           <button class="send" id="send" type="submit" aria-label="Send" disabled></button>
         </div>

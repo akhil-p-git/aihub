@@ -1,4 +1,5 @@
-// The intensity menu: how hard the model should think. Levels are whatever the chosen model offers.
+// The small choice menu under a chip: how hard the model should think (levels are whatever the chosen model offers),
+// or what shape an image takes. One popover serves both.
 
 import { bars, h, icon, placePopover } from "./dom.js";
 import { barsFor, levelLabel } from "./format.js";
@@ -6,7 +7,7 @@ import { barsFor, levelLabel } from "./format.js";
 let pop;
 let group;
 let note;
-let current; // { anchor, levels, selected, onSelect }
+let current; // { anchor, onSelect }
 let closedAt = 0;
 
 function build() {
@@ -21,10 +22,10 @@ function build() {
   document.body.append(pop);
 
   group.addEventListener("click", (event) => {
-    const level = event.target.closest("[data-level]")?.dataset.level;
-    if (!level) return;
+    const value = event.target.closest("[data-level]")?.dataset.level;
+    if (!value) return;
     pop.hidePopover();
-    current.onSelect(level);
+    current.onSelect(value);
   });
   group.addEventListener("keydown", (event) => {
     const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
@@ -41,34 +42,59 @@ function build() {
   });
 }
 
-export function openEffortMenu(options) {
+/** `rows` are { value, content[] }; `selected` is the value that is checked. */
+function show({ anchor, onSelect, title, rows, selected, text }) {
   if (!pop) build();
   if (closedAt && performance.now() - closedAt < 250) return;
-  current = options;
-  const { levels, selected } = options;
+  current = { anchor, onSelect };
+  pop.setAttribute("aria-label", title);
+  group.setAttribute("aria-label", title);
   group.replaceChildren(
-    ...levels.map((level) =>
+    ...rows.map(({ value, content }) =>
       h(
         "button",
         {
           class: "level",
           type: "button",
           role: "radio",
-          "data-level": level,
-          "aria-checked": String(level === selected),
-          tabindex: level === selected ? "0" : "-1",
+          "data-level": value,
+          "aria-checked": String(value === selected),
+          tabindex: value === selected ? "0" : "-1",
         },
-        bars(barsFor(level, levels)),
-        h("span", {}, levelLabel(level)),
-        level === selected ? icon("check") : null,
+        ...content,
+        value === selected ? icon("check") : null,
       ),
     ),
   );
-  note.textContent = options.paid
-    ? "Higher intensity thinks longer and costs more."
-    : "Higher intensity thinks longer before it answers.";
-  options.anchor.setAttribute("aria-expanded", "true");
+  note.textContent = text;
+  anchor.setAttribute("aria-expanded", "true");
   pop.showPopover();
-  placePopover(pop, options.anchor);
+  placePopover(pop, anchor);
   group.querySelector('[aria-checked="true"]')?.focus();
+}
+
+export function openEffortMenu({ anchor, levels, selected, paid, onSelect }) {
+  show({
+    anchor,
+    onSelect,
+    title: "Intensity",
+    selected,
+    rows: levels.map((level) => ({
+      value: level,
+      content: [bars(barsFor(level, levels)), h("span", {}, levelLabel(level))],
+    })),
+    text: paid ? "Higher intensity thinks longer and costs more." : "Higher intensity thinks longer before it answers.",
+  });
+}
+
+/** `choices` are [value, label] pairs; `text` is the note under them. */
+export function openChoiceMenu({ anchor, title, choices, selected, text, onSelect }) {
+  show({
+    anchor,
+    onSelect,
+    title,
+    selected,
+    rows: choices.map(([value, label]) => ({ value, content: [h("span", {}, label)] })),
+    text,
+  });
 }

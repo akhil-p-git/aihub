@@ -1,11 +1,21 @@
 // aihub: wires the page together. State lives in one object; each render function redraws one region.
 
 import { ApiError, api, streamChat } from "./api.js";
-import { configureConversation, ReplyView, replyFor, userMessage } from "./conversation.js";
+import { configureConversation, focusReply, ReplyView, replyFor, userMessage } from "./conversation.js";
 import { confirmDialog, openRowMenu, openSettings } from "./dialogs.js";
 import { bars, h, icon } from "./dom.js";
-import { openEffortMenu } from "./effort.js";
-import { TIER_LABELS, barsFor, coerceEffort, daysLeft, levelLabel, routeFor, shortName } from "./format.js";
+import { openChoiceMenu, openEffortMenu } from "./effort.js";
+import {
+  SHAPES,
+  TIER_LABELS,
+  barsFor,
+  coerceEffort,
+  daysLeft,
+  levelLabel,
+  routeFor,
+  shapeNote,
+  shortName,
+} from "./format.js";
 import { openModelPicker } from "./picker.js";
 import { renderSidebar } from "./sidebar.js";
 import { toast } from "./toast.js";
@@ -31,6 +41,9 @@ const els = {
   form: $("composer"),
   input: $("composer-input"),
   send: $("send"),
+  label: $("composer-label"),
+  shapeChip: $("shape-chip"),
+  shapeName: $("shape-name"),
   modelChip: $("model-chip"),
   modelTier: $("model-tier"),
   modelName: $("model-name"),
@@ -53,7 +66,7 @@ const state = {
   retentionDays: 30,
   chat: null, // the open chat, or null for a new one
   messages: [],
-  draft: { model: null, effort: null }, // what the next message will use
+  draft: { model: null, effort: null, shape: "square" }, // what the next message will use
   drafts: new Map(), // unsent text per chat
   run: null, // the reply in progress
   stick: true, // follow the bottom while a reply streams
@@ -81,6 +94,7 @@ const store = {
 };
 
 const currentModel = () => state.byId.get(state.draft.model);
+const isImage = (model) => model?.output === "image";
 const chatById = (id) => state.chats.find((chat) => chat.id === id);
 
 function announce(text) {
@@ -145,6 +159,15 @@ function renderChips() {
     els.modelTier.dataset.tier = model.tier;
     els.modelChip.setAttribute("aria-label", `${TIER_LABELS[model.tier]} ${shortName(model.name)}. Change model`);
   }
+  const image = isImage(model);
+  els.shapeChip.hidden = !image;
+  if (image) {
+    const { shape } = state.draft;
+    els.shapeName.textContent = SHAPES[shape];
+    els.shapeChip.setAttribute("aria-label", `Shape: ${shapeNote(model, shape)}. Change shape`);
+  }
+  els.label.textContent = image ? "Image prompt" : "Message";
+  els.input.placeholder = image ? "Describe an image…" : "Message…";
   const efforts = model?.efforts;
   els.effortChip.hidden = !efforts;
   if (efforts) {
@@ -159,7 +182,7 @@ function renderChips() {
 function renderSend() {
   const running = Boolean(state.run);
   els.send.replaceChildren(icon(running ? "stop" : "up"));
-  els.send.setAttribute("aria-label", running ? "Stop" : "Send");
+  els.send.setAttribute("aria-label", running ? "Stop" : isImage(currentModel()) ? "Create image" : "Send");
   els.send.disabled = !running && (!els.input.value.trim() || !currentModel());
 }
 
@@ -175,7 +198,9 @@ function renderMessages(messages) {
   const token = ++state.seq;
   els.messages.replaceChildren();
   const last = messages.length - 1;
-  const build = (m, i) => (m.role === "user" ? userMessage(m) : ReplyView.from(m, { last: i === last }).el);
+  const promptFor = (i) => (messages[i - 1]?.role === "user" ? messages[i - 1].content : "");
+  const build = (m, i) =>
+    m.role === "user" ? userMessage(m) : ReplyView.from(m, { last: i === last, prompt: promptFor(i) }).el;
   // The newest messages first, so the chat is usable at once; the rest fill in above while idle.
   let end = Math.max(0, messages.length - 24);
   els.messages.append(...messages.slice(end).map((m, i) => build(m, end + i)));
@@ -241,11 +266,15 @@ function upsertChat(chat) {
 function pickDraft(chat) {
   const stored = chat && state.byId.get(chat.model);
   const model = stored?.available ? stored : state.byId.get(state.defaultModel);
-  state.draft = { model: model?.id ?? null, effort: coerceEffort(model, stored === model ? chat.effort : null) };
+  state.draft = {
+    model: model?.id ?? null,
+    effort: coerceEffort(model, stored === model ? chat.effort : null),
+    shape: state.draft.shape,
+  };
 }
 
 function newChat() {
-  stopRun();
+  leaveRun();
   state.chat = null;
   state.messages = [];
   pickDraft(null);
@@ -256,7 +285,7 @@ function newChat() {
 
 async function openChat(id) {
   const seq = ++state.seq;
-  stopRun();
+  leaveRun();
   try {
     const data = await api.get(`/api/chats/${id}`);
     if (seq !== state.seq) return;
@@ -265,7 +294,8 @@ async function openChat(id) {
     pickDraft(data.chat);
     swapDraftText(id);
     renderChat();
-    announce(`Opened ${data.chat.title}`);
+    announce(`Opened ${data.chat.title}${isImage(currentModel()) ? ". Image mode." : ""}`);
+    if (data.pending_image) watchImage(data.chat, data.pending_image);
     if (!coarse.matches) els.input.focus({ preventScroll: true });
   } catch (err) {
     if (seq !== state.seq) return;
@@ -297,8 +327,103 @@ function route() {
 
 // ---- replying
 
+/** Moving to another chat ends a text reply, whose connection is the work. An image job outlives its connection. */
+function leaveRun() {
+  const run = state.run;
+  if (!run) return;
+  if (!run.image) return run.controller.abort();
+  run.detached = true;
+  clearTimeout(run.timer);
+  run.controller?.abort(); // only stops listening
+  if (run.watching) {
+    run.view.discard();
+    state.run = null;
+    renderSend();
+  }
+}
+
+/** The Stop button. An image job runs on without the request that started it, so Stop is a request of its own. */
 function stopRun() {
-  state.run?.controller.abort();
+  const run = state.run;
+  if (!run) return;
+  if (!run.image) run.controller.abort();
+  else if (run.chatId) sendImageStop(run);
+  else {
+    run.stopWanted = true; // the chat's id arrives with the first event
+    run.view.stopping();
+  }
+}
+
+async function sendImageStop(run) {
+  run.view.stopping();
+  announce("Stopping the image");
+  try {
+    await api.post(`/api/chats/${run.chatId}/image/stop`);
+  } catch (err) {
+    if (err.code === "no_job") return; // it ended a moment ago, and its reply is on the way
+    run.view.stopping(false);
+    toast(err.message);
+  }
+}
+
+/** What #status says when an image ends. */
+function imageOutcome(message) {
+  if (message.status === "stopped") return "Image stopped";
+  if (message.status === "error") return `Image failed. ${message.error?.message ?? ""}`.trim();
+  const [image] = message.images ?? [];
+  if (!image) return "Image ready.";
+  return `Image ready. ${image.w} by ${image.h}, ${Math.round((message.usage?.total_ms ?? 0) / 1000)} seconds.`;
+}
+
+const POLL_MS = 1500;
+
+/** A chat opened while its image is still being made: show where the job is, and poll until it is stored. */
+function watchImage(chat, pending) {
+  const view = new ReplyView({
+    model: pending.model,
+    image: { shape: pending.shape, est: state.byId.get(pending.model)?.est_s?.[pending.shape] },
+    onFrame: keepPinned,
+  });
+  view.progress(pending);
+  const run = { image: true, watching: true, started: true, chatId: chat.id, view, timer: 0 };
+  els.messages.append(view.el);
+  state.run = run;
+  renderSend();
+  scrollToBottom();
+  const poll = async () => {
+    try {
+      const data = await api.get(`/api/chats/${chat.id}`);
+      if (state.run !== run) return;
+      if (data.pending_image) {
+        view.progress(data.pending_image);
+        run.timer = setTimeout(poll, POLL_MS);
+        return;
+      }
+      const onSlate = view.el.contains(document.activeElement);
+      view.discard();
+      state.run = null;
+      state.chat = data.chat;
+      state.messages = data.messages;
+      upsertChat(data.chat);
+      renderChat();
+      const reply = data.messages.at(-1);
+      if (reply?.role === "assistant") {
+        if (onSlate) focusReply(els.messages.lastElementChild);
+        announce(imageOutcome(reply));
+      }
+    } catch (err) {
+      if (state.run !== run) return;
+      if (err.code === "no_chat") {
+        view.discard();
+        state.run = null;
+        toast("That chat was deleted.");
+        go("#/");
+        return;
+      }
+      run.timer = setTimeout(poll, POLL_MS * 2); // the server may be restarting: keep asking
+    }
+  };
+  run.timer = setTimeout(poll, POLL_MS);
 }
 
 function localMessage(run, status, error = null) {
@@ -328,26 +453,49 @@ function dropRetryButtons() {
 async function startRun({ text = "", regenerateFor = null, replaced = null } = {}) {
   const model = currentModel();
   if (state.run || !model?.available) return;
-  const body = { chat_id: state.chat?.id ?? null, model: model.id, effort: state.draft.effort };
+  const image = isImage(model);
+  const { shape } = state.draft;
+  const effort = image ? null : state.draft.effort;
+  const body = { chat_id: state.chat?.id ?? null, model: model.id, effort };
+  if (image) body.shape = shape;
   if (regenerateFor) body.regenerate_for = regenerateFor;
   else body.text = text;
+  const prompt = regenerateFor ? (state.messages.findLast((m) => m.role === "user")?.content ?? "") : text;
 
   const controller = new AbortController();
   const view = new ReplyView({
     waiting: model.tier === "local" ? `Starting ${shortName(model.name)}…` : `Waiting for ${shortName(model.name)}…`,
     model: model.id,
-    effort: state.draft.effort,
+    effort,
+    image: image ? { shape, est: model.est_s?.[shape] } : null,
     onFrame: keepPinned,
   });
   const userEl = regenerateFor ? null : userMessage({ id: "", content: text });
   if (userEl) els.messages.append(userEl);
   els.messages.append(view.el);
   els.route.hidden = true;
-  const run = { controller, view, userEl, text, regenerate: Boolean(regenerateFor), replaced, started: false };
+  const run = {
+    controller,
+    view,
+    userEl,
+    text,
+    prompt,
+    image,
+    chatId: state.chat?.id ?? null,
+    modelId: model.id,
+    shape,
+    regenerate: Boolean(regenerateFor),
+    replaced,
+    started: false,
+  };
   state.run = run;
   scrollToBottom();
   renderSend();
-  announce("Reply started");
+  if (image) {
+    const est = model.est_s?.[shape];
+    announce(est ? `Creating image, about ${est} seconds` : "Creating image");
+    run.still = setTimeout(() => announce("Still working"), 15000);
+  } else announce("Reply started");
 
   try {
     for await (const event of streamChat(body, controller.signal)) {
@@ -360,6 +508,7 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
   } catch (err) {
     onRunError(run, err);
   } finally {
+    clearTimeout(run.still);
     if (state.run === run) state.run = null;
     renderSend();
     dropRetryButtons();
@@ -380,6 +529,11 @@ function onEvent(run, event) {
         if (run.userEl) run.userEl.dataset.id = event.user.id;
       }
       upsertChat(event.chat);
+      run.chatId = event.chat.id;
+      if (run.stopWanted) sendImageStop(run);
+      break;
+    case "progress":
+      run.view.progress(event);
       break;
     case "think":
       run.view.addThinking(event.d);
@@ -399,17 +553,19 @@ function onEvent(run, event) {
       break;
     case "done":
     case "error":
-      run.view.finish(event.message, { last: true });
+      run.view.finish(event.message, { last: true, prompt: run.prompt });
       state.messages.push(event.message);
       if (state.chat) upsertChat({ ...state.chat, updated_at: event.message.created_at || Date.now() });
-      announce(event.t === "done" ? "Reply finished" : `Reply failed. ${event.message.error?.message ?? ""}`);
+      if (run.image) announce(imageOutcome(event.message));
+      else announce(event.t === "done" ? "Reply finished" : `Reply failed. ${event.message.error?.message ?? ""}`);
       break;
   }
 }
 
 function onRunError(run, err) {
   if (err.name === "AbortError") {
-    run.view.finish(localMessage(run, "stopped"), { last: true });
+    if (run.detached) return run.view.discard(); // an image job carries on without this page
+    run.view.finish(localMessage(run, "stopped"), { last: true, prompt: run.prompt });
     announce("Reply stopped");
     return;
   }
@@ -420,7 +576,7 @@ function onRunError(run, err) {
   }
   if (!run.started) {
     // Refused before anything streamed: undo the optimistic bubbles and give the text back.
-    run.view.el.remove();
+    run.view.discard();
     run.userEl?.remove();
     if (run.replaced) {
       els.messages.append(run.replaced.el);
@@ -436,7 +592,19 @@ function onRunError(run, err) {
     if (behind) go(`#/c/${state.chat.id}`);
     return;
   }
-  run.view.finish(localMessage(run, "error", { code: err.code, message: err.message }), { last: true });
+  if (run.image && err.code === "interrupted") {
+    // The job runs on without its connection, if the server is still there: keep asking it, which also copes
+    // with the server being away for a while, as reopening the chat would not.
+    run.view.discard();
+    if (state.chat?.id !== run.chatId) return;
+    toast("The connection dropped. Checking on the image.");
+    watchImage(state.chat, { model: run.modelId, shape: run.shape, phase: null, step: null, steps: null });
+    return;
+  }
+  run.view.finish(localMessage(run, "error", { code: err.code, message: err.message }), {
+    last: true,
+    prompt: run.prompt,
+  });
   announce(err.message);
 }
 
@@ -497,6 +665,45 @@ function chooseEffort() {
   });
 }
 
+function chooseShape() {
+  const model = currentModel();
+  if (!isImage(model)) return;
+  const times = Object.keys(SHAPES)
+    .filter((shape) => model.est_s?.[shape])
+    .map((shape) => shapeNote(model, shape));
+  openChoiceMenu({
+    anchor: els.shapeChip,
+    title: "Shape",
+    choices: Object.entries(SHAPES),
+    selected: state.draft.shape,
+    text: times.length ? `${times.join(". ")}.` : "",
+    onSelect: (shape) => {
+      state.draft.shape = shape;
+      renderChips();
+    },
+  });
+}
+
+/** "New seed" and "Redo with": the same prompt as a new turn, on the model and in the shape named. */
+function makeAgain({ prompt, model, shape }) {
+  if (state.run) return toast("Wait for the current reply to finish.");
+  const next = state.byId.get(model);
+  if (!next?.available) return toast(next?.reason ?? "That model isn't available.");
+  state.draft = { model: next.id, effort: coerceEffort(next, null), shape };
+  renderChips();
+  renderRoute();
+  startRun({ text: prompt });
+}
+
+/** "Reuse prompt": the words go back in the box to edit. */
+function reusePrompt(prompt) {
+  els.input.value = prompt;
+  resizeInput();
+  renderSend();
+  els.input.focus();
+  els.input.setSelectionRange(prompt.length, prompt.length);
+}
+
 // ---- settings and chat actions
 
 function applyTheme(value) {
@@ -510,7 +717,7 @@ function connectionRows() {
   const reason = (provider) => state.models.find((m) => m.provider === provider && !m.available)?.reason;
   const cloud = (provider) =>
     available(provider) ? `Key set, ${available(provider)} models available` : (reason(provider) ?? "Not configured");
-  return [
+  const rows = [
     [
       "Ollama",
       state.providers.ollama?.ok
@@ -520,6 +727,16 @@ function connectionRows() {
     ["OpenRouter", cloud("openrouter")],
     ["Anthropic", cloud("anthropic")],
   ];
+  if (state.providers.images) {
+    const makers = state.models.filter(isImage);
+    rows.push([
+      "Images",
+      state.providers.images === "ok"
+        ? `Ready, ${makers.length} models`
+        : (makers.find((m) => !m.available)?.reason ?? "Not available"),
+    ]);
+  }
+  return rows;
 }
 
 async function deleteChat(chat) {
@@ -639,6 +856,7 @@ function wire() {
 
   els.modelChip.addEventListener("click", () => chooseModel());
   els.effortChip.addEventListener("click", chooseEffort);
+  els.shapeChip.addEventListener("click", chooseShape);
 
   els.form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -740,6 +958,9 @@ function applyBootstrap(data) {
     levelsFor: (id) => state.byId.get(id)?.efforts?.levels ?? [],
     onRetry: retryLast,
     onChoose: () => chooseModel(retryLast),
+    imageModels: () => state.models.filter((m) => isImage(m) && m.available),
+    onAgain: makeAgain,
+    onReuse: reusePrompt,
   });
 }
 
