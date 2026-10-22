@@ -3,7 +3,7 @@ that starts the tasks that are due."""
 
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -18,7 +18,16 @@ from aihub_web.tasks import (
     finish_run,
     start_run,
 )
-from helpers import HANG, HOLD, Clock, FakeEngine, finished, generating, make_service
+from helpers import (
+    HANG,
+    HOLD,
+    Clock,
+    FakeEngine,
+    finished,
+    generating,
+    make_service,
+    utc_ms,
+)
 
 LOCAL = "ollama/qwen3:8b"  # off / on
 FREE = "openrouter/google/gemma-4-31b-it:free"
@@ -255,11 +264,6 @@ class TestWhatIsRefused:
         assert (result.status, result.chat_id) == ("error", None)
         assert result.error == "Messages are limited to 10 characters."
         assert store.list_chats() == []
-
-
-def utc_ms(text: str) -> int:
-    """Milliseconds since the epoch of a UTC time like '2027-01-15 08:00'."""
-    return int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp() * 1000)
 
 
 HOURLY = {"kind": "hourly", "every": 1}
@@ -696,3 +700,119 @@ class TestTheLoop:
 
         assert store.get_task(task.id).last_status == "done"
         assert len(calls) >= 2
+
+
+async def settled(scheduler: Scheduler) -> None:
+    """Wait for the runs that people started to finish."""
+    for _ in range(300):
+        if not scheduler.running:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("a run never finished")
+
+
+@pytest.mark.anyio
+class TestRunNow:
+    async def test_the_chat_exists_at_once_and_the_reply_finishes_in_the_background(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        providers["ollama"].script = [Text("Do the laundry."), Finish("stop")]
+        task = a_task(store, next_run_at=utc_ms("2027-01-16 08:00"))
+
+        started = scheduler.run_now(task)
+
+        assert not isinstance(started, RunResult)
+        chat = store.get_chat(started.chat_id)
+        assert (chat.title, chat.task_id) == ("Morning digest, 15 Jan 2027", task.id)
+        assert scheduler.running == {task.id}
+
+        await settled(scheduler)
+
+        done = store.get_task(task.id)
+        assert (done.last_status, done.last_chat_id) == ("done", chat.id)
+        assert store.messages(chat.id)[-1].content == "Do the laundry."
+        assert done.next_run_at == utc_ms(
+            "2027-01-16 08:00"
+        )  # the schedule is left alone
+
+    async def test_a_failure_counts_like_any_other(self, tmp_path: Path) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        providers["ollama"].script = [ProviderError("Gone.", "upstream")]
+        task = a_task(store, next_run_at=utc_ms("2027-01-16 08:00"))
+        scheduler.run_now(task)
+        await settled(scheduler)
+        failed = store.get_task(task.id)
+        assert (failed.last_status, failed.last_error, failed.failures) == (
+            "error",
+            "Gone.",
+            1,
+        )
+
+    async def test_only_one_task_runs_at_a_time(self, tmp_path: Path) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        providers["ollama"].script = [Text("Half an"), HANG]
+        first = a_task(store)
+        second = a_task(store)
+
+        assert not isinstance(scheduler.run_now(first), RunResult)
+        for task in (first, second):  # the same task, and another
+            refused = scheduler.run_now(task)
+            assert isinstance(refused, RunResult) and refused.status == "busy"
+            assert refused.error == (
+                "Another scheduled task is running. Try again when it finishes."
+            )
+        assert len(store.list_chats()) == 1
+        await scheduler.stop()
+
+    async def test_a_manual_run_waits_for_a_scheduled_one(self, tmp_path: Path) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        other = a_task(store)
+        seen: list[object] = []
+        providers["ollama"].script = [
+            lambda: seen.append(scheduler.run_now(other)),
+            Text("fine"),
+            Finish("stop"),
+        ]
+        a_task(store, next_run_at=utc_ms("2027-01-15 08:00"))
+
+        await scheduler.tick()
+
+        assert [r.status for r in seen if isinstance(r, RunResult)] == ["busy"]
+
+    async def test_a_refusal_is_returned_and_nothing_is_stored_or_counted(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        task = a_task(store, model=HAIKU)
+
+        refused = scheduler.run_now(task)
+
+        assert isinstance(refused, RunResult) and refused.status == "error"
+        assert refused.error == (
+            "A scheduled task can only use a text model that runs on this PC."
+        )
+        assert store.list_chats() == [] and scheduler.running == set()
+        assert store.get_task(task.id).failures == 0
+        assert all(not provider.requests for provider in providers.values())
+
+    async def test_stopping_cancels_a_run_and_keeps_what_arrived(
+        self, tmp_path: Path
+    ) -> None:
+        scheduler, _, store, providers, _ = await scheduling(tmp_path)
+        started = asyncio.Event()
+        providers["ollama"].script = [Text("Half an"), started.set, HANG]
+        task = a_task(store)
+        scheduler.run_now(task)
+        await started.wait()
+
+        await scheduler.stop()
+
+        (chat,) = store.list_chats()
+        assert store.messages(chat.id)[-1].status == "stopped"
+        assert scheduler.running == set()
+        left = store.get_task(task.id)
+        assert (left.failures, left.last_status) == (
+            0,
+            None,
+        )  # closing the app is no failure

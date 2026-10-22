@@ -26,6 +26,8 @@ RUN_LIMIT_SECONDS = 15 * 60
 # A task that is due longer ago than this is skipped rather than run late: a morning digest at midnight is no use.
 CATCH_UP_MS = 12 * 3_600_000
 MAX_FAILURES = 3
+# How the explanation of a task that the scheduler switched off begins. Switching it on again clears it.
+SWITCHED_OFF = "Switched off"
 SKIPPED = "Skipped: it was due more than 12 hours before the app could run it."
 
 
@@ -117,6 +119,9 @@ class Scheduler:
         self._tick = tick
         self._limit = limit
         self.running: set[str] = set()  # the ids of the tasks that are running now
+        self._jobs: set[asyncio.Task[None]] = (
+            set()
+        )  # runs that people started, finishing in the background
 
     def _now_ms(self) -> int:
         return round(self._now() * 1000)
@@ -153,7 +158,7 @@ class Scheduler:
                     "next_run_at": None,
                     "last_run_at": now,
                     "last_status": "error",
-                    "last_error": "Switched off: its schedule could not be read.",
+                    "last_error": f"{SWITCHED_OFF}: its schedule could not be read.",
                 },
             )
             return
@@ -171,13 +176,7 @@ class Scheduler:
             )
             return
 
-        try:
-            started = start_run(
-                self._service, task, datetime.fromtimestamp(now / 1000).date()
-            )
-        except Exception:
-            log.exception("task %s could not be started", task.id)
-            started = RunResult("error", None, UNEXPECTED_MESSAGE)
+        started = self._start(task, now)
         if isinstance(started, RunResult):
             # A busy service leaves the task due, and the next tick tries again.
             if started.status != "busy":
@@ -187,6 +186,19 @@ class Scheduler:
 
         self._store.update_task(task.id, {"next_run_at": following})
         self.running.add(task.id)
+        await self._finish(task, started, now)
+
+    def _start(self, task: Task, now: int) -> Started | RunResult:
+        try:
+            return start_run(
+                self._service, task, datetime.fromtimestamp(now / 1000).date()
+            )
+        except Exception:
+            log.exception("task %s could not be started", task.id)
+            return RunResult("error", None, UNEXPECTED_MESSAGE)
+
+    async def _finish(self, task: Task, started: Started, ran_at: int) -> None:
+        """Stream the reply and record how it ended. The caller has put the task in `running`."""
         try:
             result = await finish_run(self._service, started, self._limit)
         except Exception:
@@ -194,7 +206,32 @@ class Scheduler:
             result = RunResult("error", started.chat_id, UNEXPECTED_MESSAGE)
         finally:
             self.running.discard(task.id)
-        self._record(task.id, result, now)
+        self._record(task.id, result, ran_at)
+
+    def run_now(self, task: Task) -> Started | RunResult:
+        """Start a run that a person asked for. The chat exists when this returns and the reply finishes in the
+        background. The next scheduled run is left alone, and only one task runs at a time."""
+        if self.running:
+            return RunResult(
+                "busy",
+                None,
+                "Another scheduled task is running. Try again when it finishes.",
+            )
+        now = self._now_ms()
+        started = self._start(task, now)
+        if isinstance(started, RunResult):
+            return started
+        self.running.add(task.id)
+        job = asyncio.create_task(self._finish(task, started, now))
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
+        return started
+
+    async def stop(self) -> None:
+        """Cancel the runs that people started and wait for each to save what had arrived."""
+        for job in list(self._jobs):
+            job.cancel()
+        await asyncio.gather(*self._jobs, return_exceptions=True)
 
     def _record(self, task_id: str, result: RunResult, ran_at: int) -> None:
         task = self._store.get_task(task_id)
@@ -215,6 +252,6 @@ class Scheduler:
                 changes["enabled"] = False
                 changes["next_run_at"] = None
                 changes["last_error"] = (
-                    f"Switched off after {MAX_FAILURES} failed runs in a row. The last one: {result.error}"
+                    f"{SWITCHED_OFF} after {MAX_FAILURES} failed runs in a row. The last one: {result.error}"
                 )
         self._store.update_task(task_id, changes)

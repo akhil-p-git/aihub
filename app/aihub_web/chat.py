@@ -124,6 +124,11 @@ class ImageTurn:
     job: Job
 
 
+def runs_tasks(model: ModelInfo) -> bool:
+    """Whether a scheduled task may use the model: a text model on this PC, which cannot spend money."""
+    return model.provider == "ollama"
+
+
 def derive_title(text: str) -> str:
     line = next((ln for ln in text.splitlines() if ln.strip()), "")
     cleaned = " ".join(re.sub(r"[#*`>_\[\]]+", "", line).split())
@@ -275,7 +280,7 @@ class ChatService:
         if body.project_id and self._store.get_project(body.project_id) is None:
             raise ApiError(404, "no_project", "That project no longer exists.")
         model = self._resolve_model(body.model or (chat.model if chat else None))
-        if task_id and model.provider != "ollama":
+        if task_id and not runs_tasks(model):
             raise ApiError(422, "task_model", TASK_MODEL_MESSAGE)
         if model.output == "image":
             return self._prepare_image(body, chat, model)

@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from datetime import date
+from datetime import UTC, date, datetime
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -92,6 +92,11 @@ class FakeProvider:
                 item()
             else:
                 yield item
+
+
+def utc_ms(text: str) -> int:
+    """Milliseconds since the epoch of a UTC time like '2027-01-15 08:00'."""
+    return int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp() * 1000)
 
 
 class Clock:
