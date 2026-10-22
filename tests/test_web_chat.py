@@ -344,6 +344,52 @@ class TestRetryAndHistory:
         assert sent[-1]["content"] == "latest" and sent[0]["role"] == "user"
         assert len(sent) < 21
 
+    async def test_standing_instructions_take_their_share_of_the_history_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """The budget is for the whole request, so every token of the system prompt is one the history cannot use."""
+
+        async def ask(
+            instructions: str,
+        ) -> tuple[list[dict], list[dict[str, str]], str]:
+            service, store, providers = await make_service(
+                tmp_path / str(len(instructions)),
+                limits=Limits(cloud_context_tokens=1000),
+            )
+            store.set_setting("instructions", instructions)
+            chat = store.create_chat("long", FREE, None)
+            # Nine exchanges of about 100 tokens each: 912 tokens with the new message, so they fit in 1000.
+            for i in range(9):
+                store.add_message(chat.id, "user", f"question {i} " + "x" * 140)
+                store.add_message(chat.id, "assistant", f"answer {i} " + "y" * 140)
+            events = await run(service, chat_id=chat.id, text="latest")
+            sent = providers["openrouter"].requests[-1]
+            return [e for e in events if e["t"] == "note"], sent.messages, sent.system
+
+        notes, sent, _ = await ask("")
+        assert notes == [] and len(sent) == 19
+
+        # 600 characters of instructions are about 200 tokens: the oldest exchanges no longer fit.
+        notes, sent, system = await ask("i" * 600)
+        assert "i" * 600 in system
+        assert len(notes) == 1 and notes[0]["dropped"] >= 2
+        assert len(sent) == 19 - notes[0]["dropped"]
+        assert sent[0]["role"] == "user" and sent[-1]["content"] == "latest"
+
+    async def test_instructions_longer_than_the_budget_still_send_the_message(
+        self, tmp_path: Path
+    ) -> None:
+        service, store, providers = await make_service(
+            tmp_path, limits=Limits(cloud_context_tokens=1000)
+        )
+        store.set_setting("instructions", "i" * 4000)  # about 1,300 tokens
+        chat = store.create_chat("long", FREE, None)
+        store.add_message(chat.id, "user", "earlier question")
+        store.add_message(chat.id, "assistant", "earlier answer")
+        await run(service, chat_id=chat.id, text="latest")
+        sent = providers["openrouter"].requests[-1].messages
+        assert [m["content"] for m in sent] == ["latest"]
+
     def test_titles(self) -> None:
         assert (
             derive_title("# Fix the **login** bug\nmore detail") == "Fix the login bug"

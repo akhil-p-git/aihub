@@ -298,13 +298,14 @@ class ChatService:
                 or chat
             )
 
+        system = system_prompt(self._store.get_setting("instructions"), self._today())
         turns, dropped = fit_history(
             build_history(self._store.messages(chat.id), self._image_names()),
-            self._budget(model),
+            # The budget is for the whole request: what the system prompt takes, the history cannot.
+            self._budget(model) - estimate_tokens(system),
         )
         if not turns:
             raise ApiError(409, "nothing_to_answer", "There is no message to answer.")
-        system = system_prompt(self._store.get_setting("instructions"), self._today())
         request = GenRequest(
             model, turns, system, effort, max_tokens_for(model, effort, self._cfg)
         )
