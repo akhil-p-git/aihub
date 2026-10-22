@@ -1,7 +1,7 @@
 // aihub: wires the page together. State lives in one object; each render function redraws one region.
 
 import { ApiError, api, streamChat } from "./api.js";
-import { configureConversation, ReplyView, replyFor, userMessage } from "./conversation.js";
+import { configureConversation, focusReply, ReplyView, replyFor, userMessage } from "./conversation.js";
 import { confirmDialog, openRowMenu, openSettings } from "./dialogs.js";
 import { bars, h, icon } from "./dom.js";
 import { openChoiceMenu, openEffortMenu } from "./effort.js";
@@ -399,6 +399,7 @@ function watchImage(chat, pending) {
         run.timer = setTimeout(poll, POLL_MS);
         return;
       }
+      const onSlate = view.el.contains(document.activeElement);
       view.discard();
       state.run = null;
       state.chat = data.chat;
@@ -406,7 +407,10 @@ function watchImage(chat, pending) {
       upsertChat(data.chat);
       renderChat();
       const reply = data.messages.at(-1);
-      if (reply?.role === "assistant") announce(imageOutcome(reply));
+      if (reply?.role === "assistant") {
+        if (onSlate) focusReply(els.messages.lastElementChild);
+        announce(imageOutcome(reply));
+      }
     } catch (err) {
       if (state.run !== run) return;
       if (err.code === "no_chat") {
@@ -478,6 +482,8 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
     prompt,
     image,
     chatId: state.chat?.id ?? null,
+    modelId: model.id,
+    shape,
     regenerate: Boolean(regenerateFor),
     replaced,
     started: false,
@@ -586,11 +592,13 @@ function onRunError(run, err) {
     if (behind) go(`#/c/${state.chat.id}`);
     return;
   }
-  if (run.image && run.chatId && err.code === "interrupted") {
-    // The image job runs on without its connection: reloading the chat shows where it is, or what it made.
+  if (run.image && err.code === "interrupted") {
+    // The job runs on without its connection, if the server is still there: keep asking it, which also copes
+    // with the server being away for a while, as reopening the chat would not.
     run.view.discard();
-    toast("The connection dropped. The image keeps going, so the chat is reloading.");
-    go(`#/c/${run.chatId}`);
+    if (state.chat?.id !== run.chatId) return;
+    toast("The connection dropped. Checking on the image.");
+    watchImage(state.chat, { model: run.modelId, shape: run.shape, phase: null, step: null, steps: null });
     return;
   }
   run.view.finish(localMessage(run, "error", { code: err.code, message: err.message }), {

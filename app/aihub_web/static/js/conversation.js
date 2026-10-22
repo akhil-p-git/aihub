@@ -175,6 +175,13 @@ function meta(message, isLast) {
   return h("div", { class: "meta" }, parts, actions);
 }
 
+/** Gives keyboard focus to how a reply ended (its image, or its notice), for someone who was on its progress bar. */
+export function focusReply(el) {
+  const target = el.querySelector(".img-out, .notice") ?? el;
+  target.tabIndex = -1;
+  target.focus({ preventScroll: true });
+}
+
 const registry = new WeakMap();
 
 /** The ReplyView that built a reply element, so the Copy button can reach its text. */
@@ -212,13 +219,17 @@ export class ReplyView {
     if (image) this.#openSlate(image);
   }
 
-  /** Where an image has got to: `{ phase, step, steps }`, as the server reports it. */
+  /**
+   * Where an image has got to: `{ phase, step, steps }`, as the server reports it. A chat that is polled hears the
+   * same answer again and again, so only a change counts as progress for the "taking longer than usual" warning.
+   */
   progress({ phase, step, steps }) {
     if (!this.slate) return;
+    const moved = phase !== this.phase || (step ?? null) !== this.step;
     this.phase = phase;
     this.step = step ?? null;
     this.steps = steps ?? this.steps;
-    this.lastProgress = performance.now();
+    if (moved) this.lastProgress = performance.now();
     this.#drawSlate();
   }
 
@@ -377,6 +388,7 @@ export class ReplyView {
     this.raf = 0;
     this.#stopTimer();
     this.wait.remove();
+    const onSlate = Boolean(this.slate?.contains(document.activeElement));
     this.slate?.remove();
     this.slate = null;
     const made = message.status === "done" && message.images?.length ? message.images[0] : null;
@@ -437,6 +449,7 @@ export class ReplyView {
       }
       this.el.append(imageMeta(message, prompt, figure));
     } else this.el.append(meta(message, last));
+    if (onSlate) focusReply(this.el);
     this.onFrame();
   }
 

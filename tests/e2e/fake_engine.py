@@ -37,6 +37,8 @@ from helpers import (
 
 class KeywordEngine(FakeEngine):
     def _submit(self, model: str, raw: bytes) -> tuple[int, object]:
+        # Permits left over from an earlier job must not carry this one past its holds.
+        self._permits = 0
         body = json.loads(raw)
         prompt = body.get("prompt", "")
         steps = body.get("sample_params", {}).get("sample_steps", 4)

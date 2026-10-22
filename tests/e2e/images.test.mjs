@@ -2,6 +2,7 @@
 // failing, making it again, and how all of that reads to a screen reader and fits on a phone.
 
 import assert from "node:assert/strict";
+import net from "node:net";
 import { after, afterEach, before, describe, it } from "node:test";
 import { chromium } from "playwright";
 import { startApp } from "./harness.mjs";
@@ -70,6 +71,36 @@ async function imageChat(text) {
     .map((line) => JSON.parse(line));
   assert.equal(events.at(-1).t, "done", "the image was made");
   return events[0].chat.id;
+}
+
+/** A TCP relay in front of the app that can cut every connection, and refuse new ones, as a network failure would. */
+async function relay(target) {
+  const sockets = new Set();
+  const control = { url: "", down: false };
+  const server = net.createServer((client) => {
+    if (control.down) return client.destroy();
+    const upstream = net.connect(new URL(target).port, "127.0.0.1");
+    for (const [from, to] of [
+      [client, upstream],
+      [upstream, client],
+    ]) {
+      sockets.add(from);
+      from.on("error", () => from.destroy());
+      from.on("close", () => {
+        sockets.delete(from);
+        to.destroy();
+      });
+      from.pipe(to);
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  control.url = `http://127.0.0.1:${server.address().port}`;
+  control.cut = () => sockets.forEach((socket) => socket.destroy());
+  control.close = () => {
+    control.cut();
+    server.close();
+  };
+  return control;
 }
 
 const announced = (page, pattern) =>
@@ -255,6 +286,88 @@ describe("making an image", () => {
 });
 
 describe("a job in progress", () => {
+  it("holds an image where it is: nothing moves until the engine is released", async () => {
+    const { page, context } = await open(browser, app);
+    await chooseImageModel(page);
+    await make(page, "holdimage stays put");
+    await label(page).filter({ hasText: "Step 1 of 8" }).waitFor();
+    // Longer than a whole unheld image takes (about 2.5 s), so a permit that leaked in would show as an image.
+    await assert.rejects(images(page).first().waitFor({ timeout: 3500 }), /Timeout/);
+    assert.equal(await label(page).textContent(), "Step 1 of 8");
+    await app.engine.release(20);
+    await imageShown(page);
+    await context.close();
+  });
+
+  it("warns about a stall even when a polled chat hears the same progress again and again", async () => {
+    const { page, context } = await open(browser, app);
+    const text = await page.evaluate(async () => {
+      const { ReplyView } = await import("/js/conversation.js");
+      const view = new ReplyView({ image: { shape: "square", est: 23 } });
+      document.body.append(view.el);
+      view.progress({ phase: "sampling", step: 1, steps: 8 });
+      const real = performance.now.bind(performance);
+      performance.now = () => real() + 31_000; // thirty-one seconds pass with nothing new
+      view.progress({ phase: "sampling", step: 1, steps: 8 }); // the same answer to another poll
+      const shown = view.el.querySelector(".img-label").textContent;
+      performance.now = real;
+      view.discard();
+      return shown;
+    });
+    assert.equal(text, "Taking longer than usual. The GPU may be busy or stuck. Stop to give up.");
+    await context.close();
+  });
+
+  it("moves keyboard focus to the image when the progress bar it was on gives way to it", async () => {
+    const { page, context } = await open(browser, app);
+    await chooseImageModel(page);
+    await make(page, "holdimage focus");
+    await label(page).filter({ hasText: "Step 1 of 8" }).waitFor();
+    await slate(page).focus();
+    await app.engine.release(20);
+    await imageShown(page);
+    assert.equal(await page.evaluate(() => document.activeElement?.className), "img-out");
+    await context.close();
+  });
+
+  it("does the same for a chat that was left and came back to", async () => {
+    const { page, context } = await open(browser, app);
+    await chooseImageModel(page);
+    await make(page, "holdimage focus again");
+    await label(page).filter({ hasText: "Step 1 of 8" }).waitFor();
+    await page.locator("#new-chat").click();
+    await page.getByRole("link", { name: /holdimage focus again/ }).click();
+    await label(page)
+      .filter({ hasText: /Step \d of 8/ })
+      .waitFor();
+    await slate(page).focus();
+    await app.engine.release(20);
+    await imageShown(page);
+    assert.equal(await page.evaluate(() => document.activeElement?.className), "img-out");
+    await context.close();
+  });
+
+  it("keeps asking while the network is gone, and shows the image once it is back and stored", async () => {
+    const through = await relay(app.url);
+    try {
+      const { page, context } = await open(browser, { ...app, url: through.url });
+      await chooseImageModel(page);
+      await make(page, "holdimage dropped stream");
+      await label(page).filter({ hasText: "Step 1 of 8" }).waitFor();
+      through.down = true; // not just this stream: nothing gets through
+      through.cut();
+      await page.locator(".toast").filter({ hasText: "The connection dropped" }).waitFor();
+      assert.match(page.url(), /#\/c\/[0-9a-f]{16}$/, "still in the chat");
+      await page.getByRole("link", { name: /holdimage dropped stream/ }).waitFor();
+      through.down = false;
+      await app.engine.release(20);
+      await imageShown(page);
+      await context.close();
+    } finally {
+      through.close();
+    }
+  });
+
   it("shows each step, and Stop asks the job to stop, which ends the reply as stopped", async () => {
     const { page, context, problems } = await open(browser, app);
     await chooseImageModel(page);
