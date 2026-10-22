@@ -66,6 +66,8 @@ class ChatRequest(BaseModel):
     regenerate_for: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
     # The shape of an image; image models only. None means square.
     shape: Literal["square", "wide", "tall"] | None = None
+    # The project a new chat goes in. A chat that exists is moved with PATCH /api/chats/{id}, not here.
+    project_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
@@ -76,6 +78,12 @@ class ChatRequest(BaseModel):
                 raise ValueError("regenerate_for takes no text")
         elif not (self.text or "").strip():
             raise ValueError("text is empty")
+        return self
+
+    @model_validator(mode="after")
+    def _only_a_new_chat_takes_a_project(self) -> Self:
+        if self.project_id and self.chat_id:
+            raise ValueError("project_id only applies to a new chat")
         return self
 
 
@@ -249,6 +257,8 @@ class ChatService:
         chat = self._store.get_chat(body.chat_id) if body.chat_id else None
         if body.chat_id and not chat:
             raise ApiError(404, "no_chat", "That chat no longer exists.")
+        if body.project_id and self._store.get_project(body.project_id) is None:
+            raise ApiError(404, "no_project", "That project no longer exists.")
         model = self._resolve_model(body.model or (chat.model if chat else None))
         if model.output == "image":
             return self._prepare_image(body, chat, model)
@@ -299,7 +309,9 @@ class ChatService:
                     f"Messages are limited to {self._cfg.limits.max_message_chars:,} characters.",
                 )
             if not chat:
-                chat = self._store.create_chat(derive_title(text), model.id, effort)
+                chat = self._store.create_chat(
+                    derive_title(text), model.id, effort, body.project_id
+                )
             user = self._store.add_message(chat.id, "user", text)
         if (chat.model, chat.effort) != (model.id, effort):
             chat = (
@@ -413,7 +425,9 @@ class ChatService:
             self._drop_last_reply(chat, body.regenerate_for)
         else:
             if not chat:
-                chat = self._store.create_chat(derive_title(prompt), model.id, None)
+                chat = self._store.create_chat(
+                    derive_title(prompt), model.id, None, body.project_id
+                )
             user = self._store.add_message(chat.id, "user", prompt)
         if (chat.model, chat.effort) != (model.id, None):
             chat = (

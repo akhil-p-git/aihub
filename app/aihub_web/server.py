@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Literal
 
 import httpx2
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -33,7 +40,7 @@ from starlette.types import Scope
 from .catalog import Catalog
 from .chat import ApiError, ChatRequest, ChatService
 from .config import Config, secret
-from .db import Store
+from .db import Project, Store
 from .images import PACING, GpuLock, ImageJobs, Pacing
 from .providers import Provider, build_providers
 from .providers.images import EngineClient
@@ -44,6 +51,11 @@ log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 CHAT_ID = re.compile(r"[0-9a-f]{16}")
 IMAGE_ID = re.compile(r"[0-9a-f]{16}")
+PROJECT_ID = re.compile(r"[0-9a-f]{16}")
+# What a person may write: the same room for the standing instructions and for a project's.
+INSTRUCTIONS_MAX = 4000
+PROJECT_NAME_MAX = 80
+MAX_PROJECTS = 100
 # A message may be 100,000 characters, which is under 400 KB even if every one takes four bytes.
 BODY_LIMIT = 1024 * 1024
 MAINTENANCE_INTERVAL = 60.0
@@ -65,12 +77,74 @@ class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class RenameChat(_Body):
-    title: str = Field(min_length=1, max_length=200)
+def _one_line(value: str, longest: int, what: str) -> str:
+    """Whitespace collapsed, and between 1 and `longest` characters."""
+    cleaned = " ".join(value.split())
+    if not 1 <= len(cleaned) <= longest:
+        raise ValueError(f"{what} must be 1 to {longest} characters")
+    return cleaned
+
+
+class EditChat(_Body):
+    """A chat's title and its project. A key that is absent is left alone; project_id null takes the chat out."""
+
+    title: str | None = Field(None, max_length=200)
+    project_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> "EditChat":
+        if not self.model_fields_set:
+            raise ValueError("nothing to change")
+        if "title" in self.model_fields_set:
+            if self.title is None:
+                raise ValueError("title can't be null")
+            _one_line(self.title, 200, "title")
+        return self
+
+
+class NewProject(_Body):
+    name: str
+    instructions: str = Field("", max_length=INSTRUCTIONS_MAX)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _one_line(value, PROJECT_NAME_MAX, "name")
+
+
+class EditProject(_Body):
+    name: str | None = None
+    instructions: str | None = Field(None, max_length=INSTRUCTIONS_MAX)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("name can't be null")
+        return _one_line(value, PROJECT_NAME_MAX, "name")
+
+    @field_validator("instructions")
+    @classmethod
+    def _instructions(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("instructions can't be null")
+        return value
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> "EditProject":
+        if not self.model_fields_set:
+            raise ValueError("nothing to change")
+        return self
+
+
+class DropProject(_Body):
+    """What becomes of a project's chats: they stay, without a project, or they go with it."""
+
+    chats: Literal["keep", "delete"] = "keep"
 
 
 class Settings(_Body):
-    instructions: str = Field(max_length=4000)
+    instructions: str = Field(max_length=INSTRUCTIONS_MAX)
 
 
 class DeleteAll(_Body):
@@ -126,6 +200,15 @@ def chat_or_404(ctx: Context, chat_id: str):
     return chat
 
 
+def project_or_404(ctx: Context, project_id: str) -> Project:
+    project = (
+        ctx.store.get_project(project_id) if PROJECT_ID.fullmatch(project_id) else None
+    )
+    if project is None:
+        raise ApiError(404, "no_project", "That project no longer exists.")
+    return project
+
+
 async def refresh_briefly(
     catalog: Catalog, timeout: float, *, force: bool = False
 ) -> None:
@@ -153,6 +236,7 @@ async def bootstrap(request: Request) -> Response:
         {
             **models_payload(ctx),
             "chats": [c.to_json() for c in ctx.store.list_chats()],
+            "projects": [p.to_json() for p in ctx.store.list_projects()],
             "settings": {"instructions": ctx.store.get_setting("instructions")},
             "retention_days": ctx.cfg.retention_days,
         }
@@ -217,12 +301,61 @@ async def stop_image(request: Request) -> Response:
     return JSONResponse({"stopping": True})
 
 
-async def rename_chat(request: Request) -> Response:
+async def patch_chat(request: Request) -> Response:
     ctx = ctx_of(request)
     chat = chat_or_404(ctx, request.path_params["chat_id"])
-    body = await read_json(request, RenameChat)
-    updated = ctx.store.update_chat(chat.id, {"title": " ".join(body.title.split())})
+    body = await read_json(request, EditChat)
+    changes: dict[str, str | None] = {}
+    if "title" in body.model_fields_set:
+        changes["title"] = " ".join((body.title or "").split())
+    if "project_id" in body.model_fields_set:
+        if body.project_id and ctx.store.get_project(body.project_id) is None:
+            raise ApiError(404, "no_project", "That project no longer exists.")
+        changes["project_id"] = body.project_id
+    updated = ctx.store.update_chat(chat.id, changes)
     return JSONResponse(updated.to_json() if updated else {})
+
+
+async def list_projects(request: Request) -> Response:
+    ctx = ctx_of(request)
+    return JSONResponse({"projects": [p.to_json() for p in ctx.store.list_projects()]})
+
+
+async def create_project(request: Request) -> Response:
+    ctx = ctx_of(request)
+    body = await read_json(request, NewProject)
+    if ctx.store.count_projects() >= MAX_PROJECTS:
+        raise ApiError(
+            409,
+            "too_many_projects",
+            f"You can have {MAX_PROJECTS} projects. Delete one to make room.",
+        )
+    project = ctx.store.create_project(body.name, body.instructions.strip())
+    return JSONResponse(project.to_json(), status_code=201)
+
+
+async def patch_project(request: Request) -> Response:
+    ctx = ctx_of(request)
+    project = project_or_404(ctx, request.path_params["project_id"])
+    body = await read_json(request, EditProject)
+    updated = ctx.store.update_project(
+        project.id,
+        name=body.name,
+        instructions=None if body.instructions is None else body.instructions.strip(),
+    )
+    return JSONResponse(updated.to_json() if updated else {})
+
+
+async def delete_project(request: Request) -> Response:
+    ctx = ctx_of(request)
+    project = project_or_404(ctx, request.path_params["project_id"])
+    body = (
+        await read_json(request, DropProject)
+        if (await request.body()).strip()
+        else DropProject()
+    )
+    ctx.store.delete_project(project.id, delete_chats=body.chats == "delete")
+    return Response(status_code=204)
 
 
 async def delete_chat(request: Request) -> Response:
@@ -361,10 +494,14 @@ def create_app(
             Route("/api/chats", list_chats),
             Route("/api/chats", delete_all_chats, methods=["DELETE"]),
             Route("/api/chats/{chat_id}", get_chat),
-            Route("/api/chats/{chat_id}", rename_chat, methods=["PATCH"]),
+            Route("/api/chats/{chat_id}", patch_chat, methods=["PATCH"]),
             Route("/api/chats/{chat_id}", delete_chat, methods=["DELETE"]),
             Route("/api/chats/{chat_id}/images/{image_id}", get_image),
             Route("/api/chats/{chat_id}/image/stop", stop_image, methods=["POST"]),
+            Route("/api/projects", list_projects),
+            Route("/api/projects", create_project, methods=["POST"]),
+            Route("/api/projects/{project_id}", patch_project, methods=["PATCH"]),
+            Route("/api/projects/{project_id}", delete_project, methods=["DELETE"]),
             Route("/api/settings", put_settings, methods=["PUT"]),
             Route(
                 "/api/{rest:path}",

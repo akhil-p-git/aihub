@@ -1,6 +1,7 @@
 import contextlib
 import hmac
 import json
+import re
 import secrets
 import socket
 import sqlite3
@@ -822,6 +823,7 @@ class TestImageModelsInTheLists:
             "default_model",
             "providers",
             "chats",
+            "projects",
             "settings",
             "retention_days",
         }
@@ -854,6 +856,7 @@ class TestImageModelsInTheLists:
             "default_model",
             "providers",
             "chats",
+            "projects",
             "settings",
             "retention_days",
         }
@@ -1282,3 +1285,277 @@ class TestImagesOnARealServer:
                 "stopping": True
             }
             assert json.loads(list(lines)[-1])["message"]["status"] == "stopped"
+
+
+def new_project(client: TestClient, name: str = "Trips", **fields) -> dict:
+    response = client.post("/api/projects", json={"name": name, **fields})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def error_of(response) -> tuple[int, str]:
+    return response.status_code, response.json()["error"]["code"]
+
+
+class TestProjectsApi:
+    def test_there_are_none_to_begin_with(self, api: TestClient) -> None:
+        assert api.get("/api/projects").json() == {"projects": []}
+        assert api.get("/api/bootstrap").json()["projects"] == []
+
+    def test_a_new_project_is_listed_and_in_the_bootstrap(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "  My   trips ", instructions="  Answer in French.\n")
+        assert (
+            made["name"] == "My trips" and made["instructions"] == "Answer in French."
+        )
+        assert made["chat_count"] == 0 and re.fullmatch(r"[0-9a-f]{16}", made["id"])
+        assert api.get("/api/projects").json() == {"projects": [made]}
+        assert api.get("/api/bootstrap").json()["projects"] == [made]
+
+    def test_the_list_is_by_name(self, api: TestClient) -> None:
+        for name in ("beta", "Alpha", "Zed"):
+            new_project(api, name)
+        names = [p["name"] for p in api.get("/api/projects").json()["projects"]]
+        assert names == ["Alpha", "beta", "Zed"]
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"name": ""},
+            {"name": "   \n\t "},
+            {"name": "x" * 81},
+            {"name": 7},
+            {"name": "ok", "instructions": "x" * 4001},
+            {"name": "ok", "colour": "red"},
+        ],
+    )
+    def test_a_project_that_does_not_fit_is_refused(
+        self, api: TestClient, body: dict
+    ) -> None:
+        response = api.post("/api/projects", json=body)
+        assert error_of(response) == (422, "invalid")
+        assert api.get("/api/projects").json() == {"projects": []}
+
+    def test_a_name_may_be_eighty_characters_and_instructions_four_thousand(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "n" * 80, instructions="i" * 4000)
+        assert len(made["name"]) == 80 and len(made["instructions"]) == 4000
+
+    def test_a_body_that_is_not_json_is_refused(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/projects",
+            content=b"{nope",
+            headers={"content-type": "application/json"},
+        )
+        assert error_of(response) == (400, "bad_json")
+
+    def test_there_is_a_limit_of_a_hundred(self, api: TestClient) -> None:
+        for n in range(100):
+            new_project(api, f"p{n:03d}")
+        refused = api.post("/api/projects", json={"name": "one too many"})
+        assert error_of(refused) == (409, "too_many_projects")
+        assert len(api.get("/api/projects").json()["projects"]) == 100
+
+    def test_editing_changes_what_is_sent(self, api: TestClient) -> None:
+        made = new_project(api, "Trips", instructions="Be brief.")
+        url = f"/api/projects/{made['id']}"
+        renamed = api.patch(url, json={"name": " Travel  plans "}).json()
+        assert (renamed["name"], renamed["instructions"]) == (
+            "Travel plans",
+            "Be brief.",
+        )
+        rewritten = api.patch(url, json={"instructions": ""}).json()
+        assert (rewritten["name"], rewritten["instructions"]) == ("Travel plans", "")
+        both = api.patch(url, json={"name": "Trips", "instructions": " x "}).json()
+        assert (both["name"], both["instructions"]) == ("Trips", "x")
+        assert api.get("/api/projects").json()["projects"] == [both]
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"name": ""},
+            {"name": "  "},
+            {"name": None},
+            {"instructions": "x" * 4001},
+            {"id": "x"},
+        ],
+    )
+    def test_an_edit_that_does_not_fit_is_refused(
+        self, api: TestClient, body: dict
+    ) -> None:
+        made = new_project(api, "Trips", instructions="Be brief.")
+        response = api.patch(f"/api/projects/{made['id']}", json=body)
+        assert error_of(response) == (422, "invalid")
+        assert api.get("/api/projects").json()["projects"] == [made]
+
+    @pytest.mark.parametrize(
+        "project_id", ["0123456789abcdef", "nope", "0123456789ABCDEF"]
+    )
+    def test_an_unknown_project_is_a_404_for_every_verb(
+        self, api: TestClient, project_id: str
+    ) -> None:
+        url = f"/api/projects/{project_id}"
+        assert error_of(api.patch(url, json={"name": "x"})) == (404, "no_project")
+        assert error_of(api.delete(url)) == (404, "no_project")
+
+    def test_deleting_keeps_the_chats_unless_told_otherwise(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "Trips")
+        chat_id = reply(api, text="hello", model=FREE, project_id=made["id"])[0][
+            "chat"
+        ]["id"]
+        assert api.delete(f"/api/projects/{made['id']}").status_code == 204
+        kept = api.get(f"/api/chats/{chat_id}").json()["chat"]
+        assert kept["project_id"] is None
+        assert api.get("/api/projects").json() == {"projects": []}
+        assert error_of(api.delete(f"/api/projects/{made['id']}")) == (
+            404,
+            "no_project",
+        )
+
+    def test_deleting_can_take_the_projects_chats_and_only_those(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "Trips")
+        other = new_project(api, "Work")
+        mine = reply(api, text="in trips", model=FREE, project_id=made["id"])[0][
+            "chat"
+        ]["id"]
+        theirs = reply(api, text="in work", model=FREE, project_id=other["id"])[0][
+            "chat"
+        ]["id"]
+        free = reply(api, text="alone", model=FREE)[0]["chat"]["id"]
+        response = api.request(
+            "DELETE", f"/api/projects/{made['id']}", json={"chats": "delete"}
+        )
+        assert response.status_code == 204
+        assert error_of(api.get(f"/api/chats/{mine}")) == (404, "no_chat")
+        assert (
+            api.get(f"/api/chats/{theirs}").json()["chat"]["project_id"] == other["id"]
+        )
+        assert api.get(f"/api/chats/{free}").status_code == 200
+
+    @pytest.mark.parametrize("body", [{"chats": "all"}, {"chats": True}, {"keep": 1}])
+    def test_a_delete_that_does_not_make_sense_is_refused(
+        self, api: TestClient, body: dict
+    ) -> None:
+        made = new_project(api, "Trips")
+        response = api.request("DELETE", f"/api/projects/{made['id']}", json=body)
+        assert error_of(response) == (422, "invalid")
+        assert len(api.get("/api/projects").json()["projects"]) == 1
+
+    def test_delete_all_chats_leaves_the_projects(self, api: TestClient) -> None:
+        made = new_project(api, "Trips", instructions="Be brief.")
+        reply(api, text="hello", model=FREE, project_id=made["id"])
+        api.request("DELETE", "/api/chats", json={"confirm": "delete-all"})
+        assert api.get("/api/projects").json()["projects"][0]["chat_count"] == 0
+        assert api.get("/api/projects").json()["projects"][0]["name"] == "Trips"
+
+
+class TestChatsInProjects:
+    def test_a_new_chat_goes_in_the_project_and_the_model_hears_its_instructions(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "Trips", instructions="Answer in French.")
+        events = reply(api, text="hello", model=FREE, project_id=made["id"])
+        assert events[0]["chat"]["project_id"] == made["id"]
+        assert 'Instructions for the project "Trips":\nAnswer in French.' in (
+            api.fakes["openrouter"].requests[-1].system
+        )
+        assert api.get("/api/projects").json()["projects"][0]["chat_count"] == 1
+        assert [c["project_id"] for c in api.get("/api/bootstrap").json()["chats"]] == [
+            made["id"]
+        ]
+
+    def test_a_chat_with_no_project_has_a_null_one(self, api: TestClient) -> None:
+        events = reply(api, text="hello", model=FREE)
+        assert events[0]["chat"]["project_id"] is None
+
+    def test_only_a_new_chat_takes_a_project(self, api: TestClient) -> None:
+        made = new_project(api, "Trips")
+        chat_id = reply(api, text="first", model=FREE)[0]["chat"]["id"]
+        response = api.post(
+            "/api/chat",
+            json={"text": "again", "chat_id": chat_id, "project_id": made["id"]},
+        )
+        assert error_of(response) == (422, "invalid")
+        assert api.get(f"/api/chats/{chat_id}").json()["chat"]["project_id"] is None
+
+    def test_a_project_that_does_not_exist_makes_no_chat(self, api: TestClient) -> None:
+        response = api.post(
+            "/api/chat",
+            json={"text": "hello", "model": FREE, "project_id": "0123456789abcdef"},
+        )
+        assert error_of(response) == (404, "no_project")
+        assert api.get("/api/bootstrap").json()["chats"] == []
+        assert not api.fakes["openrouter"].requests
+
+    @pytest.mark.parametrize("bad", ["", "nope", "0123456789ABCDEF", "../../etc"])
+    def test_a_project_id_has_one_form(self, api: TestClient, bad: str) -> None:
+        response = api.post(
+            "/api/chat", json={"text": "hello", "model": FREE, "project_id": bad}
+        )
+        assert error_of(response) == (422, "invalid")
+
+    def test_a_chat_can_be_moved_into_a_project_and_out_without_counting_as_activity(
+        self, api: TestClient
+    ) -> None:
+        made = new_project(api, "Trips")
+        chat = reply(api, text="hello", model=FREE)[0]["chat"]
+        url = f"/api/chats/{chat['id']}"
+        moved = api.patch(url, json={"project_id": made["id"]}).json()
+        assert moved["project_id"] == made["id"]
+        assert moved["updated_at"] == api.get(url).json()["chat"]["updated_at"]
+        assert api.get("/api/projects").json()["projects"][0]["chat_count"] == 1
+        free = api.patch(url, json={"project_id": None}).json()
+        assert free["project_id"] is None
+        assert api.get("/api/projects").json()["projects"][0]["chat_count"] == 0
+
+    def test_renaming_still_works_alone_and_with_a_move(self, api: TestClient) -> None:
+        made = new_project(api, "Trips")
+        chat_id = reply(api, text="hello", model=FREE)[0]["chat"]["id"]
+        url = f"/api/chats/{chat_id}"
+        assert (
+            api.patch(url, json={"title": "  A  new   title "}).json()["title"]
+            == "A new title"
+        )
+        both = api.patch(url, json={"title": "Both", "project_id": made["id"]}).json()
+        assert (both["title"], both["project_id"]) == ("Both", made["id"])
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"title": None},
+            {"title": ""},
+            {"title": "  \n "},
+            {"title": "t" * 201},
+            {"project_id": "nope"},
+            {"model": "x"},
+        ],
+    )
+    def test_a_change_that_does_not_make_sense_is_refused(
+        self, api: TestClient, body: dict
+    ) -> None:
+        chat_id = reply(api, text="hello", model=FREE)[0]["chat"]["id"]
+        before = api.get(f"/api/chats/{chat_id}").json()["chat"]
+        assert error_of(api.patch(f"/api/chats/{chat_id}", json=body)) == (
+            422,
+            "invalid",
+        )
+        assert api.get(f"/api/chats/{chat_id}").json()["chat"] == before
+
+    def test_moving_a_chat_to_a_project_that_does_not_exist_is_a_404(
+        self, api: TestClient
+    ) -> None:
+        chat_id = reply(api, text="hello", model=FREE)[0]["chat"]["id"]
+        response = api.patch(
+            f"/api/chats/{chat_id}", json={"project_id": "0123456789abcdef"}
+        )
+        assert error_of(response) == (404, "no_project")
+        assert api.get(f"/api/chats/{chat_id}").json()["chat"]["project_id"] is None
