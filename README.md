@@ -49,7 +49,7 @@ deleted 30 days after its last message (`retention_days`): once at start-up and 
 checkpoint that follows moves the deleted text out of the write-ahead log too. Renaming a chat does not count as
 activity. The sidebar says so, and a chat in its last week shows "Deletes in N days". Settings has "Delete all chats".
 
-**Upgrading the database.** The schema has a version (`PRAGMA user_version`: 2 added images, 3 added projects). Starting a
+**Upgrading the database.** The schema has a version (`PRAGMA user_version`: 2 added images, 3 added projects, 4 added scheduled tasks). Starting a
 newer build on an older file upgrades it in place, one transaction per step, and first copies the file with SQLite's
 backup API to `chats.db.v<old>.bak` beside it (mode 600; a second copy of the same version is `chats.db.v<old>-2.bak`).
 The copy is built as `chats.db.v<old>.bak.part` and only gets its own name once it is whole, so a crash leaves a part

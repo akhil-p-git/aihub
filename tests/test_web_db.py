@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from aihub_web import db as db_module
-from aihub_web.db import ImageRow, Store
+from aihub_web.db import ImageRow, Store, Task
 
 FIXTURES = Path(__file__).parent / "fixtures" / "images"
 
@@ -499,6 +499,12 @@ def v2_copy(tmp_path: Path, name: str = "chats.db") -> Path:
     return path
 
 
+def v3_copy(tmp_path: Path, name: str = "chats.db") -> Path:
+    path = tmp_path / name
+    shutil.copy(FIXTURES / "chats-v3.db", path)
+    return path
+
+
 class TestMigration:
     """chats-v1.db is a real version 1 file: the db.py of commit 77f7456 wrote it in a temporary directory.
 
@@ -974,7 +980,7 @@ class TestMigrationToProjects:
         assert rows_of(path) == before
         raw = sqlite3.connect(path)
         assert raw.execute("SELECT * FROM images").fetchall() == pictures
-        assert user_version(raw) == 3
+        assert user_version(raw) == db_module.SCHEMA_VERSION
         assert raw.execute("SELECT count(*) FROM projects").fetchone()[0] == 0
         assert (
             raw.execute(
@@ -987,7 +993,7 @@ class TestMigrationToProjects:
             for (name,) in raw.execute(
                 "SELECT name FROM sqlite_master WHERE name LIKE 'chats_%'"
             )
-        } == {"chats_updated", "chats_project"}
+        } >= {"chats_updated", "chats_project"}
         assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
         raw.close()
@@ -1031,8 +1037,7 @@ class TestMigrationToProjects:
     def test_old_code_cannot_open_a_version_3_file_and_says_why(
         self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        path = tmp_path / "chats.db"
-        Store(path, clock).close()
+        path = v3_copy(tmp_path)  # a real version 3 file
         monkeypatch.setattr(db_module, "SCHEMA_VERSION", 2)
         with pytest.raises(
             RuntimeError, match=r"schema 3 is newer than this app \(2\)"
@@ -1172,3 +1177,240 @@ class TestProjects:
         store.add_message(other.id, "user", "y")
         assert store.delete_all() == 1
         assert [p.name for p in store.list_projects()] == ["Trips"]
+
+
+DAILY = {"kind": "daily", "time": "08:00"}
+
+
+def a_task(store: Store, name: str = "Morning digest", **fields) -> Task:
+    fields.setdefault("prompt", "Summarise what I should do today.")
+    fields.setdefault("model", "ollama/qwen3:8b")
+    fields.setdefault("effort", None)
+    fields.setdefault("schedule", DAILY)
+    return store.create_task(name, **fields)
+
+
+class TestMigrationToTasks:
+    """chats-v3.db is a real version 3 file: the db.py of this branch before schema 4 opened chats-v2.db (which
+    upgraded it) and then stored two projects and a chat in one of them. It holds 5 chats, 12 messages, 1 image,
+    2 projects and 1 setting."""
+
+    def test_the_fixture_really_is_a_version_3_file(self, tmp_path: Path) -> None:
+        raw = sqlite3.connect(v3_copy(tmp_path))
+        tables = {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert user_version(raw) == 3
+        assert tables == {"chats", "images", "messages", "projects", "settings"}
+        assert [
+            raw.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            for t in ("chats", "messages", "images", "projects", "settings")
+        ] == [5, 12, 1, 2, 1]
+        raw.close()
+
+    def test_opening_it_adds_tasks_and_keeps_every_row(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        untouched = v3_copy(tmp_path, "untouched.db")
+        before = rows_of(untouched)
+        raw = sqlite3.connect(untouched)
+        kept = {
+            table: raw.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            for table in ("images", "projects")
+        }
+        raw.close()
+        path = v3_copy(tmp_path)
+        s = Store(path, clock)
+        assert s.list_tasks() == []
+        assert [p.name for p in s.list_projects()] == ["Trips", "Work notes"]
+        assert s.list_projects()[0].chat_count == 1
+        s.close()
+        assert rows_of(path) == before
+        raw = sqlite3.connect(path)
+        assert user_version(raw) == 4
+        for table, rows in kept.items():
+            assert raw.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() == rows
+        assert raw.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+        assert (
+            raw.execute(
+                "SELECT count(*) FROM chats WHERE task_id IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+        raw.close()
+
+    def test_an_upgraded_file_has_the_schema_of_a_new_one(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        fresh = tmp_path / "fresh.db"
+        Store(fresh, clock).close()
+        for old in (v1_copy, v2_copy, v3_copy):
+            upgraded = old(tmp_path, f"from-{old.__name__}.db")
+            Store(upgraded, clock).close()
+            assert schema_of(upgraded) == schema_of(fresh)
+
+    def test_the_copy_made_first_is_the_version_3_file(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v3_copy(tmp_path)
+        Store(path, clock).close()
+        [backup] = backups_of(path)
+        assert backup.name == "chats.db.v3.bak"
+        raw = sqlite3.connect(backup)
+        assert user_version(raw) == 3
+        assert raw.execute("SELECT count(*) FROM projects").fetchone()[0] == 2
+        assert not any(
+            row[1] == "task_id" for row in raw.execute("PRAGMA table_info(chats)")
+        )
+        raw.close()
+
+
+class TestTasks:
+    def test_a_new_task(self, store: Store, clock: Clock) -> None:
+        made = a_task(store, effort="low", next_run_at=1_800_000_000_000)
+        assert re.fullmatch(r"[0-9a-f]{16}", made.id)
+        assert made.to_json() == {
+            "id": made.id,
+            "name": "Morning digest",
+            "prompt": "Summarise what I should do today.",
+            "model": "ollama/qwen3:8b",
+            "effort": "low",
+            "schedule": DAILY,
+            "enabled": True,
+            "project_id": None,
+            "next_run_at": 1_800_000_000_000,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_chat_id": None,
+            "failures": 0,
+            "created_at": int(clock.now * 1000),
+            "updated_at": int(clock.now * 1000),
+        }
+        assert store.get_task(made.id) == made
+        assert store.get_task("0" * 16) is None
+
+    def test_the_list_is_by_name_without_regard_to_case(self, store: Store) -> None:
+        for name in ("beta", "Alpha", "Zed", "alpha two"):
+            a_task(store, name)
+        assert [t.name for t in store.list_tasks()] == [
+            "Alpha",
+            "alpha two",
+            "beta",
+            "Zed",
+        ]
+        assert store.count_tasks() == 4
+
+    def test_a_schedule_comes_back_as_it_went_in(self, store: Store) -> None:
+        weekly = {"kind": "weekly", "day": 4, "time": "17:30"}
+        assert a_task(store, schedule=weekly).schedule == weekly
+        assert store.list_tasks()[0].schedule == weekly
+
+    def test_editing_changes_only_what_is_given_and_ignores_other_names(
+        self, store: Store, clock: Clock
+    ) -> None:
+        made = a_task(store)
+        clock.advance(seconds=5)
+        changed = store.update_task(
+            made.id,
+            {
+                "name": "Evening digest",
+                "schedule": {"kind": "hourly", "every": 6},
+                "enabled": False,
+                "id": "0" * 16,  # not a column a caller may set
+                "created_at": 1,
+            },
+        )
+        assert changed.name == "Evening digest" and changed.enabled is False
+        assert changed.schedule == {"kind": "hourly", "every": 6}
+        assert changed.prompt == made.prompt and changed.id == made.id
+        assert changed.created_at == made.created_at
+        assert changed.updated_at == made.updated_at + 5000
+        assert store.update_task("0" * 16, {"name": "x"}) is None
+
+    def test_what_a_run_leaves_behind_is_kept(self, store: Store) -> None:
+        made = a_task(store)
+        chat = store.create_chat(
+            "Morning digest, 20 Oct", made.model, None, None, made.id
+        )
+        done = store.update_task(
+            made.id,
+            {
+                "last_run_at": 5,
+                "last_status": "error",
+                "last_error": "The model stopped responding.",
+                "last_chat_id": chat.id,
+                "failures": 2,
+                "next_run_at": 99,
+            },
+        )
+        assert (done.last_status, done.last_error, done.failures) == (
+            "error",
+            "The model stopped responding.",
+            2,
+        )
+        assert (done.last_chat_id, done.next_run_at, done.last_run_at) == (
+            chat.id,
+            99,
+            5,
+        )
+        assert store.get_chat(chat.id).to_json()["task_id"] == made.id
+        with pytest.raises(sqlite3.IntegrityError):
+            store.update_task(made.id, {"last_status": "exploded"})
+
+    def test_due_tasks_are_the_enabled_ones_whose_time_has_come_in_order(
+        self, store: Store
+    ) -> None:
+        late = a_task(store, "late", next_run_at=300)
+        early = a_task(store, "early", next_run_at=100)
+        exactly = a_task(store, "exactly", next_run_at=200)
+        a_task(store, "later", next_run_at=201)
+        a_task(store, "off", next_run_at=50, enabled=False)
+        a_task(store, "unscheduled", next_run_at=None)
+        assert [t.id for t in store.due_tasks(200)] == [early.id, exactly.id]
+        assert [t.id for t in store.due_tasks(10_000)][-1] == late.id
+        assert store.due_tasks(99) == []
+
+    def test_a_chat_that_names_no_task_is_refused_by_the_database(
+        self, store: Store
+    ) -> None:
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_chat("x", "ollama/qwen3:8b", None, None, "f" * 16)
+
+    def test_deleting_a_task_keeps_its_chats(self, store: Store) -> None:
+        made = a_task(store)
+        chat = store.create_chat("a run", made.model, None, None, made.id)
+        store.add_message(chat.id, "user", "x")
+        assert store.delete_task(made.id) is True
+        assert store.get_task(made.id) is None
+        assert store.get_chat(chat.id).to_json()["task_id"] is None
+        assert len(store.messages(chat.id)) == 1
+        assert store.delete_task(made.id) is False
+
+    def test_deleting_a_chat_or_a_project_leaves_the_task(self, store: Store) -> None:
+        project = store.create_project("Digests")
+        made = a_task(store, project_id=project.id)
+        chat = store.create_chat("a run", made.model, None, project.id, made.id)
+        store.update_task(made.id, {"last_chat_id": chat.id})
+        store.delete_chat(chat.id)
+        assert store.get_task(made.id).last_chat_id is None
+        store.delete_project(project.id, delete_chats=False)
+        assert store.get_task(made.id).project_id is None
+
+    def test_tasks_outlive_retention_and_delete_all(
+        self, store: Store, clock: Clock
+    ) -> None:
+        made = a_task(store, "Keeps", next_run_at=5)
+        chat = store.create_chat("a run", made.model, None, None, made.id)
+        store.add_message(chat.id, "user", "x")
+        clock.advance(days=400)
+        assert store.purge_expired(30) == 1
+        other = store.create_chat("another", made.model, None, None, made.id)
+        store.add_message(other.id, "user", "y")
+        assert store.delete_all() == 1
+        assert [t.name for t in store.list_tasks()] == ["Keeps"]

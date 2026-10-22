@@ -22,6 +22,22 @@ DAY_MS = 86_400_000
 BACKUP_APPLICATION_ID = 0x41484231
 # Columns update_chat may change; the names are interpolated into SQL, so never take them from input.
 EDITABLE_CHAT_COLUMNS = ("title", "model", "effort", "project_id")
+# Columns update_task may change (the names are interpolated into SQL, so never take them from input).
+EDITABLE_TASK_COLUMNS = (
+    "name",
+    "prompt",
+    "model",
+    "effort",
+    "schedule",
+    "enabled",
+    "project_id",
+    "next_run_at",
+    "last_run_at",
+    "last_status",
+    "last_error",
+    "last_chat_id",
+    "failures",
+)
 
 SCHEMA = """
 CREATE TABLE chats (
@@ -94,7 +110,32 @@ CREATE INDEX chats_project ON chats (project_id);
 
 # Each step takes a database from the version before it to its own, and step 1 is the base schema. A new file runs every
 # step, so it ends up with exactly the tables, columns and SQL that an upgraded file has.
-MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA, 3: PROJECTS_SCHEMA}
+# Added in version 4. A task is settings, like a project: never expired. A run makes an ordinary chat (chats.task_id
+# says which task made it) and the task remembers the newest one; deleting either side leaves the other.
+TASKS_SCHEMA = """
+CREATE TABLE tasks (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    prompt       TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    effort       TEXT,
+    schedule     TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    project_id   TEXT REFERENCES projects (id) ON DELETE SET NULL,
+    next_run_at  INTEGER,
+    last_run_at  INTEGER,
+    last_status  TEXT CHECK (last_status IN ('done', 'error', 'stopped', 'skipped')),
+    last_error   TEXT,
+    last_chat_id TEXT REFERENCES chats (id) ON DELETE SET NULL,
+    failures     INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX tasks_due ON tasks (next_run_at);
+ALTER TABLE chats ADD COLUMN task_id TEXT REFERENCES tasks (id) ON DELETE SET NULL;
+CREATE INDEX chats_task ON chats (task_id);
+"""
+MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA, 3: PROJECTS_SCHEMA, 4: TASKS_SCHEMA}
 SCHEMA_VERSION = max(MIGRATIONS)
 
 
@@ -136,6 +177,7 @@ class Chat:
     created_at: int
     updated_at: int
     project_id: str | None = None
+    task_id: str | None = None
     snippet: str | None = None
 
     def to_json(self) -> dict[str, object]:
@@ -153,6 +195,39 @@ class Project:
 
     def to_json(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class Task:
+    """A prompt that runs on a schedule. `schedule` is the structured form (see schedule.py); the times are
+    milliseconds since the epoch, and next_run_at is None while the task is off."""
+
+    id: str
+    name: str
+    prompt: str
+    model: str
+    effort: str | None
+    schedule: dict[str, object]
+    enabled: bool
+    project_id: str | None
+    next_run_at: int | None
+    last_run_at: int | None
+    last_status: str | None
+    last_error: str | None
+    last_chat_id: str | None
+    failures: int
+    created_at: int
+    updated_at: int
+
+    def to_json(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _task(row: sqlite3.Row) -> Task:
+    data = dict(row)
+    data["schedule"] = json.loads(data["schedule"])
+    data["enabled"] = bool(data["enabled"])
+    return Task(**data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,14 +451,26 @@ class Store:
         model: str,
         effort: str | None,
         project_id: str | None = None,
+        task_id: str | None = None,
     ) -> Chat:
         now = self._now()
-        chat = Chat(secrets.token_hex(8), title, model, effort, now, now, project_id)
+        chat = Chat(
+            secrets.token_hex(8), title, model, effort, now, now, project_id, task_id
+        )
         with self._tx() as db:
             db.execute(
-                "INSERT INTO chats (id, title, model, effort, created_at, updated_at, project_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chat.id, chat.title, chat.model, chat.effort, now, now, project_id),
+                "INSERT INTO chats (id, title, model, effort, created_at, updated_at, project_id, task_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    chat.id,
+                    chat.title,
+                    chat.model,
+                    chat.effort,
+                    now,
+                    now,
+                    project_id,
+                    task_id,
+                ),
             )
         return chat
 
@@ -549,6 +636,113 @@ class Store:
         if removed:
             self._wipe_wal()
         return deleted
+
+    # tasks
+
+    def create_task(
+        self,
+        name: str,
+        *,
+        prompt: str,
+        model: str,
+        effort: str | None,
+        schedule: Mapping[str, object],
+        project_id: str | None = None,
+        enabled: bool = True,
+        next_run_at: int | None = None,
+    ) -> Task:
+        now = self._now()
+        task = Task(
+            secrets.token_hex(8),
+            name,
+            prompt,
+            model,
+            effort,
+            dict(schedule),
+            enabled,
+            project_id,
+            next_run_at,
+            None,
+            None,
+            None,
+            None,
+            0,
+            now,
+            now,
+        )
+        with self._tx() as db:
+            db.execute(
+                "INSERT INTO tasks (id, name, prompt, model, effort, schedule, enabled, project_id, next_run_at,"
+                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task.id,
+                    name,
+                    prompt,
+                    model,
+                    effort,
+                    json.dumps(task.schedule),
+                    int(enabled),
+                    project_id,
+                    next_run_at,
+                    now,
+                    now,
+                ),
+            )
+        return task
+
+    def get_task(self, task_id: str) -> Task | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return _task(row) if row else None
+
+    def list_tasks(self) -> list[Task]:
+        """By name, without regard to case."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM tasks ORDER BY lower(name), id"
+            ).fetchall()
+        return [_task(r) for r in rows]
+
+    def count_tasks(self) -> int:
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    def update_task(self, task_id: str, changes: Mapping[str, object]) -> Task | None:
+        """Change the columns named (only those in EDITABLE_TASK_COLUMNS count)."""
+        columns = [c for c in EDITABLE_TASK_COLUMNS if c in changes]
+        if columns:
+            values: list[object] = []
+            for column in columns:
+                value = changes[column]
+                if column == "schedule":
+                    value = json.dumps(value)
+                elif column == "enabled":
+                    value = int(bool(value))
+                values.append(value)
+            assignments = ", ".join(f"{c} = ?" for c in (*columns, "updated_at"))
+            with self._tx() as db:
+                db.execute(
+                    f"UPDATE tasks SET {assignments} WHERE id = ?",
+                    [*values, self._now(), task_id],
+                )
+        return self.get_task(task_id)
+
+    def delete_task(self, task_id: str) -> bool:
+        """Its chats stay, with no task."""
+        with self._tx() as db:
+            return db.execute("DELETE FROM tasks WHERE id = ?", (task_id,)).rowcount > 0
+
+    def due_tasks(self, now_ms: int) -> list[Task]:
+        """The enabled tasks whose next run is at or before `now_ms`, earliest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM tasks WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?"
+                " ORDER BY next_run_at, id",
+                (now_ms,),
+            ).fetchall()
+        return [_task(r) for r in rows]
 
     # messages
 
