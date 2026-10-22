@@ -109,14 +109,27 @@ export function working(label) {
   return h("div", { class: "working" }, bars(4), h("span", {}, label));
 }
 
-/** Puts the popover above (or below) its anchor, clamped to the viewport. Call after showPopover(). */
+/**
+ * Puts the popover above (or below, with `below`) its anchor, clamped to the viewport. It keeps to that side unless
+ * the side cannot show the whole popover and the other can show more, and it is never taller than the room there
+ * (its rows scroll). Call after showPopover(). On a phone the popover is a sheet and needs no placing.
+ */
 export function placePopover(pop, anchor, { below = false } = {}) {
   const rect = anchor.getBoundingClientRect();
   const left = Math.max(8, Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8));
   pop.style.setProperty("--pop-x", `${left}px`);
-  if (below) {
-    pop.style.setProperty("--pop-top", `${rect.bottom + 4}px`);
-  } else {
-    pop.style.setProperty("--pop-bottom", `${window.innerHeight - rect.top + 8}px`);
+  pop.style.removeProperty("--pop-max"); // so that its height is measured as it wants to be, not as last capped
+  if (matchMedia("(max-width: 40rem)").matches) {
+    pop.removeAttribute("data-below");
+    return;
   }
+  const above = rect.top - 12;
+  const under = window.innerHeight - rect.bottom - 12;
+  const preferred = below ? under : above;
+  const other = below ? above : under;
+  const useBelow = pop.scrollHeight > preferred && other > preferred ? !below : below;
+  pop.toggleAttribute("data-below", useBelow);
+  if (useBelow) pop.style.setProperty("--pop-top", `${rect.bottom + 4}px`);
+  else pop.style.setProperty("--pop-bottom", `${window.innerHeight - rect.top + 8}px`);
+  pop.style.setProperty("--pop-max", `${Math.max(useBelow ? under : above, 160)}px`);
 }
