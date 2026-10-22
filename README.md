@@ -16,6 +16,10 @@ This is the web chat, run as a systemd user service and opened in a browser. It 
   `ollama pull qwen3:8b` makes it work at once. `ollama pull qwen3:4b` (2.5 GB) is smaller; then put
   `ollama/qwen3:4b` in `default_models`. Any Ollama model that can chat shows up in the picker by itself.
   Without Ollama the page still opens, and the local models are marked "Ollama isn't responding".
+  A bigger local model to try is `muse-glimmer` (Meta, 30B, 18 GB, Apache 2.0; <https://ollama.com/library/muse-glimmer>);
+  it needs far more memory than a small GPU has, so expect it to be slow on one. An Ollama cloud model such as
+  `muse-spark-open:cloud` runs on Ollama's servers, needs `ollama signin`, and is listed under Paid: the prompt leaves
+  your machine and Ollama may bill it.
 - Optional: keys for OpenRouter and Claude (see "Add a key" below).
 - Optional, for image generation: an **NVIDIA GPU** is required. The image engine is built with CUDA and the unit uses
   `/dev/nvidia*`, so without one the chat works but images do not (see Images).
@@ -83,7 +87,7 @@ script for this yet; the steps to turn it on are under Images below.
 Open <http://127.0.0.1:8787>. Enable it once with `systemctl --user enable --now aihub-web`; logs are
 `journalctl --user -u aihub-web -f`; health is `curl -sf http://127.0.0.1:8787/api/health`.
 
-**What it does.** Chats in a list grouped by day, with search; a model picker (free in the cloud, on this PC, paid)
+**What it does.** Chats in a list grouped by day, with search; a model picker (free in the cloud, on this PC, paid; an Ollama cloud model counts as paid)
 and an intensity control in the composer; replies stream, with a Stop button; reasoning shows in a collapsed
 "Thought for 8 s" block; each reply is footed with its model, intensity, speed, tokens, time and, for paid models,
 its estimated cost. Light and dark themes follow the system and can be fixed in Settings. It works from a 360 px
@@ -181,7 +185,7 @@ a time that happens twice runs once.
 Only local models, and the server enforces it, not the page. Making or editing a task with a cloud or image model is
 refused, a run checks again, and a model that is gone makes the run fail instead of falling back to another. An Ollama
 model that Ollama only passes on to ollama.com counts as a cloud model: the server treats one that Ollama marks with
-`remote_host` or `remote_model` in its model list, or whose name ends in `-cloud`, that way. A run sends
+`remote_host` or `remote_model` in its model list, or whose name ends in `-cloud` or `:cloud`, that way. A run sends
 the saved prompt with your standing instructions and the project's, the model has no tools, and it reads nothing else,
 so nothing a task does costs money or goes to a cloud provider.
 
