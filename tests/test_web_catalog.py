@@ -147,6 +147,9 @@ class TestParsing:
             {
                 "name": "gpt-oss:120b-cloud"
             },  # named as a cloud model, with none of Ollama's own marks
+            {
+                "name": "muse-spark-open:cloud"
+            },  # the library names a cloud model with the tag :cloud
         ],
     )
     def test_a_model_that_ollama_only_passes_on_to_the_cloud_is_remote(
@@ -156,10 +159,13 @@ class TestParsing:
         model = ollama_model({**tag, **extra}, show, OllamaConfig())
         assert model is not None and model.remote is True
         assert model.to_json()["remote"] is True
+        # Ollama bills it and the prompt leaves this PC, so it is not filed with the models on this PC.
+        assert model.tier == "paid"
 
     def test_a_model_on_this_pc_is_not_remote_and_says_nothing_of_it(self) -> None:
         model = ollama_model(*self.tag_and_show("qwen3:8b"), OllamaConfig())
         assert model.remote is False and "remote" not in model.to_json()
+        assert model.tier == "local"
 
     def test_ollama_model_fields(self) -> None:
         model = ollama_model(*self.tag_and_show("gemma3:4b"), OllamaConfig())

@@ -52,7 +52,7 @@ class ModelInfo:
     provider: str
     native: str
     name: str
-    tier: str  # "free", "local" or "paid"
+    tier: str  # "free", "local" or "paid" (a pinned OpenRouter or Claude model, or an Ollama cloud model)
     ctx: int | None = None  # tokens we will actually use
     ctx_max: int | None = None  # tokens the model supports
     vision: bool = False
@@ -189,9 +189,9 @@ def claude_model(model: ClaudeModel) -> ModelInfo:
 
 def _is_remote(tag: Mapping[str, object]) -> bool:
     """Whether Ollama only passes the prompt on to ollama.com for this model. Ollama marks such a model in its list
-    with remote_host and remote_model and names it ...-cloud; either is taken as the sign."""
+    with remote_host and remote_model, and its library names one ...-cloud or ...:cloud; any of these is the sign."""
     marked = bool(tag.get("remote_host") or tag.get("remote_model"))
-    return marked or str(tag["name"]).endswith("-cloud")
+    return marked or str(tag["name"]).endswith(("-cloud", ":cloud"))
 
 
 def ollama_model(
@@ -211,18 +211,20 @@ def ollama_model(
         None,
     )
     size = tag.get("size")
+    remote = _is_remote(tag)
     return ModelInfo(
         id=f"ollama/{name}",
         provider="ollama",
         native=name,
         name=name,
-        tier="local",
+        # A cloud model is Ollama's service, not this PC: the prompt leaves it and Ollama may bill it.
+        tier="paid" if remote else "local",
         ctx=min(declared, cfg.num_ctx) if declared else cfg.num_ctx,
         ctx_max=declared,
         vision="vision" in capabilities,
         efforts=ollama_efforts(show),
         size_bytes=size if isinstance(size, int) else None,
-        remote=_is_remote(tag),
+        remote=remote,
     )
 
 
