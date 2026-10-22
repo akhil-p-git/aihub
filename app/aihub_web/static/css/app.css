@@ -244,6 +244,7 @@
   .icon .solid { fill: currentColor; stroke: none; }
 
   .btn { padding-inline: var(--s-3); font-weight: 500; font-size: var(--text-sm); }
+  a.btn { color: inherit; text-decoration: none; }
   .btn[data-kind="primary"] { background: var(--primary); color: var(--on-primary); }
   .btn[data-kind="danger"] { background: var(--danger); color: var(--paper); }
   @media (hover: hover) {
@@ -397,7 +398,7 @@
     .meta .btn, .code-head .btn, .think > summary { min-block-size: var(--hit); }
   }
   @media (hover: hover) {
-    .msg.assistant:not(:last-child) .actions { opacity: 0; transition: opacity var(--t-pop); }
+    .msg.assistant:not(:last-child) .actions:not(.img-actions) { opacity: 0; transition: opacity var(--t-pop); }
     .msg.assistant:hover .actions, .msg.assistant:focus-within .actions { opacity: 1; }
   }
 
@@ -408,6 +409,36 @@
   .notice .row { display: flex; flex-wrap: wrap; gap: var(--s-2); }
   .notice .btn { box-shadow: inset 0 0 0 1px var(--line-strong); }
   .notice-inline { margin-block-start: var(--s-3); font-family: var(--font-ui); font-size: var(--text-xs); color: var(--muted); }
+  .notice-inline .btn { min-block-size: 2rem; padding-inline: var(--s-2); font-size: var(--text-xs); box-shadow: inset 0 0 0 1px var(--line-strong); }
+
+  /* Image replies. The slate that stands in while an image is made and the image itself share one size rule, so
+     the image replaces the slate without the page jumping: column width, never taller than 70% of the window. */
+  .img-slate, .img-out {
+    inline-size: min(100%, calc(70dvh * var(--ar, 1))); aspect-ratio: var(--ar, 1);
+    border-radius: var(--r-md);
+  }
+  .img-slate[data-shape="square"] { --ar: 1; }
+  .img-slate[data-shape="wide"] { --ar: 1.7778; }
+  .img-slate[data-shape="tall"] { --ar: 0.5625; }
+  .img-slate {
+    display: grid; place-content: center; justify-items: center; gap: var(--s-4);
+    background: var(--slate); box-shadow: inset 0 0 0 1px var(--line);
+    font-family: var(--font-ui);
+  }
+  .img-signal { display: flex; align-items: flex-end; gap: 6px; block-size: 2.5rem; }
+  .img-signal i {
+    inline-size: 0.5rem; block-size: calc(30% + 70% * (var(--i) + 1) / var(--n, 4));
+    border-radius: 2px; background: var(--line-strong); transition: background-color var(--t-pop);
+  }
+  .img-signal i[data-on], .img-slate[data-loop] .img-signal i { background: var(--primary); }
+  .img-label {
+    max-inline-size: 22rem; padding-inline: var(--s-4); text-align: center; color: var(--muted);
+    font-size: var(--text-sm); font-variant-numeric: tabular-nums;
+  }
+  .img-fig { display: grid; }
+  .img-out { display: block; block-size: auto; background: var(--slate); box-shadow: 0 0 0 1px var(--line); }
+  .img-fig[data-full] .img-out { inline-size: 100%; }
+  .meta .img-actions { flex: 1 0 100%; flex-wrap: wrap; margin-inline-start: calc(-1 * var(--s-2)); }
 
   .jump {
     position: absolute; inset-inline: 0; inset-block-end: var(--s-4); margin-inline: auto; z-index: var(--z-jump);
@@ -439,11 +470,11 @@
   }
   @media (hover: hover) { .chip:hover:not(:disabled) { background: var(--press); } }
   #model-chip { flex: 0 1 auto; }
-  #effort-chip { flex: none; }
+  #effort-chip, #shape-chip { flex: none; }
   @media (max-width: 26rem) {
-    .composer-bar:has(#effort-chip:not([hidden])) { flex-wrap: wrap; }
-    .composer-bar:has(#effort-chip:not([hidden])) #model-chip { flex: 1 0 100%; justify-content: flex-start; }
-    .composer-bar:has(#effort-chip:not([hidden])) #model-chip::after { margin-inline-start: auto; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) { flex-wrap: wrap; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) #model-chip { flex: 1 0 100%; justify-content: flex-start; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) #model-chip::after { margin-inline-start: auto; }
   }
   .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip-bars { display: inline-flex; }
@@ -564,6 +595,11 @@
       animation-delay: calc(var(--i) * 110ms);
     }
     @keyframes bar { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(1); } }
+    .img-slate[data-loop] .img-signal i {
+      transform-origin: bottom;
+      animation: bar 900ms var(--ease-io) infinite;
+      animation-delay: calc(var(--i) * 110ms);
+    }
     .pop:popover-open { animation: pop var(--t-pop) var(--ease); transform-origin: bottom left; }
     @keyframes pop { from { opacity: 0; transform: scale(0.97) translateY(4px); } }
     @media (max-width: 40rem) {

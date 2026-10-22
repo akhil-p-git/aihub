@@ -3,10 +3,13 @@
 import { h, icon, placePopover } from "./dom.js";
 import { formatBytes, formatContext, formatDay, formatPrice } from "./format.js";
 
+// [key, label, which models]. Image models are local too, but they sit in a group of their own.
+const makesImages = (m) => m.output === "image";
 const GROUPS = [
-  ["free", "Free, in the cloud"],
-  ["local", "On this PC"],
-  ["paid", "Paid, billed to your credits"],
+  ["free", "Free, in the cloud", (m) => m.tier === "free"],
+  ["local", "On this PC", (m) => m.tier === "local" && !makesImages(m)],
+  ["images", "Makes images", (m) => m.tier === "local" && makesImages(m)],
+  ["paid", "Paid, billed to your credits", (m) => m.tier === "paid"],
 ];
 
 let pop;
@@ -17,10 +20,11 @@ let closedAt = 0;
 
 function subtitle(model) {
   if (!model.available) return [model.reason];
+  if (makesImages(model)) return [model.note, "Free, on this PC"].filter(Boolean);
   const parts = [];
   if (model.size_bytes) parts.push(formatBytes(model.size_bytes));
   if (model.ctx) parts.push(`${formatContext(model.ctx)} context`);
-  if (model.vision) parts.push("Images");
+  if (model.vision) parts.push("Reads images");
   if (model.efforts) parts.push("Adjustable reasoning");
   if (model.expires) parts.push(`Free until ${formatDay(model.expires)}`);
   if (model.price) parts.push(formatPrice(model.price));
@@ -61,17 +65,18 @@ function missingNotes(shown) {
 function renderList() {
   const words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
   const matches = (m) => {
-    const haystack = `${m.name} ${m.id} ${m.tier} ${m.provider} ${m.vision ? "images vision" : ""}`.toLowerCase();
+    const haystack =
+      `${m.name} ${m.id} ${m.tier} ${m.provider} ${m.vision ? "reads images vision" : ""} ${makesImages(m) ? "makes images image" : ""}`.toLowerCase();
     return words.every((word) => haystack.includes(word));
   };
   list.replaceChildren();
   const shown = new Set();
   let index = 0;
-  for (const [tier, label] of GROUPS) {
-    const rows = current.models.filter((m) => m.tier === tier && matches(m));
+  for (const [key, label, belongs] of GROUPS) {
+    const rows = current.models.filter((m) => belongs(m) && matches(m));
     if (!rows.length) continue;
-    shown.add(tier);
-    const labelId = `model-group-${tier}`;
+    shown.add(key);
+    const labelId = `model-group-${key}`;
     list.append(
       h(
         "div",
