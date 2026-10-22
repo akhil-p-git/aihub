@@ -142,6 +142,8 @@ class Scheduler:
     async def tick(self) -> None:
         """Run what is due, earliest first. Time passes during a run, so each task is read again before it starts."""
         for due in self._store.due_tasks(self._now_ms()):
+            if self.running:  # one started by hand: what is due waits for it, as it waits for a busy service
+                return
             task = self._store.get_task(due.id)
             if (
                 task
@@ -242,11 +244,13 @@ class Scheduler:
         task = self._store.get_task(task_id)
         if task is None:  # deleted during the run: its chat stays, with no task
             return
+        # A chat that was deleted during its run is gone, and a task cannot link to it.
+        chat = result.chat_id and self._store.get_chat(result.chat_id)
         changes: dict[str, object] = {
             "last_run_at": ran_at,
             "last_status": result.status,
             "last_error": result.error,
-            "last_chat_id": result.chat_id,
+            "last_chat_id": chat.id if chat else None,
         }
         if result.status == "done":
             changes["failures"] = 0
