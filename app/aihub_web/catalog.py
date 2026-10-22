@@ -69,6 +69,9 @@ class ModelInfo:
     edits: bool = False
     est_s: Mapping[str, int | float] | None = None
     note: str | None = None
+    # An Ollama model that this PC's Ollama only passes on to ollama.com (a cloud model): it is listed with the
+    # models on this PC, but the prompt leaves it.
+    remote: bool = False
 
     def to_json(self) -> dict[str, object]:
         price = None
@@ -98,6 +101,9 @@ class ModelInfo:
                 "est_s": self.est_s,
                 "note": self.note,
             }
+        if self.remote:
+            # Said only where it is so, so that the list is unchanged for models on this PC.
+            data["remote"] = True
         return data
 
 
@@ -181,6 +187,13 @@ def claude_model(model: ClaudeModel) -> ModelInfo:
     )
 
 
+def _is_remote(tag: Mapping[str, object]) -> bool:
+    """Whether Ollama only passes the prompt on to ollama.com for this model. Ollama marks such a model in its list
+    with remote_host and remote_model and names it ...-cloud; either is taken as the sign."""
+    marked = bool(tag.get("remote_host") or tag.get("remote_model"))
+    return marked or str(tag["name"]).endswith("-cloud")
+
+
 def ollama_model(
     tag: Mapping[str, object], show: Mapping[str, object], cfg: OllamaConfig
 ) -> ModelInfo | None:
@@ -209,6 +222,7 @@ def ollama_model(
         vision="vision" in capabilities,
         efforts=ollama_efforts(show),
         size_bytes=size if isinstance(size, int) else None,
+        remote=_is_remote(tag),
     )
 
 

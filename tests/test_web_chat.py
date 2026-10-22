@@ -1412,6 +1412,26 @@ class TestTaskTurns:
         assert store.list_chats() == []
         assert all(not provider.requests for provider in providers.values())
 
+    async def test_an_ollama_cloud_model_is_refused_before_anything_is_stored(
+        self, tmp_path: Path, cloud_model: str
+    ) -> None:
+        """Ollama lists it beside the models on this PC, but a run would send the prompt to ollama.com."""
+        service, store, providers = await make_service(tmp_path)
+        task = self.a_task(store)
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(text="Summarise my day.", model=cloud_model),
+                title="Morning digest",
+                task_id=task.id,
+            )
+        assert (err.value.status, err.value.code) == (422, "task_model")
+        assert store.list_chats() == []
+        assert all(not provider.requests for provider in providers.values())
+        # In an ordinary chat it is a model like any other: the person chose it, and the page says where it is.
+        assert service.prepare(
+            ChatRequest(text="hello", model=cloud_model)
+        ).model.remote
+
     async def test_an_image_model_is_refused_before_a_job_starts(
         self, tmp_path: Path, bound_socket: str
     ) -> None:

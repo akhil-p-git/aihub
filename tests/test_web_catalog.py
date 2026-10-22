@@ -139,6 +139,28 @@ class TestParsing:
         )
         assert (small.ctx, small.ctx_max) == (32768, 32768)
 
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"remote_host": "https://ollama.com:443"},
+            {"remote_model": "gpt-oss:120b"},
+            {
+                "name": "gpt-oss:120b-cloud"
+            },  # named as a cloud model, with none of Ollama's own marks
+        ],
+    )
+    def test_a_model_that_ollama_only_passes_on_to_the_cloud_is_remote(
+        self, extra: dict
+    ) -> None:
+        tag, show = self.tag_and_show("qwen3:8b")
+        model = ollama_model({**tag, **extra}, show, OllamaConfig())
+        assert model is not None and model.remote is True
+        assert model.to_json()["remote"] is True
+
+    def test_a_model_on_this_pc_is_not_remote_and_says_nothing_of_it(self) -> None:
+        model = ollama_model(*self.tag_and_show("qwen3:8b"), OllamaConfig())
+        assert model.remote is False and "remote" not in model.to_json()
+
     def test_ollama_model_fields(self) -> None:
         model = ollama_model(*self.tag_and_show("gemma3:4b"), OllamaConfig())
         assert (model.id, model.tier, model.vision) == (

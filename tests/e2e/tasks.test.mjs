@@ -268,6 +268,37 @@ describe("making a task", () => {
     });
   });
 
+  it("does not offer an Ollama model that only passes the prompt on to the cloud", async () => {
+    await withApp(async (fresh) => {
+      const { page, context } = await open(browser, fresh);
+      await page.route("**/api/bootstrap", async (route) => {
+        const response = await route.fetch();
+        const json = await response.json();
+        const local = json.models.find((m) => m.id === LOCAL);
+        json.models.push({
+          ...local,
+          id: "ollama/gpt-oss:120b-cloud",
+          name: "gpt-oss:120b-cloud",
+          remote: true,
+          efforts: null,
+        });
+        await route.fulfill({ response, json });
+      });
+      await page.reload();
+      await openTasks(page);
+      await page.getByRole("button", { name: "New task" }).click();
+      const dlg = dialog(page, "New task");
+      await dlg.waitFor();
+      const options = await dlg
+        .getByLabel("Model")
+        .locator("option")
+        .evaluateAll((all) => all.map((o) => o.value));
+      assert.ok(options.includes(LOCAL), "a model on this PC is offered");
+      assert.ok(!options.includes("ollama/gpt-oss:120b-cloud"), `a cloud model is not: ${options.join()}`);
+      await context.close();
+    });
+  });
+
   it("asks only for what the kind of schedule uses", async () => {
     await withApp(async (fresh) => {
       const { page, context } = await open(browser, fresh, { hash: "#/tasks" });

@@ -237,6 +237,20 @@ class TestWhatIsRefused:
         assert store.list_chats() == []
         assert all(not provider.requests for provider in providers.values())
 
+    async def test_an_ollama_cloud_model_is_never_called(
+        self, tmp_path: Path, cloud_model: str
+    ) -> None:
+        service, store, providers = await make_service(tmp_path)
+
+        result = await run_task(service, a_task(store, model=cloud_model))
+
+        assert (result.status, result.chat_id) == ("error", None)
+        assert result.error == (
+            "A scheduled task can only use a text model that runs on this PC."
+        )
+        assert store.list_chats() == []
+        assert all(not provider.requests for provider in providers.values())
+
     async def test_an_image_model_is_refused(
         self, tmp_path: Path, bound_socket: str
     ) -> None:

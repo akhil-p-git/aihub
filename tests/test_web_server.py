@@ -1732,6 +1732,21 @@ class TestTasksApi:
                 "A scheduled task can only use a text model that runs on this PC."
             )
 
+    def test_an_ollama_cloud_model_is_refused_like_any_cloud_model(
+        self, tmp_path: Path, tz, cloud_model: str
+    ) -> None:
+        with tasks_app(tmp_path, tz) as client:
+            listed = {m["id"]: m for m in client.get("/api/bootstrap").json()["models"]}
+            assert listed[cloud_model]["remote"] is True  # the page can tell
+            assert "remote" not in listed[LOCAL]
+            made = new_task(client)
+            for response in (
+                client.post("/api/tasks", json={**BASE_TASK, "model": cloud_model}),
+                client.patch(f"/api/tasks/{made['id']}", json={"model": cloud_model}),
+            ):
+                assert error_of(response) == (422, "task_model")
+            assert tasks_of(client) == [made]
+
     def test_a_project_must_exist(self, tasks_api: TestClient) -> None:
         missing = tasks_api.post(
             "/api/tasks", json={**BASE_TASK, "project_id": "0123456789abcdef"}

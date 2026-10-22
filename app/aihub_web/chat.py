@@ -125,8 +125,9 @@ class ImageTurn:
 
 
 def runs_tasks(model: ModelInfo) -> bool:
-    """Whether a scheduled task may use the model: a text model on this PC, which cannot spend money."""
-    return model.provider == "ollama"
+    """Whether a scheduled task may use the model: a text model that runs on this PC. An Ollama cloud model is
+    listed with those but sends the prompt to ollama.com, and can cost money."""
+    return model.provider == "ollama" and not model.remote
 
 
 def derive_title(text: str) -> str:

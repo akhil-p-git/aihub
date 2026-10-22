@@ -996,7 +996,7 @@ function beginRename(row, chat) {
 // ---- scheduled tasks
 
 /** The models a task may use: those that run on this PC. */
-const taskModels = () => state.models.filter((m) => m.provider === "ollama");
+const taskModels = () => state.models.filter((m) => m.provider === "ollama" && !m.remote);
 
 /** What "Delete all chats" leaves alone, said in a sentence ("" when there is nothing). */
 function whatStays() {

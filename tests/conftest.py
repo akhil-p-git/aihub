@@ -54,3 +54,25 @@ def tz(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
     yield use
     monkeypatch.undo()
     time.tzset()
+
+
+@pytest.fixture
+def cloud_model(monkeypatch: pytest.MonkeyPatch) -> str:
+    """An Ollama cloud model in the model list, as Ollama reports one: its name ends in -cloud and the tag carries
+    remote_host and remote_model. It is only a way for the prompt to reach ollama.com. Returns the model's id."""
+    import helpers
+
+    name = "gpt-oss:120b-cloud"
+    tag = {
+        "name": name,
+        "model": name,
+        "remote_model": "gpt-oss:120b",
+        "remote_host": "https://ollama.com:443",
+        "size": 384,
+        "digest": "0" * 64,
+    }
+    monkeypatch.setitem(helpers.OLLAMA, "tags", [*helpers.OLLAMA["tags"], tag])
+    monkeypatch.setitem(
+        helpers.OLLAMA["show"], name, helpers.OLLAMA["show"]["qwen3:8b"]
+    )
+    return f"ollama/{name}"
