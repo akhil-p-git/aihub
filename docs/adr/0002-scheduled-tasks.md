@@ -8,7 +8,7 @@ decision-makers: Akhil
 
 ## Context and problem statement
 
-aihub should do what Claude desktop's scheduled tasks do: run a saved prompt on a schedule and leave the reply in a chat (plan: `~/.claude/plans/aihub-projects-and-scheduled-tasks.md`, phases P3 and P4). Nobody watches a run. The web app already runs as a user service (`aihub-web`) and as the desktop app's backend, it has one GPU and a concurrency gate for replies, and its chats live in SQLite. The question is where the scheduler runs, what a task may use, and what a restart, a suspended PC or a change of clock may do to it.
+aihub should do what Claude desktop's scheduled tasks do: run a saved prompt on a schedule and leave the reply in a chat (phases P3 and P4 of the plan for projects and scheduled tasks, which is kept outside the repository). Nobody watches a run. The web app already runs as a user service (`aihub-web`) and as the desktop app's backend, it has one GPU and a concurrency gate for replies, and its chats live in SQLite. The question is where the scheduler runs, what a task may use, and what a restart, a suspended PC or a change of clock may do to it.
 
 ## Decision drivers
 
@@ -29,12 +29,12 @@ aihub should do what Claude desktop's scheduled tasks do: run a saved prompt on 
 
 Chosen option: the scheduler runs in the web app's lifespan (option 1), with structured schedules (not option 4's cron strings), because it needs no unit, uses the gate and the GPU share that replies already use, and keeps the next run next to the task.
 
-- **Local text models only, enforced in code.** `POST` and `PATCH /api/tasks` refuse any model that is not Ollama's (422 `task_model`), `ChatService.prepare` refuses it again whenever it is given a `task_id`, so the scheduler and Run now cannot skip it, and a model that is gone fails the run. There is no fallback to another model.
+- **Local text models only, enforced in code.** `POST` and `PATCH /api/tasks` refuse any model that is not a local Ollama one (422 `task_model`; an Ollama model that only passes the prompt on to ollama.com, which Ollama marks with `remote_host` or `remote_model` or names `...-cloud`, is not local), `ChatService.prepare` refuses it again whenever it is given a `task_id`, so the scheduler and Run now cannot skip it, and a model that is gone fails the run. There is no fallback to another model.
 - **No tools.** A run sends the saved prompt with the standing and project instructions and reads nothing else, so the model never holds private data, untrusted content and an outbound channel at once. If chat ever gets tools or web access, tasks must not inherit them without a per-task approval.
 - **Claim first.** A task's next run is set from its schedule, never from its last run, and it is stored before the run starts. A process that dies mid-run and is restarted does not run that occurrence again, and a crash during a run cannot loop. An interrupted run keeps what had arrived (a stopped reply) and is not repeated.
 - **Catch-up.** A task due while the app was off runs once if it was due less than 12 hours ago, and is skipped and recorded if it was due longer ago. Missed times collapse into one.
 - **Schedules** are every N hours (N divides a day, so the runs sit on the same hours every day), every day, every weekday, or one day a week, on the local wall clock. A wall time is turned into a moment by asking the C library for both daylight readings and keeping the ones that read back unchanged: a time that happens twice runs at the first of them, and a time that is skipped runs when the clock jumps past it.
-- **One run at a time**, however it was started. A busy service (replies streaming, an image being made) leaves the task due and counts nothing, so the next 30-second check tries again.
+- **One run at a time**, however it was started. A busy service (the most replies the service allows at once are already streaming, or an image is being made) leaves the task due and counts nothing, so the next 30-second check tries again.
 - **Three failures in a row switch a task off**, with the reason on its card; a run that fails, is stopped at the 15-minute limit, or returns no text counts. Switching it on again starts the count afresh.
 
 ### Consequences
@@ -44,6 +44,7 @@ Chosen option: the scheduler runs in the web app's lifespan (option 1), with str
 - Good, because a restart cannot repeat a run and a clock set back cannot run a task twice.
 - Bad, because tasks run only while aihub is running. A task due while it was off is caught up within 12 hours or skipped.
 - Bad, because a task due while Ollama is still starting fails with "model unavailable" and counts toward the three; three such days switch it off. Treating "unavailable" like "busy" would hide a model that was really removed.
+- Bad, because whether an Ollama model is remote rests on what Ollama puts in its model list (`remote_host`, `remote_model`) and on the `-cloud` naming. A cloud model that carries neither would be taken for a local one. The model picker has the same blind spot and files such a model under "On this PC".
 - Bad, because the stored next run is an absolute moment: after a change of time zone one occurrence runs at the old zone's wall time, then the schedule takes over.
 - Bad, because the explanation of a switch-off lives in the same `last_error` column as an ordinary error, and is recognised by how it begins (`switched_off()` in `tasks.py`), not by a column of its own.
 - Bad, because the teardown of the app depends on awaiting its background tasks in one order: an extra `await` there lets uvicorn's force-cancelled request log a traceback (`tests/test_web_launch.py` and `tests/test_web_shutdown.py` catch it).

@@ -115,13 +115,16 @@ PC's clock. When the clocks go forward, a time that was skipped runs the moment 
 a time that happens twice runs once.
 
 Only local models, and the server enforces it, not the page. Making or editing a task with a cloud or image model is
-refused, a run checks again, and a model that is gone makes the run fail instead of falling back to another. A run sends
+refused, a run checks again, and a model that is gone makes the run fail instead of falling back to another. An Ollama
+model that Ollama only passes on to ollama.com counts as a cloud model: the server treats one that Ollama marks with
+`remote_host` or `remote_model` in its model list, or whose name ends in `-cloud`, that way. A run sends
 the saved prompt with your standing instructions and the project's, the model has no tools, and it reads nothing else,
 so nothing a task does costs money or goes to a cloud provider.
 
 Tasks run inside `aihub-web` (or the desktop app), so only while it is running; there is no separate service. One task
-runs at a time, whether the schedule or Run now started it, and a run that finds replies streaming or an image being
-made waits for the next check (every 30 seconds). A run is stopped after 15 minutes. A task that was due while aihub was
+runs at a time, whether the schedule or Run now started it. A run waits for the next check (every 30 seconds) while
+the most replies that the service allows at once (`max_concurrent`, 3) are already streaming, or while an image is
+being made. A run is stopped after 15 minutes. A task that was due while aihub was
 off runs once when it starts if it was due less than 12 hours before, and is skipped (the card says "Skipped") if it
 was due longer ago; several missed times count as one. Closing aihub in the middle of a run keeps what had arrived and
 does not run it again. A run that fails, is stopped, or gets no answer counts as a failure: three in a row switch the
