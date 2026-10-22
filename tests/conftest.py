@@ -3,10 +3,13 @@ import os
 import shutil
 import socket
 import tempfile
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+
+ZONEINFO = Path("/usr/share/zoneinfo")
 
 
 @pytest.fixture
@@ -36,3 +39,18 @@ def bound_socket(socket_dir: Path) -> Iterator[str]:
         sock.bind(str(path))
         os.chmod(path, 0o600)
         yield str(path)
+
+
+@pytest.fixture
+def tz(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
+    """Sets the process time zone for one test (the schedule math reads the system's, through the C library)."""
+
+    def use(name: str) -> None:
+        if not (ZONEINFO / name).exists():
+            pytest.skip(f"no zone database for {name}")
+        monkeypatch.setenv("TZ", name)
+        time.tzset()
+
+    yield use
+    monkeypatch.undo()
+    time.tzset()

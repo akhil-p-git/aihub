@@ -1,31 +1,13 @@
 """Schedules: what is accepted, when each kind is next due (in real time zones, daylight saving included), and how it reads."""
 
 import time
-from collections.abc import Callable, Iterator
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 from aihub_web.schedule import describe, next_run, parse_schedule
 from pydantic import ValidationError
 
-ZONEINFO = Path("/usr/share/zoneinfo")
 LA = "America/Los_Angeles"
-
-
-@pytest.fixture
-def tz(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
-    """Sets the process time zone for one test (the schedule math reads the system's, through the C library)."""
-
-    def use(name: str) -> None:
-        if not (ZONEINFO / name).exists():
-            pytest.skip(f"no zone database for {name}")
-        monkeypatch.setenv("TZ", name)
-        time.tzset()
-
-    yield use
-    monkeypatch.undo()
-    time.tzset()
 
 
 def ms(wall: str) -> int:
