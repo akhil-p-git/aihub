@@ -15,7 +15,7 @@ import httpx2
 import pytest
 import uvicorn
 from aihub_web.chat import ChatRequest
-from aihub_web.config import Config
+from aihub_web.config import Config, Limits
 from aihub_web.db import Store
 from aihub_web.providers import Finish, ProviderError, Text, Thinking, Usage
 from aihub_web.security import CSP, SecurityMiddleware
@@ -34,6 +34,7 @@ from helpers import (
     handler_for,
     make_service,
     serve_engine,
+    utc_ms,
     webp,
 )
 from starlette.testclient import TestClient
@@ -47,7 +48,7 @@ HAIKU = "anthropic/claude-haiku-5-5"
 TOKEN = secrets.token_urlsafe(32)
 
 
-def build(tmp_path: Path, environ=KEYS, **config):
+def build(tmp_path: Path, environ=KEYS, options: dict | None = None, **config):
     fakes = {
         "openrouter": FakeProvider(Text("Hello"), Finish("stop")),
         "ollama": FakeProvider(Text("Hi"), Finish("stop")),
@@ -60,6 +61,7 @@ def build(tmp_path: Path, environ=KEYS, **config):
         providers=fakes,
         today=lambda: TODAY,
         image_pacing=FAST_PACING,
+        **(options or {}),
     )
     return app, fakes
 
@@ -824,6 +826,7 @@ class TestImageModelsInTheLists:
             "providers",
             "chats",
             "projects",
+            "tasks",
             "settings",
             "retention_days",
         }
@@ -857,6 +860,7 @@ class TestImageModelsInTheLists:
             "providers",
             "chats",
             "projects",
+            "tasks",
             "settings",
             "retention_days",
         }
@@ -1559,3 +1563,483 @@ class TestChatsInProjects:
         )
         assert error_of(response) == (404, "no_project")
         assert api.get(f"/api/chats/{chat_id}").json()["chat"]["project_id"] is None
+
+
+DAILY = {"kind": "daily", "time": "08:00"}
+NOW = utc_ms("2027-01-15 08:00")  # where the Clock starts
+TOMORROW = utc_ms("2027-01-16 08:00")
+
+
+BASE_TASK = {"name": "x", "prompt": "p", "model": LOCAL, "schedule": DAILY}
+
+
+def new_task(client: TestClient, name: str = "Morning digest", **fields) -> dict:
+    body = {
+        "name": name,
+        "prompt": "Summarise my day.",
+        "model": LOCAL,
+        "schedule": DAILY,
+        **fields,
+    }
+    response = client.post("/api/tasks", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def tasks_of(client: TestClient) -> list[dict]:
+    return client.get("/api/tasks").json()["tasks"]
+
+
+def seeded_task(store: Store, **fields):
+    fields.setdefault("model", LOCAL)
+    return store.create_task(
+        "Morning digest",
+        prompt="Summarise my day.",
+        effort=None,
+        schedule=DAILY,
+        **fields,
+    )
+
+
+@contextlib.contextmanager
+def tasks_app(tmp_path: Path, tz, *, seed=None, tick: float = 3600.0, **config):
+    """The app on a clock that starts at 2027-01-15 08:00 UTC, with a tick so long that the scheduler leaves
+    tasks alone unless a test asks for it. `seed(store)` fills the database before the app starts."""
+    tz("UTC")
+    if seed:
+        store = Store(tmp_path / "chats.db")
+        seed(store)
+        store.close()
+    clock = Clock()
+    app, fakes = build(tmp_path, options={"clock": clock, "task_tick": tick}, **config)
+    with TestClient(app, base_url=BASE) as client:
+        client.fakes, client.clock = fakes, clock
+        yield client
+
+
+@pytest.fixture
+def tasks_api(tmp_path: Path, tz):
+    with tasks_app(tmp_path, tz) as client:
+        yield client
+
+
+def finished_task(client: TestClient, index: int = 0) -> dict | None:
+    task = tasks_of(client)[index]
+    return task if task["last_status"] and not task["running"] else None
+
+
+class TestTasksApi:
+    def test_there_are_none_to_begin_with(self, tasks_api: TestClient) -> None:
+        assert tasks_api.get("/api/tasks").json() == {"tasks": []}
+        assert tasks_api.get("/api/bootstrap").json()["tasks"] == []
+
+    def test_a_new_task_is_listed_and_in_the_bootstrap(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(
+            tasks_api,
+            "  Morning   digest ",
+            prompt="  Summarise my day.\n",
+            effort="on",
+        )
+        assert (made["name"], made["prompt"]) == ("Morning digest", "Summarise my day.")
+        assert (made["model"], made["effort"], made["schedule"]) == (LOCAL, "on", DAILY)
+        assert made["schedule_text"] == "Every day at 08:00"
+        assert (made["enabled"], made["next_run_at"]) == (True, TOMORROW)
+        assert (made["last_status"], made["last_chat_id"]) == (None, None)
+        assert (made["failures"], made["running"], made["project_id"]) == (
+            0,
+            False,
+            None,
+        )
+        assert re.fullmatch(r"[0-9a-f]{16}", made["id"])
+        assert tasks_of(tasks_api) == [made]
+        assert tasks_api.get("/api/bootstrap").json()["tasks"] == [made]
+
+    def test_the_list_is_by_name(self, tasks_api: TestClient) -> None:
+        for name in ("beta", "Alpha", "Zed"):
+            new_task(tasks_api, name)
+        assert [t["name"] for t in tasks_of(tasks_api)] == ["Alpha", "beta", "Zed"]
+
+    def test_a_task_made_while_off_has_no_next_run(self, tasks_api: TestClient) -> None:
+        made = new_task(tasks_api, enabled=False)
+        assert (made["enabled"], made["next_run_at"]) == (False, None)
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"name": ""},
+            {"name": "   "},
+            {"name": "x" * 81},
+            {"name": 7},
+            {"prompt": ""},
+            {"prompt": " \n "},
+            {"model": ""},
+            {"model": "m" * 201},
+            {"effort": "x" * 17},
+            {"schedule": {"kind": "hourly", "every": 5}},
+            {"schedule": {"kind": "daily", "time": "8:00"}},
+            {"schedule": {"kind": "weekly", "day": 7, "time": "08:00"}},
+            {"schedule": {"kind": "daily", "time": "08:00", "zone": "UTC"}},
+            {"schedule": "daily"},
+            {"project_id": "nope"},
+            {"enabled": "yes"},
+            {"colour": "red"},
+            {"name": None},
+            {"prompt": None},
+            {"model": None},
+            {"schedule": None},
+        ],
+    )
+    def test_a_task_that_does_not_fit_is_refused(
+        self, tasks_api: TestClient, change: dict
+    ) -> None:
+        response = tasks_api.post("/api/tasks", json={**BASE_TASK, **change})
+        assert error_of(response) == (422, "invalid")
+        assert tasks_of(tasks_api) == []
+
+    @pytest.mark.parametrize("missing", ["name", "prompt", "model", "schedule"])
+    def test_every_part_is_needed(self, tasks_api: TestClient, missing: str) -> None:
+        body = {k: v for k, v in BASE_TASK.items() if k != missing}
+        assert error_of(tasks_api.post("/api/tasks", json=body)) == (422, "invalid")
+
+    def test_a_prompt_over_the_limit_is_refused(self, tmp_path: Path, tz) -> None:
+        with tasks_app(tmp_path, tz, limits=Limits(max_message_chars=20)) as client:
+            response = client.post("/api/tasks", json={**BASE_TASK, "prompt": "x" * 21})
+            assert error_of(response) == (413, "too_long")
+            assert response.json()["error"]["message"] == (
+                "A prompt is limited to 20 characters."
+            )
+            new_task(client, prompt="x" * 20)  # exactly the limit is fine
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            (FREE, (422, "task_model")),
+            (HAIKU, (422, "task_model")),
+            ("ollama/not-installed:1b", (400, "unknown_model")),
+        ],
+    )
+    def test_only_a_model_on_this_pc_is_accepted(
+        self, tasks_api: TestClient, model: str, expected: tuple[int, str]
+    ) -> None:
+        response = tasks_api.post("/api/tasks", json={**BASE_TASK, "model": model})
+        assert error_of(response) == expected
+        assert tasks_of(tasks_api) == []
+        if expected[1] == "task_model":
+            assert response.json()["error"]["message"] == (
+                "A scheduled task can only use a text model that runs on this PC."
+            )
+
+    def test_a_project_must_exist(self, tasks_api: TestClient) -> None:
+        missing = tasks_api.post(
+            "/api/tasks", json={**BASE_TASK, "project_id": "0123456789abcdef"}
+        )
+        assert error_of(missing) == (404, "no_project")
+        project = new_project(tasks_api, "Home")
+        made = new_task(tasks_api, project_id=project["id"])
+        assert made["project_id"] == project["id"]
+
+    def test_there_is_room_for_fifty(self, tasks_api: TestClient) -> None:
+        for n in range(50):
+            new_task(tasks_api, f"Task {n:02}")
+        response = tasks_api.post("/api/tasks", json=BASE_TASK)
+        assert error_of(response) == (409, "too_many_tasks")
+        assert len(tasks_of(tasks_api)) == 50
+
+
+class TestEditingTasks:
+    def test_fields_can_be_changed_one_at_a_time(self, tasks_api: TestClient) -> None:
+        made = new_task(tasks_api)
+        project = new_project(tasks_api, "Home")
+        url = f"/api/tasks/{made['id']}"
+
+        changed = tasks_api.patch(
+            url,
+            json={
+                "name": " New  name ",
+                "prompt": " Other. ",
+                "effort": "off",
+                "project_id": project["id"],
+            },
+        ).json()
+
+        assert (changed["name"], changed["prompt"], changed["effort"]) == (
+            "New name",
+            "Other.",
+            "off",
+        )
+        assert changed["project_id"] == project["id"]
+        assert (changed["schedule"], changed["next_run_at"]) == (DAILY, TOMORROW)
+        cleared = tasks_api.patch(url, json={"effort": None, "project_id": None}).json()
+        assert (cleared["effort"], cleared["project_id"]) == (None, None)
+        assert tasks_of(tasks_api) == [cleared]
+
+    def test_a_new_schedule_moves_the_next_run_from_now(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(tasks_api)
+        changed = tasks_api.patch(
+            f"/api/tasks/{made['id']}",
+            json={"schedule": {"kind": "hourly", "every": 2}},
+        ).json()
+        assert changed["schedule_text"] == "Every 2 hours"
+        assert changed["next_run_at"] == utc_ms("2027-01-15 10:00")
+
+    def test_a_new_schedule_for_a_task_that_is_off_leaves_it_off(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(tasks_api, enabled=False)
+        changed = tasks_api.patch(
+            f"/api/tasks/{made['id']}",
+            json={"schedule": {"kind": "hourly", "every": 2}},
+        ).json()
+        assert (changed["enabled"], changed["next_run_at"]) == (False, None)
+
+    def test_switching_off_clears_the_next_run_and_on_sets_it_from_now(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(tasks_api)
+        url = f"/api/tasks/{made['id']}"
+        off = tasks_api.patch(url, json={"enabled": False}).json()
+        assert (off["enabled"], off["next_run_at"]) == (False, None)
+        tasks_api.clock.advance(days=2, seconds=3600)  # 2027-01-17 09:00
+        on = tasks_api.patch(url, json={"enabled": True}).json()
+        assert (on["enabled"], on["next_run_at"]) == (True, utc_ms("2027-01-18 08:00"))
+
+    def test_saying_on_again_leaves_the_next_run_alone(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(tasks_api)
+        tasks_api.clock.advance(3600)
+        again = tasks_api.patch(
+            f"/api/tasks/{made['id']}", json={"enabled": True}
+        ).json()
+        assert again["next_run_at"] == TOMORROW
+
+    def test_switching_on_after_three_failures_starts_afresh(
+        self, tmp_path: Path, tz
+    ) -> None:
+        def seed(store: Store) -> None:
+            task = seeded_task(store, enabled=False)
+            store.update_task(
+                task.id,
+                {
+                    "failures": 3,
+                    "last_status": "error",
+                    "last_error": "Switched off after 3 failed runs in a row. The last one: Gone.",
+                    "last_run_at": NOW,
+                },
+            )
+
+        with tasks_app(tmp_path, tz, seed=seed) as client:
+            (task,) = tasks_of(client)
+            on = client.patch(f"/api/tasks/{task['id']}", json={"enabled": True}).json()
+            assert (on["failures"], on["last_status"], on["last_error"]) == (
+                0,
+                None,
+                None,
+            )
+            assert (on["last_run_at"], on["next_run_at"]) == (None, TOMORROW)
+
+    def test_pausing_by_hand_keeps_the_last_result(self, tmp_path: Path, tz) -> None:
+        def seed(store: Store) -> None:
+            task = seeded_task(store, next_run_at=TOMORROW)
+            store.update_task(task.id, {"last_status": "done", "last_run_at": NOW})
+
+        with tasks_app(tmp_path, tz, seed=seed) as client:
+            (task,) = tasks_of(client)
+            url = f"/api/tasks/{task['id']}"
+            client.patch(url, json={"enabled": False})
+            on = client.patch(url, json={"enabled": True}).json()
+            assert (on["last_status"], on["last_run_at"], on["failures"]) == (
+                "done",
+                NOW,
+                0,
+            )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"name": None},
+            {"prompt": None},
+            {"model": None},
+            {"schedule": None},
+            {"enabled": None},
+            {"name": ""},
+            {"prompt": "   "},
+            {"schedule": {"kind": "daily"}},
+            {"project_id": "nope"},
+            {"colour": "red"},
+        ],
+    )
+    def test_an_edit_that_does_not_fit_is_refused(
+        self, tasks_api: TestClient, body: dict
+    ) -> None:
+        made = new_task(tasks_api)
+        response = tasks_api.patch(f"/api/tasks/{made['id']}", json=body)
+        assert error_of(response) == (422, "invalid")
+        assert tasks_of(tasks_api) == [made]
+
+    def test_an_edit_gets_the_checks_of_creation(self, tmp_path: Path, tz) -> None:
+        with tasks_app(tmp_path, tz, limits=Limits(max_message_chars=20)) as client:
+            made = new_task(client)
+            url = f"/api/tasks/{made['id']}"
+            assert error_of(client.patch(url, json={"model": FREE})) == (
+                422,
+                "task_model",
+            )
+            assert error_of(client.patch(url, json={"model": "ollama/nope:1b"})) == (
+                400,
+                "unknown_model",
+            )
+            assert error_of(
+                client.patch(url, json={"project_id": "0123456789abcdef"})
+            ) == (404, "no_project")
+            assert error_of(client.patch(url, json={"prompt": "x" * 21})) == (
+                413,
+                "too_long",
+            )
+            assert tasks_of(client) == [made]
+
+    @pytest.mark.parametrize("task_id", ["0123456789abcdef", "x"])
+    def test_a_task_that_does_not_exist_is_not_found(
+        self, tasks_api: TestClient, task_id: str
+    ) -> None:
+        for response in (
+            tasks_api.patch(f"/api/tasks/{task_id}", json={"enabled": False}),
+            tasks_api.delete(f"/api/tasks/{task_id}"),
+            tasks_api.post(f"/api/tasks/{task_id}/run"),
+        ):
+            assert error_of(response) in {(404, "no_task"), (404, "not_found")}
+
+
+class TestRunningTasks:
+    def test_run_now_answers_at_once_with_the_chat(self, tasks_api: TestClient) -> None:
+        tasks_api.fakes["ollama"].script = [Text("Do the laundry."), Finish("stop")]
+        made = new_task(tasks_api)
+
+        response = tasks_api.post(f"/api/tasks/{made['id']}/run")
+
+        assert response.status_code == 202
+        chat_id = response.json()["chat_id"]
+        done = wait_for(lambda: finished_task(tasks_api))
+        assert (done["last_status"], done["last_chat_id"]) == ("done", chat_id)
+        assert done["next_run_at"] == made["next_run_at"]  # the schedule is left alone
+        body = tasks_api.get(f"/api/chats/{chat_id}").json()
+        assert body["chat"]["title"] == "Morning digest, 15 Jan 2027"
+        assert body["chat"]["task_id"] == made["id"]
+        assert body["messages"][-1]["content"] == "Do the laundry."
+        assert any(
+            c["task_id"] == made["id"]
+            for c in tasks_api.get("/api/chats").json()["chats"]
+        )
+
+    def test_the_list_says_which_task_is_running(self, tasks_api: TestClient) -> None:
+        started = threading.Event()
+        tasks_api.fakes["ollama"].script = [Text("Half an"), started.set, HANG]
+        made = new_task(tasks_api)
+        tasks_api.post(f"/api/tasks/{made['id']}/run")
+        assert started.wait(5)
+        assert [t["running"] for t in tasks_of(tasks_api)] == [True]
+
+    def test_a_second_run_while_one_is_running_is_refused(
+        self, tasks_api: TestClient
+    ) -> None:
+        started = threading.Event()
+        tasks_api.fakes["ollama"].script = [Text("Half an"), started.set, HANG]
+        first, second = new_task(tasks_api, "One"), new_task(tasks_api, "Two")
+        assert tasks_api.post(f"/api/tasks/{first['id']}/run").status_code == 202
+        assert started.wait(5)
+
+        response = tasks_api.post(f"/api/tasks/{second['id']}/run")
+
+        assert error_of(response) == (429, "busy")
+        assert response.json()["error"]["message"] == (
+            "Another scheduled task is running. Try again when it finishes."
+        )
+
+    def test_a_model_that_is_gone_is_said_so_and_counts_for_nothing(
+        self, tmp_path: Path, tz
+    ) -> None:
+        def seed(store: Store) -> None:
+            seeded_task(store, model="ollama/not-installed:1b", next_run_at=TOMORROW)
+
+        with tasks_app(tmp_path, tz, seed=seed) as client:
+            (task,) = tasks_of(client)
+            response = client.post(f"/api/tasks/{task['id']}/run")
+            assert error_of(response) == (409, "cannot_run")
+            assert response.json()["error"]["message"] == (
+                "There is no model called ollama/not-installed:1b."
+            )
+            assert tasks_of(client)[0]["failures"] == 0
+
+    def test_deleting_a_task_keeps_the_chats_it_made(
+        self, tasks_api: TestClient
+    ) -> None:
+        made = new_task(tasks_api)
+        chat_id = tasks_api.post(f"/api/tasks/{made['id']}/run").json()["chat_id"]
+        wait_for(lambda: finished_task(tasks_api))
+
+        assert tasks_api.delete(f"/api/tasks/{made['id']}").status_code == 204
+
+        assert tasks_of(tasks_api) == []
+        kept = tasks_api.get(f"/api/chats/{chat_id}").json()["chat"]
+        assert kept["task_id"] is None
+
+    def test_the_scheduler_runs_a_due_task_while_the_app_is_up(
+        self, tmp_path: Path, tz
+    ) -> None:
+        def seed(store: Store) -> None:
+            seeded_task(store, next_run_at=NOW - 3_600_000)  # an hour overdue
+
+        with tasks_app(tmp_path, tz, seed=seed, tick=0.01) as client:
+            done = wait_for(lambda: finished_task(client))
+            assert done["last_status"] == "done" and done["next_run_at"] == TOMORROW
+
+    def test_a_run_in_flight_when_the_app_stops_is_saved_as_stopped(
+        self, tmp_path: Path, tz
+    ) -> None:
+        started = threading.Event()
+        with tasks_app(tmp_path, tz) as client:
+            client.fakes["ollama"].script = [Text("Half an"), started.set, HANG]
+            made = new_task(client)
+            chat_id = client.post(f"/api/tasks/{made['id']}/run").json()["chat_id"]
+            assert started.wait(5)
+        store = Store(tmp_path / "chats.db")
+        reply = store.messages(chat_id)[-1]
+        assert (reply.content, reply.status) == ("Half an", "stopped")
+        store.close()
+
+    def test_a_scheduled_run_in_flight_when_the_app_stops_is_saved_as_stopped(
+        self, tmp_path: Path, tz
+    ) -> None:
+        started = threading.Event()
+
+        def seed(store: Store) -> None:
+            seeded_task(
+                store, next_run_at=NOW + 60_000
+            )  # not due until the clock moves
+
+        with tasks_app(tmp_path, tz, seed=seed, tick=0.01) as client:
+            client.fakes["ollama"].script = [Text("Half an"), started.set, HANG]
+            client.clock.advance(120)
+            assert started.wait(5)
+        store = Store(tmp_path / "chats.db")
+        (chat,) = store.list_chats()
+        reply = store.messages(chat.id)[-1]
+        assert (reply.content, reply.status) == ("Half an", "stopped")
+        store.close()
+
+    def test_an_unreadable_schedule_does_not_break_the_page(
+        self, tmp_path: Path, tz
+    ) -> None:
+        def seed(store: Store) -> None:
+            task = seeded_task(store, next_run_at=TOMORROW)
+            store.update_task(task.id, {"schedule": {"kind": "fortnightly"}})
+
+        with tasks_app(tmp_path, tz, seed=seed) as client:
+            assert client.get("/api/bootstrap").status_code == 200
+            (task,) = tasks_of(client)
+            assert task["schedule_text"] == "Unreadable schedule"

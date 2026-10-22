@@ -8,7 +8,7 @@ import mimetypes
 import os
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -38,13 +38,15 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from .catalog import Catalog
-from .chat import ApiError, ChatRequest, ChatService
+from .chat import TASK_MODEL_MESSAGE, ApiError, ChatRequest, ChatService, runs_tasks
 from .config import Config, secret
-from .db import Project, Store
+from .db import Project, Store, Task
 from .images import PACING, GpuLock, ImageJobs, Pacing
 from .providers import Provider, build_providers
 from .providers.images import EngineClient
+from .schedule import Schedule, describe, next_run, parse_schedule
 from .security import SecurityMiddleware
+from .tasks import SWITCHED_OFF, TICK_SECONDS, RunResult, Scheduler
 
 log = logging.getLogger(__name__)
 
@@ -52,10 +54,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 CHAT_ID = re.compile(r"[0-9a-f]{16}")
 IMAGE_ID = re.compile(r"[0-9a-f]{16}")
 PROJECT_ID = re.compile(r"[0-9a-f]{16}")
+TASK_ID = re.compile(r"[0-9a-f]{16}")
 # What a person may write: the same room for the standing instructions and for a project's.
 INSTRUCTIONS_MAX = 4000
 PROJECT_NAME_MAX = 80
 MAX_PROJECTS = 100
+TASK_NAME_MAX = 80
+MAX_TASKS = 50
 # A message may be 100,000 characters, which is under 400 KB even if every one takes four bytes.
 BODY_LIMIT = 1024 * 1024
 MAINTENANCE_INTERVAL = 60.0
@@ -143,6 +148,68 @@ class DropProject(_Body):
     chats: Literal["keep", "delete"] = "keep"
 
 
+def _prompt_text(value: str) -> str:
+    if not value.strip():
+        raise ValueError("prompt is empty")
+    return value
+
+
+class NewTask(_Body):
+    name: str
+    prompt: str
+    model: str = Field(min_length=1, max_length=200)
+    effort: str | None = Field(None, max_length=16)
+    schedule: Schedule
+    project_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
+    enabled: bool = Field(True, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _one_line(value, TASK_NAME_MAX, "name")
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, value: str) -> str:
+        return _prompt_text(value)
+
+
+class EditTask(_Body):
+    """A key that is absent is left alone. effort and project_id may be null (the model's usual level, no
+    project); the others may not."""
+
+    name: str | None = None
+    prompt: str | None = None
+    model: str | None = Field(None, min_length=1, max_length=200)
+    effort: str | None = Field(None, max_length=16)
+    schedule: Schedule | None = None
+    project_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
+    enabled: bool | None = Field(None, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("name can't be null")
+        return _one_line(value, TASK_NAME_MAX, "name")
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("prompt can't be null")
+        return _prompt_text(value)
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> "EditTask":
+        if not self.model_fields_set:
+            raise ValueError("nothing to change")
+        for key in ("model", "schedule", "enabled"):
+            if key in self.model_fields_set and getattr(self, key) is None:
+                raise ValueError(f"{key} can't be null")
+        return self
+
+
 class Settings(_Body):
     instructions: str = Field(max_length=INSTRUCTIONS_MAX)
 
@@ -161,6 +228,11 @@ class Context:
     store: Store
     catalog: Catalog
     service: ChatService
+    scheduler: Scheduler
+    clock: Callable[[], float]
+
+    def now_ms(self) -> int:
+        return round(self.clock() * 1000)
 
 
 class Static(StaticFiles):
@@ -209,6 +281,51 @@ def project_or_404(ctx: Context, project_id: str) -> Project:
     return project
 
 
+def task_or_404(ctx: Context, task_id: str) -> Task:
+    task = ctx.store.get_task(task_id) if TASK_ID.fullmatch(task_id) else None
+    if task is None:
+        raise ApiError(404, "no_task", "That task no longer exists.")
+    return task
+
+
+def task_json(ctx: Context, task: Task) -> dict[str, object]:
+    """The task, and how its schedule reads and whether it is running now. A schedule this code cannot read
+    must not stop the page from loading, so it reads as such."""
+    try:
+        words = describe(parse_schedule(task.schedule))
+    except ValueError:
+        words = "Unreadable schedule"
+    return {
+        **task.to_json(),
+        "schedule_text": words,
+        "running": task.id in ctx.scheduler.running,
+    }
+
+
+def checked_prompt(ctx: Context, prompt: str) -> str:
+    cleaned = prompt.strip()
+    if len(cleaned) > ctx.cfg.limits.max_message_chars:
+        raise ApiError(
+            413,
+            "too_long",
+            f"A prompt is limited to {ctx.cfg.limits.max_message_chars:,} characters.",
+        )
+    return cleaned
+
+
+def check_task_model(ctx: Context, model_id: str) -> None:
+    model = ctx.catalog.get(model_id)
+    if model is None:
+        raise ApiError(400, "unknown_model", f"There is no model called {model_id}.")
+    if not runs_tasks(model):
+        raise ApiError(422, "task_model", TASK_MODEL_MESSAGE)
+
+
+def check_project(ctx: Context, project_id: str | None) -> None:
+    if project_id and ctx.store.get_project(project_id) is None:
+        raise ApiError(404, "no_project", "That project no longer exists.")
+
+
 async def refresh_briefly(
     catalog: Catalog, timeout: float, *, force: bool = False
 ) -> None:
@@ -237,6 +354,7 @@ async def bootstrap(request: Request) -> Response:
             **models_payload(ctx),
             "chats": [c.to_json() for c in ctx.store.list_chats()],
             "projects": [p.to_json() for p in ctx.store.list_projects()],
+            "tasks": [task_json(ctx, t) for t in ctx.store.list_tasks()],
             "settings": {"instructions": ctx.store.get_setting("instructions")},
             "retention_days": ctx.cfg.retention_days,
         }
@@ -358,6 +476,98 @@ async def delete_project(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def list_tasks(request: Request) -> Response:
+    ctx = ctx_of(request)
+    return JSONResponse({"tasks": [task_json(ctx, t) for t in ctx.store.list_tasks()]})
+
+
+async def create_task(request: Request) -> Response:
+    ctx = ctx_of(request)
+    body = await read_json(request, NewTask)
+    if ctx.store.count_tasks() >= MAX_TASKS:
+        raise ApiError(
+            409,
+            "too_many_tasks",
+            f"You can have {MAX_TASKS} scheduled tasks. Delete one to make room.",
+        )
+    prompt = checked_prompt(ctx, body.prompt)
+    check_task_model(ctx, body.model)
+    check_project(ctx, body.project_id)
+    task = ctx.store.create_task(
+        body.name,
+        prompt=prompt,
+        model=body.model,
+        effort=body.effort,
+        schedule=body.schedule.model_dump(),
+        project_id=body.project_id,
+        enabled=body.enabled,
+        next_run_at=next_run(body.schedule, ctx.now_ms()) if body.enabled else None,
+    )
+    return JSONResponse(task_json(ctx, task), status_code=201)
+
+
+async def patch_task(request: Request) -> Response:
+    ctx = ctx_of(request)
+    task = task_or_404(ctx, request.path_params["task_id"])
+    body = await read_json(request, EditTask)
+    given = body.model_fields_set
+    changes: dict[str, object] = {}
+    if "name" in given:
+        changes["name"] = body.name
+    if "prompt" in given:
+        changes["prompt"] = checked_prompt(ctx, body.prompt or "")
+    if "model" in given:
+        check_task_model(ctx, body.model or "")
+        changes["model"] = body.model
+    if "effort" in given:
+        changes["effort"] = body.effort
+    if "project_id" in given:
+        check_project(ctx, body.project_id)
+        changes["project_id"] = body.project_id
+    if "schedule" in given:
+        assert body.schedule is not None, "a schedule can't be null"
+        changes["schedule"] = body.schedule.model_dump()
+    enabled = task.enabled if body.enabled is None else body.enabled
+    if body.enabled is not None:
+        changes["enabled"] = enabled
+    # The next run belongs to the schedule: it is set when the task goes on or its schedule changes, and cleared
+    # when it goes off. Saving anything else leaves it where it is.
+    if not enabled:
+        changes["next_run_at"] = None
+    elif "schedule" in given or not task.enabled:
+        schedule = body.schedule or parse_schedule(task.schedule)
+        changes["next_run_at"] = next_run(schedule, ctx.now_ms())
+    if enabled and not task.enabled:
+        changes["failures"] = 0
+        # If the scheduler switched it off, the reason is gone and so is the explanation of it.
+        if (task.last_error or "").startswith(SWITCHED_OFF):
+            changes.update(
+                last_status=None, last_error=None, last_chat_id=None, last_run_at=None
+            )
+    updated = ctx.store.update_task(task.id, changes)
+    return JSONResponse(task_json(ctx, updated) if updated else {})
+
+
+async def delete_task(request: Request) -> Response:
+    ctx = ctx_of(request)
+    task = task_or_404(ctx, request.path_params["task_id"])
+    ctx.store.delete_task(task.id)
+    return Response(status_code=204)
+
+
+async def run_task_now(request: Request) -> Response:
+    ctx = ctx_of(request)
+    task = task_or_404(ctx, request.path_params["task_id"])
+    outcome = ctx.scheduler.run_now(task)
+    if isinstance(outcome, RunResult):
+        raise ApiError(
+            429 if outcome.status == "busy" else 409,
+            "busy" if outcome.status == "busy" else "cannot_run",
+            outcome.error,
+        )
+    return JSONResponse({"chat_id": outcome.chat_id}, status_code=202)
+
+
 async def delete_chat(request: Request) -> Response:
     ctx = ctx_of(request)
     chat = chat_or_404(ctx, request.path_params["chat_id"])
@@ -436,9 +646,11 @@ def create_app(
     providers: Mapping[str, Provider] | None = None,
     today=date.today,
     image_pacing: Pacing = PACING,
+    clock: Callable[[], float] = time.time,
+    task_tick: float = TICK_SECONDS,
 ) -> Starlette:
-    """`transport`, `providers` and `image_pacing` exist so tests can swap the network and the models out
-    and make image jobs look at the engine more often."""
+    """`transport`, `providers`, `image_pacing`, `clock` and `task_tick` exist so tests can swap the network and
+    the models out, make image jobs look at the engine more often, and wind the scheduler's clock by hand."""
 
     # Set by the desktop shell, which gives only its own window the matching cookie; the service sets none.
     launch_token = secret("AIHUB_LAUNCH_TOKEN", environ)
@@ -469,19 +681,29 @@ def create_app(
             today=today,
             images=images,
         )
-        ctx = app.state.ctx = Context(cfg, store, catalog, service)
+        scheduler = Scheduler(store, service, now=clock, tick=task_tick)
+        ctx = app.state.ctx = Context(cfg, store, catalog, service, scheduler, clock)
         store.purge_expired(cfg.retention_days)
         await refresh_briefly(catalog, 6.0, force=True)
         task = asyncio.create_task(maintenance(ctx))
+        # After the first refresh, so that a task due at start-up sees the models that are there.
+        scheduling = asyncio.create_task(scheduler.run_forever())
         try:
             yield
         finally:
+            # Replies in progress, scheduled or started by hand, are saved as stopped with what had arrived.
+            scheduling.cancel()
+            await scheduler.stop()
             if images:
                 # Images in the making are saved as stopped; the engine is left to finish and idle out.
                 await images.shutdown()
             task.cancel()
+            # Both are cancelled before either is awaited: a request that uvicorn has cancelled is still
+            # unwinding, and one more turn of the loop here lets it end with a traceback in the log.
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduling
             await client.aclose()
             store.close()
 
@@ -502,6 +724,11 @@ def create_app(
             Route("/api/projects", create_project, methods=["POST"]),
             Route("/api/projects/{project_id}", patch_project, methods=["PATCH"]),
             Route("/api/projects/{project_id}", delete_project, methods=["DELETE"]),
+            Route("/api/tasks", list_tasks),
+            Route("/api/tasks", create_task, methods=["POST"]),
+            Route("/api/tasks/{task_id}", patch_task, methods=["PATCH"]),
+            Route("/api/tasks/{task_id}", delete_task, methods=["DELETE"]),
+            Route("/api/tasks/{task_id}/run", run_task_now, methods=["POST"]),
             Route("/api/settings", put_settings, methods=["PUT"]),
             Route(
                 "/api/{rest:path}",
