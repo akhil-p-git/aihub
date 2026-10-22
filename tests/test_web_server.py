@@ -981,7 +981,9 @@ class TestMakingImagesOverHttp:
         ]
         for n, (chat_id, image_id) in enumerate(rows):
             raw.execute(
-                "INSERT INTO chats VALUES (?, 't', 'm', NULL, 1, 1)", (chat_id,)
+                "INSERT INTO chats (id, title, model, effort, created_at, updated_at)"
+                " VALUES (?, 't', 'm', NULL, 1, 1)",
+                (chat_id,),
             )
             raw.execute(
                 "INSERT INTO messages VALUES (?, ?, 1, 'assistant', '', NULL, NULL, NULL, NULL, 'done', NULL, 1)",

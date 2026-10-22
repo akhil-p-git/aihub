@@ -453,13 +453,21 @@ def user_version(raw: sqlite3.Connection) -> int:
     return raw.execute("PRAGMA user_version").fetchone()[0]
 
 
+# The columns the version 1 tables had: later versions add columns, and what they must keep is these.
+V1_COLUMNS = {
+    "chats": "id, title, model, effort, created_at, updated_at",
+    "messages": "*",
+    "settings": "*",
+}
+
+
 def rows_of(path: Path) -> dict[str, list[tuple]]:
     """Every row of the version 1 tables, read without going through the app."""
     raw = sqlite3.connect(path)
     try:
         return {
-            table: raw.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
-            for table in ("chats", "messages", "settings")
+            table: raw.execute(f"SELECT {columns} FROM {table} ORDER BY 1").fetchall()
+            for table, columns in V1_COLUMNS.items()
         }
     finally:
         raw.close()
@@ -478,6 +486,12 @@ def schema_of(path: Path) -> list[tuple]:
 def v1_copy(tmp_path: Path, name: str = "chats.db") -> Path:
     path = tmp_path / name
     shutil.copy(FIXTURES / "chats-v1.db", path)
+    return path
+
+
+def v2_copy(tmp_path: Path, name: str = "chats.db") -> Path:
+    path = tmp_path / name
+    shutil.copy(FIXTURES / "chats-v2.db", path)
     return path
 
 
@@ -512,7 +526,7 @@ class TestMigration:
         Store(path, clock).close()
         assert rows_of(path) == before
         raw = sqlite3.connect(path)
-        assert user_version(raw) == 2
+        assert user_version(raw) == db_module.SCHEMA_VERSION
         assert {
             name
             for (name,) in raw.execute(
@@ -549,7 +563,7 @@ class TestMigration:
         Store(upgraded, clock).close()
         assert schema_of(upgraded) == schema_of(fresh)
         raw = sqlite3.connect(fresh)
-        assert user_version(raw) == 2
+        assert user_version(raw) == db_module.SCHEMA_VERSION
         raw.close()
 
     def test_opening_a_version_2_file_again_changes_nothing(
@@ -770,3 +784,237 @@ class TestBackup:
             "chats.db.v9.bak",
         ]
         s.close()
+
+
+class TestMigrationToProjects:
+    """chats-v2.db is a real version 2 file: the db.py of commit 21d5fab (schema 2) opened chats-v1.db, which upgraded
+    it, and then stored one chat with a generated image. It holds 4 chats, 10 messages, 1 image and 1 setting."""
+
+    def test_the_fixture_really_is_a_version_2_file(self, tmp_path: Path) -> None:
+        raw = sqlite3.connect(v2_copy(tmp_path))
+        tables = {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert user_version(raw) == 2
+        assert tables == {"chats", "images", "messages", "settings"}
+        assert [
+            raw.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            for t in ("chats", "messages", "images", "settings")
+        ] == [4, 10, 1, 1]
+        raw.close()
+
+    def test_opening_it_adds_projects_and_keeps_every_row(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        untouched = v2_copy(tmp_path, "untouched.db")
+        before = rows_of(untouched)
+        pictures = sqlite3.connect(untouched).execute("SELECT * FROM images").fetchall()
+        path = v2_copy(tmp_path)
+        s = Store(path, clock)
+        assert len(s.list_chats()) == 4
+        assert s.list_projects() == []
+        s.close()
+        assert rows_of(path) == before
+        raw = sqlite3.connect(path)
+        assert raw.execute("SELECT * FROM images").fetchall() == pictures
+        assert user_version(raw) == 3
+        assert raw.execute("SELECT count(*) FROM projects").fetchone()[0] == 0
+        assert (
+            raw.execute(
+                "SELECT count(*) FROM chats WHERE project_id IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        assert {
+            name
+            for (name,) in raw.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'chats_%'"
+            )
+        } == {"chats_updated", "chats_project"}
+        assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+        raw.close()
+
+    def test_an_upgraded_file_has_the_schema_of_a_new_one(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        fresh = tmp_path / "fresh.db"
+        Store(fresh, clock).close()
+        from_v2 = v2_copy(tmp_path)
+        Store(from_v2, clock).close()
+        assert schema_of(from_v2) == schema_of(fresh)
+
+    def test_the_copy_made_first_is_the_version_2_file_untouched(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v2_copy(tmp_path)
+        Store(path, clock).close()
+        [backup] = backups_of(path)
+        assert backup.name == "chats.db.v2.bak"
+        assert backup.read_bytes()[:16] == b"SQLite format 3\0", (
+            "a database a person can open with any SQLite tool"
+        )
+        raw = sqlite3.connect(backup)
+        assert user_version(raw) == 2
+        assert raw.execute("SELECT count(*) FROM chats").fetchone()[0] == 4
+        assert raw.execute("PRAGMA table_info(chats)").fetchall()[-1][1] != "project_id"
+        raw.close()
+
+    def test_a_version_1_file_goes_through_both_steps(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = v1_copy(tmp_path)
+        s = Store(path, clock)
+        project = s.create_project("Trips")
+        trip = next(c for c in s.list_chats() if c.title == "Plan the trip")
+        s.update_chat(trip.id, {"project_id": project.id})
+        assert s.get_chat(trip.id).project_id == project.id
+        s.close()
+
+    def test_old_code_cannot_open_a_version_3_file_and_says_why(
+        self, tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "chats.db"
+        Store(path, clock).close()
+        monkeypatch.setattr(db_module, "SCHEMA_VERSION", 2)
+        with pytest.raises(
+            RuntimeError, match=r"schema 3 is newer than this app \(2\)"
+        ):
+            Store(path, clock)
+
+
+class TestProjects:
+    def test_a_new_project(self, store: Store, clock: Clock) -> None:
+        project = store.create_project("Trips", "Answer in French.")
+        assert re.fullmatch(r"[0-9a-f]{16}", project.id)
+        assert project.to_json() == {
+            "id": project.id,
+            "name": "Trips",
+            "instructions": "Answer in French.",
+            "created_at": int(clock.now * 1000),
+            "updated_at": int(clock.now * 1000),
+            "chat_count": 0,
+        }
+        assert store.get_project(project.id) == project
+        assert store.get_project("0" * 16) is None
+
+    def test_the_list_is_by_name_without_regard_to_case(self, store: Store) -> None:
+        for name in ("beta", "Alpha", "alpha two", "Zed"):
+            store.create_project(name)
+        assert [p.name for p in store.list_projects()] == [
+            "Alpha",
+            "alpha two",
+            "beta",
+            "Zed",
+        ]
+        assert store.count_projects() == 4
+
+    def test_editing_changes_only_what_is_given(
+        self, store: Store, clock: Clock
+    ) -> None:
+        project = store.create_project("Trips", "Be brief.")
+        clock.advance(seconds=5)
+        renamed = store.update_project(project.id, name="Travel")
+        assert (renamed.name, renamed.instructions) == ("Travel", "Be brief.")
+        assert renamed.updated_at == project.updated_at + 5000
+        assert renamed.created_at == project.created_at
+        rewritten = store.update_project(project.id, instructions="")
+        assert (rewritten.name, rewritten.instructions) == ("Travel", "")
+        assert store.update_project("0" * 16, name="x") is None
+
+    def test_a_chat_belongs_to_a_project(self, store: Store) -> None:
+        project = store.create_project("Trips")
+        inside = store.create_chat("in", "ollama/qwen3:8b", None, project.id)
+        outside = store.create_chat("out", "ollama/qwen3:8b", None)
+        assert inside.project_id == project.id and outside.project_id is None
+        assert store.get_chat(inside.id).project_id == project.id
+        assert inside.to_json()["project_id"] == project.id
+        assert {c.id: c.project_id for c in store.list_chats()} == {
+            inside.id: project.id,
+            outside.id: None,
+        }
+        assert store.get_project(project.id).chat_count == 1
+        store.add_message(inside.id, "user", "findme please")
+        assert [c.project_id for c in store.list_chats("findme")] == [project.id]
+
+    def test_a_chat_that_names_no_project_is_refused_by_the_database(
+        self, store: Store
+    ) -> None:
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_chat("x", "ollama/qwen3:8b", None, "f" * 16)
+
+    def test_moving_a_chat_is_not_activity(self, store: Store, clock: Clock) -> None:
+        project = store.create_project("Trips")
+        chat = store.create_chat("c", "ollama/qwen3:8b", None)
+        clock.advance(days=3)
+        moved = store.update_chat(chat.id, {"project_id": project.id})
+        assert moved.project_id == project.id
+        assert moved.updated_at == chat.updated_at
+        free = store.update_chat(chat.id, {"project_id": None})
+        assert free.project_id is None and free.updated_at == chat.updated_at
+        with pytest.raises(sqlite3.IntegrityError):
+            store.update_chat(chat.id, {"project_id": "f" * 16})
+
+    def test_deleting_a_project_can_keep_its_chats(self, store: Store) -> None:
+        project = store.create_project("Trips")
+        chat = store.create_chat("c", "ollama/qwen3:8b", None, project.id)
+        store.add_message(chat.id, "user", "hello")
+        assert store.delete_project(project.id, delete_chats=False) is True
+        assert store.get_project(project.id) is None
+        kept = store.get_chat(chat.id)
+        assert kept is not None and kept.project_id is None
+        assert len(store.messages(chat.id)) == 1
+        assert store.delete_project(project.id, delete_chats=False) is False
+
+    def test_deleting_a_project_can_take_its_chats_and_only_its_chats(
+        self, store: Store
+    ) -> None:
+        project = store.create_project("Trips")
+        other = store.create_project("Work")
+        mine = [
+            store.create_chat(f"c{i}", "ollama/qwen3:8b", None, project.id)
+            for i in range(2)
+        ]
+        theirs = store.create_chat("w", "ollama/qwen3:8b", None, other.id)
+        free = store.create_chat("f", "ollama/qwen3:8b", None)
+        for chat in (*mine, theirs, free):
+            store.add_message(chat.id, "user", "x")
+        assert store.delete_project(project.id, delete_chats=True) is True
+        assert [store.get_chat(c.id) for c in mine] == [None, None]
+        assert store.messages(mine[0].id) == []
+        assert store.get_chat(theirs.id).project_id == other.id
+        assert store.get_chat(free.id) is not None
+        assert store.delete_project("0" * 16, delete_chats=True) is False
+        assert len(store.list_chats()) == 2
+
+    def test_deleted_chat_text_leaves_the_file_with_the_project(
+        self, tmp_path: Path, clock: Clock
+    ) -> None:
+        path = tmp_path / "chats.db"
+        s = Store(path, clock)
+        project = s.create_project("Trips")
+        chat = s.create_chat("c", "ollama/qwen3:8b", None, project.id)
+        # The text is long, so it spans overflow pages whose pointers break it up: look for the short repeated unit.
+        marker = b"project-marker-7f3a-"
+        s.add_message(chat.id, "user", (marker * 300).decode())
+        wal = tmp_path / "chats.db-wal"
+        assert marker in path.read_bytes() + wal.read_bytes()
+        s.delete_project(project.id, delete_chats=True)
+        raw = path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+        s.close()
+        assert marker not in raw
+
+    def test_projects_outlive_their_chats(self, store: Store, clock: Clock) -> None:
+        project = store.create_project("Trips", "Be brief.")
+        chat = store.create_chat("c", "ollama/qwen3:8b", None, project.id)
+        store.add_message(chat.id, "user", "x")
+        clock.advance(days=400)
+        assert store.purge_expired(30) == 1
+        assert store.get_project(project.id).chat_count == 0
+        other = store.create_chat("d", "ollama/qwen3:8b", None, project.id)
+        store.add_message(other.id, "user", "y")
+        assert store.delete_all() == 1
+        assert [p.name for p in store.list_projects()] == ["Trips"]

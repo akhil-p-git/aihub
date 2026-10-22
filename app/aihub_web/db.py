@@ -21,7 +21,7 @@ DAY_MS = 86_400_000
 # old copies never touches a file somebody else put in the folder under a similar name.
 BACKUP_APPLICATION_ID = 0x41484231
 # Columns update_chat may change; the names are interpolated into SQL, so never take them from input.
-EDITABLE_CHAT_COLUMNS = ("title", "model", "effort")
+EDITABLE_CHAT_COLUMNS = ("title", "model", "effort", "project_id")
 
 SCHEMA = """
 CREATE TABLE chats (
@@ -78,9 +78,23 @@ CREATE INDEX images_message ON images (message_id);
 CREATE INDEX images_chat ON images (chat_id);
 """
 
+# Added in version 3. A project is configuration, not chat content, so it is never expired; deleting one sets its
+# chats' project_id to NULL (delete_project can remove the chats first).
+PROJECTS_SCHEMA = """
+CREATE TABLE projects (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    instructions TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+ALTER TABLE chats ADD COLUMN project_id TEXT REFERENCES projects (id) ON DELETE SET NULL;
+CREATE INDEX chats_project ON chats (project_id);
+"""
+
 # Each step takes a database from the version before it to its own, and step 1 is the base schema. A new file runs every
 # step, so it ends up with exactly the tables, columns and SQL that an upgraded file has.
-MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA}
+MIGRATIONS = {1: SCHEMA, 2: IMAGES_SCHEMA, 3: PROJECTS_SCHEMA}
 SCHEMA_VERSION = max(MIGRATIONS)
 
 
@@ -104,7 +118,21 @@ class Chat:
     effort: str | None
     created_at: int
     updated_at: int
+    project_id: str | None = None
     snippet: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class Project:
+    id: str
+    name: str
+    instructions: str
+    created_at: int
+    updated_at: int
+    chat_count: int = 0
 
     def to_json(self) -> dict[str, object]:
         return asdict(self)
@@ -290,13 +318,20 @@ class Store:
 
     # chats
 
-    def create_chat(self, title: str, model: str, effort: str | None) -> Chat:
+    def create_chat(
+        self,
+        title: str,
+        model: str,
+        effort: str | None,
+        project_id: str | None = None,
+    ) -> Chat:
         now = self._now()
-        chat = Chat(secrets.token_hex(8), title, model, effort, now, now)
+        chat = Chat(secrets.token_hex(8), title, model, effort, now, now, project_id)
         with self._tx() as db:
             db.execute(
-                "INSERT INTO chats (id, title, model, effort, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (chat.id, chat.title, chat.model, chat.effort, now, now),
+                "INSERT INTO chats (id, title, model, effort, created_at, updated_at, project_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat.id, chat.title, chat.model, chat.effort, now, now, project_id),
             )
         return chat
 
@@ -392,6 +427,77 @@ class Store:
                     retention_days,
                 )
         return count
+
+    # projects
+
+    _PROJECT_SELECT = (
+        "SELECT p.id, p.name, p.instructions, p.created_at, p.updated_at,"
+        " (SELECT COUNT(*) FROM chats c WHERE c.project_id = p.id) AS chat_count FROM projects p"
+    )
+
+    def create_project(self, name: str, instructions: str = "") -> Project:
+        now = self._now()
+        project = Project(secrets.token_hex(8), name, instructions, now, now)
+        with self._tx() as db:
+            db.execute(
+                "INSERT INTO projects (id, name, instructions, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (project.id, name, instructions, now, now),
+            )
+        return project
+
+    def get_project(self, project_id: str) -> Project | None:
+        with self._lock:
+            row = self._db.execute(
+                f"{self._PROJECT_SELECT} WHERE p.id = ?", (project_id,)
+            ).fetchone()
+        return Project(**dict(row)) if row else None
+
+    def list_projects(self) -> list[Project]:
+        """By name, without regard to case."""
+        with self._lock:
+            rows = self._db.execute(
+                f"{self._PROJECT_SELECT} ORDER BY lower(p.name), p.id"
+            ).fetchall()
+        return [Project(**dict(r)) for r in rows]
+
+    def count_projects(self) -> int:
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        instructions: str | None = None,
+    ) -> Project | None:
+        """Change what is given. A project's own edits do not touch its chats' retention clocks."""
+        changes = {"name": name, "instructions": instructions}
+        columns = [c for c, value in changes.items() if value is not None]
+        if columns:
+            assignments = ", ".join(f"{c} = ?" for c in (*columns, "updated_at"))
+            with self._tx() as db:
+                db.execute(
+                    f"UPDATE projects SET {assignments} WHERE id = ?",
+                    [*(changes[c] for c in columns), self._now(), project_id],
+                )
+        return self.get_project(project_id)
+
+    def delete_project(self, project_id: str, *, delete_chats: bool) -> bool:
+        """The chats stay, without a project, unless `delete_chats`: then they go, with their text and pictures."""
+        with self._tx() as db:
+            removed = 0
+            if delete_chats:
+                removed = db.execute(
+                    "DELETE FROM chats WHERE project_id = ?", (project_id,)
+                ).rowcount
+            deleted = (
+                db.execute("DELETE FROM projects WHERE id = ?", (project_id,)).rowcount
+                > 0
+            )
+        if removed:
+            self._wipe_wal()
+        return deleted
 
     # messages
 
