@@ -1,6 +1,7 @@
 // Modal dialogs (settings, confirmation) and the small menu on a chat row.
 
 import { h, icon, placePopover } from "./dom.js";
+import { estimateTokens } from "./format.js";
 
 let counter = 0;
 
@@ -39,6 +40,116 @@ export function confirmDialog({ title, text, confirm, kind = "danger" }) {
     no.addEventListener("click", () => dialog.close());
     yes.addEventListener("click", () => {
       answer = true;
+      dialog.close();
+    });
+    dialog.addEventListener("close", () => resolve(answer));
+    no.focus();
+  });
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+/** The dialog for a project's name and instructions. `onSave({ name, instructions })` may throw; its message is shown. */
+export function openProjectDialog({ project = null, onSave }) {
+  const name = h("input", {
+    id: "project-name",
+    type: "text",
+    maxlength: "80",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-describedby": "project-status",
+  });
+  const instructions = h("textarea", {
+    id: "project-instructions",
+    maxlength: "4000",
+    placeholder: "Answer in French. Keep it short.",
+    spellcheck: "true",
+    "aria-describedby": "project-hint",
+  });
+  name.value = project?.name ?? "";
+  instructions.value = project?.instructions ?? "";
+  const hint = h("span", { class: "hint", id: "project-hint" });
+  const status = h("p", { class: "action-status", role: "status", id: "project-status" });
+  const sayCount = () => {
+    const text = instructions.value.trim();
+    hint.textContent =
+      "Added to every chat in this project, after your standing instructions. Up to 4,000 characters." +
+      (text ? ` About ${plural(estimateTokens(text), "token", "tokens")} of the model's memory.` : "");
+  };
+  sayCount();
+  instructions.addEventListener("input", sayCount);
+
+  const form = h(
+    "form",
+    { class: "dlg-body", id: "project-form", novalidate: "" },
+    h("div", { class: "field" }, h("label", { for: "project-name" }, "Name"), name),
+    h("div", { class: "field" }, h("label", { for: "project-instructions" }, "Instructions"), instructions, hint),
+    status,
+  );
+  const cancel = h("button", { class: "btn", type: "button" }, "Cancel");
+  // Not disabled while it saves: a focused button that turns disabled drops the keyboard out of the dialog.
+  const save = h("button", { class: "btn", type: "submit", form: "project-form", "data-kind": "primary" }, "Save");
+  const dialog = modal(project ? "Edit project" : "New project", form, h("div", { class: "dlg-foot" }, cancel, save));
+  cancel.addEventListener("click", () => dialog.close());
+  let saving = false;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (saving) return;
+    const cleaned = name.value.split(/\s+/).filter(Boolean).join(" ");
+    status.removeAttribute("data-error");
+    if (!cleaned) {
+      status.textContent = "Give the project a name.";
+      status.setAttribute("data-error", "");
+      name.focus();
+      return;
+    }
+    saving = true;
+    status.textContent = "";
+    try {
+      await onSave({ name: cleaned, instructions: instructions.value.trim() });
+      dialog.close();
+    } catch (err) {
+      status.textContent = err.message;
+      status.setAttribute("data-error", "");
+    } finally {
+      saving = false;
+    }
+  });
+  name.focus();
+  return dialog;
+}
+
+/** Resolves null if the person cancels, else `{ chats: "keep" | "delete" }`. `chatCount` is how many chats it holds. */
+export function openDeleteProject({ project, chatCount }) {
+  return new Promise((resolve) => {
+    let answer = null;
+    const also = chatCount ? h("input", { type: "checkbox", id: "also-delete-chats" }) : null;
+    const yes = h("button", { class: "btn", type: "button", "data-kind": "danger" }, "Delete project");
+    const no = h("button", { class: "btn", type: "button" }, "Cancel");
+    const stays = chatCount
+      ? `Its ${plural(chatCount, "chat stays", "chats stay")} in your list, without a project.`
+      : "It has no chats.";
+    const dialog = modal(
+      "Delete this project?",
+      h(
+        "div",
+        { class: "dlg-body" },
+        h("p", {}, `“${project.name}” will be deleted. ${stays}`),
+        also
+          ? h(
+              "label",
+              { class: "check" },
+              also,
+              h("span", {}, `Also delete its ${plural(chatCount, "chat", "chats")}`),
+              h("span", { class: "hint" }, "This can't be undone."),
+            )
+          : null,
+      ),
+      h("div", { class: "dlg-foot" }, no, yes),
+    );
+    no.addEventListener("click", () => dialog.close());
+    yes.addEventListener("click", () => {
+      answer = { chats: also?.checked ? "delete" : "keep" };
       dialog.close();
     });
     dialog.addEventListener("close", () => resolve(answer));
@@ -166,15 +277,14 @@ export function openSettings({ theme, instructions, retentionDays, connections, 
 let menu;
 let menuAnchor;
 
-/** The Rename / Delete menu on a chat row. */
-export function openRowMenu({ anchor, onRename, onDelete }) {
+/** The small menu on a chat or project row: `items` are { icon, label, run }. */
+export function openRowMenu({ anchor, label, items }) {
   if (!menu) {
     menu = h("div", {
       class: "pop pop-menu",
       id: "row-menu",
       popover: "auto",
       role: "menu",
-      "aria-label": "Chat options",
     });
     document.body.append(menu);
     menu.addEventListener("toggle", (event) => {
@@ -183,28 +293,31 @@ export function openRowMenu({ anchor, onRename, onDelete }) {
     menu.addEventListener("keydown", (event) => {
       const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
       if (!step) return;
-      const items = [...menu.querySelectorAll("[role=menuitem]")];
-      items[(items.indexOf(document.activeElement) + step + items.length) % items.length].focus();
+      const entries = [...menu.querySelectorAll("[role=menuitem]")];
+      entries[(entries.indexOf(document.activeElement) + step + entries.length) % entries.length].focus();
       event.preventDefault();
     });
   }
   menuAnchor = anchor;
-  const item = (name, label, run) =>
-    h(
-      "button",
-      {
-        class: "level",
-        type: "button",
-        role: "menuitem",
-        onClick: () => {
-          menu.hidePopover();
-          run();
+  menu.setAttribute("aria-label", label);
+  menu.replaceChildren(
+    ...items.map((item) =>
+      h(
+        "button",
+        {
+          class: "level",
+          type: "button",
+          role: "menuitem",
+          onClick: () => {
+            menu.hidePopover();
+            item.run();
+          },
         },
-      },
-      icon(name),
-      h("span", {}, label),
-    );
-  menu.replaceChildren(item("pencil", "Rename…", onRename), item("trash", "Delete…", onDelete));
+        icon(item.icon),
+        h("span", {}, item.label),
+      ),
+    ),
+  );
   anchor.setAttribute("aria-expanded", "true");
   menu.showPopover();
   placePopover(menu, anchor, { below: true });

@@ -48,6 +48,11 @@ export function groupChats(chats, now = Date.now()) {
   return order.filter((label) => groups.has(label)).map((label) => ({ label, items: groups.get(label) }));
 }
 
+/** About how many tokens a text takes: the server's rule (three characters to a token, counted in code points). */
+export function estimateTokens(text) {
+  return Math.floor([...text].length / 3) + 1;
+}
+
 /** Whole days until the retention clock deletes a chat, never below zero. */
 export function daysLeft(updatedAt, retentionDays, now = Date.now()) {
   return Math.max(0, Math.ceil((updatedAt + retentionDays * 86_400_000 - now) / 86_400_000));

@@ -2,7 +2,7 @@
 
 import { ApiError, api, streamChat } from "./api.js";
 import { configureConversation, focusReply, ReplyView, replyFor, userMessage } from "./conversation.js";
-import { confirmDialog, openRowMenu, openSettings } from "./dialogs.js";
+import { confirmDialog, openDeleteProject, openProjectDialog, openRowMenu, openSettings } from "./dialogs.js";
 import { bars, h, icon } from "./dom.js";
 import { openChoiceMenu, openEffortMenu } from "./effort.js";
 import {
@@ -60,6 +60,10 @@ const state = {
   defaultModel: null,
   providers: {},
   chats: [],
+  projects: [],
+  open: new Set(), // ids of the projects whose chats are shown in the list
+  nextProject: null, // set by "New chat in <project>", taken by the new chat that follows
+  draftProject: null, // the project the unsent new chat will go in
   results: null,
   query: "",
   settings: { instructions: "" },
@@ -96,6 +100,23 @@ const store = {
 const currentModel = () => state.byId.get(state.draft.model);
 const isImage = (model) => model?.output === "image";
 const chatById = (id) => state.chats.find((chat) => chat.id === id);
+const projectById = (id) => state.projects.find((project) => project.id === id);
+const chatsOf = (projectId) => state.chats.filter((chat) => chat.project_id === projectId);
+
+const OPEN_KEY = "aihub.projects.open";
+function loadOpen() {
+  try {
+    const ids = JSON.parse(store.get(OPEN_KEY) ?? "[]");
+    return new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+function setOpen(id, on) {
+  if (on) state.open.add(id);
+  else state.open.delete(id);
+  store.set(OPEN_KEY, JSON.stringify([...state.open].filter((open) => projectById(open))));
+}
 
 function announce(text) {
   els.status.textContent = "";
@@ -128,6 +149,8 @@ const closeDrawer = () => !wide.matches && els.app.dataset.nav === "open" && set
 function renderSidebarNow() {
   renderSidebar(els.nav, {
     chats: state.results ?? state.chats,
+    projects: state.projects,
+    open: state.open,
     current: state.chat?.id,
     query: state.query,
   });
@@ -138,15 +161,22 @@ function renderTitle() {
   els.title.textContent = chat ? chat.title : "New chat";
   document.title = chat ? `${chat.title} - aihub` : "aihub";
   const left = chat ? daysLeft(chat.updated_at, state.retentionDays) : null;
-  els.sub.hidden = left === null || left > 7;
-  if (!els.sub.hidden)
-    els.sub.textContent = left === 0 ? "Deletes today" : `Deletes in ${left} day${left === 1 ? "" : "s"}`;
+  const project = projectById(chat ? chat.project_id : state.draftProject);
+  const notes = [];
+  if (project) notes.push(`Project: ${project.name}`);
+  if (left !== null && left <= 7)
+    notes.push(left === 0 ? "Deletes today" : `Deletes in ${left} day${left === 1 ? "" : "s"}`);
+  els.sub.replaceChildren(...notes.map((note) => h("span", {}, note)));
+  els.sub.hidden = notes.length === 0;
 }
 
 function renderRoute() {
-  const { title, text } = routeFor(currentModel());
-  els.routeTitle.textContent = title;
-  els.routeText.textContent = text;
+  const model = currentModel();
+  const route = routeFor(model);
+  const project = state.chat || isImage(model) ? null : projectById(state.draftProject);
+  // An image model is not given a project's instructions, so only a text chat says that they apply.
+  els.routeTitle.textContent = project ? `New chat in ${project.name}` : route.title;
+  els.routeText.textContent = project?.instructions ? `${route.text} The project's instructions apply.` : route.text;
 }
 
 function renderChips() {
@@ -277,6 +307,8 @@ function newChat() {
   leaveRun();
   state.chat = null;
   state.messages = [];
+  state.draftProject = state.nextProject;
+  state.nextProject = null;
   pickDraft(null);
   swapDraftText("new");
   renderChat();
@@ -291,6 +323,7 @@ async function openChat(id) {
     if (seq !== state.seq) return;
     state.chat = data.chat;
     state.messages = data.messages;
+    if (data.chat.project_id && !state.open.has(data.chat.project_id)) setOpen(data.chat.project_id, true);
     pickDraft(data.chat);
     swapDraftText(id);
     renderChat();
@@ -460,6 +493,7 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
   if (image) body.shape = shape;
   if (regenerateFor) body.regenerate_for = regenerateFor;
   else body.text = text;
+  if (!state.chat && state.draftProject) body.project_id = state.draftProject;
   const prompt = regenerateFor ? (state.messages.findLast((m) => m.role === "user")?.content ?? "") : text;
 
   const controller = new AbortController();
@@ -520,6 +554,7 @@ function onEvent(run, event) {
     case "chat":
       if (!state.chat) {
         state.chat = event.chat;
+        state.draftProject = null;
         draftKey = event.chat.id;
         history.replaceState(null, "", `#/c/${event.chat.id}`);
         renderTitle();
@@ -587,6 +622,7 @@ function onRunError(run, err) {
       resizeInput();
     }
     els.route.hidden = state.messages.length > 0 || state.chat !== null;
+    if (err.code === "no_project") dropDraftProject();
     const behind = err.code === "stale_chat" && state.chat;
     toast(behind ? `${err.message} It has been reloaded.` : err.message);
     if (behind) go(`#/c/${state.chat.id}`);
@@ -704,6 +740,118 @@ function reusePrompt(prompt) {
   els.input.setSelectionRange(prompt.length, prompt.length);
 }
 
+// ---- projects
+
+async function refreshProjects() {
+  state.projects = (await api.get("/api/projects")).projects;
+}
+
+/** The project a new chat was to go in has gone: forget it, and say what the list now is. */
+async function dropDraftProject() {
+  state.draftProject = null;
+  try {
+    await refreshProjects();
+  } catch {
+    // The list stays as it was; the next load corrects it.
+  }
+  renderSidebarNow();
+  renderTitle();
+  renderRoute();
+}
+
+function createProject() {
+  const dialog = openProjectDialog({
+    onSave: async (fields) => {
+      const made = await api.post("/api/projects", fields);
+      await refreshProjects();
+      setOpen(made.id, true);
+      renderSidebarNow();
+      dialog.addEventListener("close", () => els.nav.querySelector(`[data-toggle="${made.id}"]`)?.focus());
+    },
+  });
+}
+
+function editProject(project) {
+  const dialog = openProjectDialog({
+    project,
+    onSave: async (fields) => {
+      await api.patch(`/api/projects/${project.id}`, fields);
+      await refreshProjects();
+      renderSidebarNow();
+      renderTitle();
+      renderRoute();
+      dialog.addEventListener("close", () => els.nav.querySelector(`[data-toggle="${project.id}"]`)?.focus());
+    },
+  });
+}
+
+async function deleteProject(project) {
+  try {
+    await refreshProjects(); // the count in the dialog is the server's, not just the chats this page has loaded
+  } catch (err) {
+    return toast(err.message);
+  }
+  const current = projectById(project.id);
+  if (!current) return renderSidebarNow();
+  const choice = await openDeleteProject({ project: current, chatCount: current.chat_count });
+  if (!choice) return;
+  try {
+    await api.del(`/api/projects/${project.id}`, { chats: choice.chats });
+  } catch (err) {
+    if (err.code !== "no_project") return toast(err.message);
+  }
+  const doomed = new Set(choice.chats === "delete" ? chatsOf(project.id).map((chat) => chat.id) : []);
+  const without = (chats) =>
+    chats
+      .filter((chat) => !doomed.has(chat.id))
+      .map((chat) => (chat.project_id === project.id ? { ...chat, project_id: null } : chat));
+  state.chats = without(state.chats);
+  if (state.results) state.results = without(state.results);
+  state.projects = state.projects.filter((p) => p.id !== project.id);
+  setOpen(project.id, false);
+  if (state.draftProject === project.id) state.draftProject = null;
+  if (state.chat && doomed.has(state.chat.id)) go("#/");
+  else {
+    if (state.chat?.project_id === project.id) state.chat = { ...state.chat, project_id: null };
+    renderSidebarNow();
+    renderTitle();
+    if (!state.chat) renderRoute();
+  }
+  toast("Project deleted.");
+}
+
+function chooseProjectFor(chat, anchor) {
+  openChoiceMenu({
+    anchor,
+    title: "Move to project",
+    choices: [["none", "No project"], ...state.projects.map((project) => [project.id, project.name])],
+    selected: chat.project_id ?? "none",
+    text: "",
+    onSelect: (value) => moveChat(chat, value === "none" ? null : value),
+  });
+}
+
+async function moveChat(chat, projectId) {
+  const was = projectById(chat.project_id)?.name;
+  try {
+    const updated = await api.patch(`/api/chats/${chat.id}`, { project_id: projectId });
+    upsertChat(updated);
+    if (state.chat?.id === chat.id) {
+      state.chat = { ...state.chat, project_id: updated.project_id };
+      renderTitle();
+    }
+    if (projectId) setOpen(projectId, true);
+    renderSidebarNow();
+    toast(projectId ? `Moved to ${projectById(projectId)?.name}.` : `Removed from ${was ?? "its project"}.`);
+  } catch (err) {
+    toast(err.code === "no_project" ? "That project was deleted." : err.message);
+    if (err.code === "no_project") {
+      await refreshProjects().catch(() => {}); // the list stays as it was if that fails too
+      renderSidebarNow();
+    }
+  }
+}
+
 // ---- settings and chat actions
 
 function applyTheme(value) {
@@ -809,7 +957,7 @@ function openSettingsDialog() {
     onDeleteAll: async () => {
       const ok = await confirmDialog({
         title: "Delete all chats?",
-        text: "Every chat and message will be removed from this PC. This can't be undone.",
+        text: `Every chat and message will be removed from this PC.${state.projects.length ? " Projects stay." : ""} This can't be undone.`,
         confirm: "Delete everything",
       });
       if (!ok) return false;
@@ -899,15 +1047,43 @@ function wire() {
 
   els.nav.addEventListener("click", (event) => {
     const menu = event.target.closest("[data-menu]");
+    const toggle = event.target.closest("[data-toggle]");
+    const projectMenu = event.target.closest("[data-project-menu]");
+    const newIn = event.target.closest("[data-new-in]");
     if (menu) {
       const chat = chatById(menu.dataset.menu) ?? state.results?.find((c) => c.id === menu.dataset.menu);
       if (chat) {
+        const items = [{ icon: "pencil", label: "Rename…", run: () => beginRename(menu.closest(".chat-row"), chat) }];
+        if (state.projects.length || chat.project_id) {
+          items.push({ icon: "folder", label: "Move to project…", run: () => chooseProjectFor(chat, menu) });
+        }
+        items.push({ icon: "trash", label: "Delete…", run: () => deleteChat(chat) });
+        openRowMenu({ anchor: menu, label: "Chat options", items });
+      }
+    } else if (toggle) {
+      const id = toggle.dataset.toggle;
+      const on = toggle.getAttribute("aria-expanded") !== "true";
+      setOpen(id, on);
+      // In place, so the keyboard stays where it is.
+      toggle.setAttribute("aria-expanded", String(on));
+      document.getElementById(toggle.getAttribute("aria-controls")).hidden = !on;
+    } else if (projectMenu) {
+      const project = projectById(projectMenu.dataset.projectMenu);
+      if (project) {
         openRowMenu({
-          anchor: menu,
-          onRename: () => beginRename(menu.closest(".chat-row"), chat),
-          onDelete: () => deleteChat(chat),
+          anchor: projectMenu,
+          label: "Project options",
+          items: [
+            { icon: "pencil", label: "Edit…", run: () => editProject(project) },
+            { icon: "trash", label: "Delete…", run: () => deleteProject(project) },
+          ],
         });
       }
+    } else if (newIn) {
+      state.nextProject = newIn.dataset.newIn;
+      go("#/");
+    } else if (event.target.closest("#new-project")) {
+      createProject();
     } else if (event.target.closest(".chat-link")) {
       closeDrawer();
     }
@@ -950,6 +1126,7 @@ function applyBootstrap(data) {
   state.defaultModel = data.default_model;
   state.providers = data.providers;
   state.chats = data.chats;
+  state.projects = data.projects ?? [];
   state.settings = data.settings;
   state.retentionDays = data.retention_days;
   els.retention.textContent = `Chats are deleted ${data.retention_days} days after their last message.`;
@@ -992,6 +1169,7 @@ function boot() {
   wire();
   els.routeRetry.addEventListener("click", load);
   setNav(wide.matches ? store.get("aihub.nav") !== "closed" : false);
+  state.open = loadOpen();
   load();
 }
 

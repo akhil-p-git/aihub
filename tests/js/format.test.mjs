@@ -5,6 +5,7 @@ import {
   barsFor,
   coerceEffort,
   daysLeft,
+  estimateTokens,
   formatBytes,
   formatContext,
   formatCost,
@@ -197,5 +198,19 @@ describe("shapeNote: what a shape costs in time", () => {
   it("names only the shape when the model has no estimate for it", () => {
     assert.equal(shapeNote({ est_s: { square: 23 } }, "wide"), "Wide");
     assert.equal(shapeNote(undefined, "wide"), "Wide");
+  });
+});
+
+describe("estimateTokens: the server's rule, so the project dialog counts what is budgeted", () => {
+  it("is three characters to a token, plus one", () => {
+    assert.equal(estimateTokens(""), 1);
+    assert.equal(estimateTokens("ab"), 1);
+    assert.equal(estimateTokens("abc"), 2);
+    assert.equal(estimateTokens("x".repeat(300)), 101);
+    assert.equal(estimateTokens("x".repeat(4000)), 1334);
+  });
+  it("counts characters, not UTF-16 units: an emoji is one", () => {
+    assert.equal(estimateTokens("😀😀😀"), 2);
+    assert.equal(estimateTokens("é".repeat(6)), 3);
   });
 });
