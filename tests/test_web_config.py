@@ -129,6 +129,30 @@ class TestImages:
     def test_image_generation_is_off_until_a_socket_is_named(self) -> None:
         assert Config().images.socket is None
 
+    def test_images_are_copied_to_pictures_aihubgen_by_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert Config().images.save_dir == tmp_path / "Pictures" / "aihubgen"
+
+    def test_the_folder_can_be_moved_or_turned_off(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        moved = load_config(write(tmp_path, {"images": {"save_dir": "~/Art/ai"}}), {})
+        assert moved.images.save_dir == tmp_path / "Art" / "ai"
+        absolute = load_config(write(tmp_path, {"images": {"save_dir": "/srv/pics"}}), {})
+        assert absolute.images.save_dir == Path("/srv/pics")
+        off = load_config(write(tmp_path, {"images": {"save_dir": None}}), {})
+        assert off.images.save_dir is None
+
+    @pytest.mark.parametrize("folder", ["pics", "./pics", "../pics", ""])
+    def test_the_folder_must_be_absolute_or_start_with_a_tilde(
+        self, tmp_path: Path, folder: str
+    ) -> None:
+        with pytest.raises(ConfigError, match=r"images\.save_dir"):
+            load_config(write(tmp_path, {"images": {"save_dir": folder}}), {})
+
     def test_the_shipped_models(self) -> None:
         zimage, klein = ImagesConfig().models
         assert (zimage.id, zimage.steps, zimage.sample_method, zimage.edits) == (

@@ -141,12 +141,28 @@ class ImagesConfig(_Section):
     socket: str | None = None
     # The first model is the default image model.
     models: tuple[ImageModel, ...] = DEFAULT_IMAGE_MODELS
+    # Every image made is also written to this folder as a .webp file; None turns the copies off. A leading "~" is
+    # the home folder. The systemd unit may write only here (ReadWritePaths), so change both together.
+    save_dir: Path | None = Field(Path("~/Pictures/aihubgen"), validate_default=True)
 
     @field_validator("socket")
     @classmethod
     def _absolute(cls, value: str | None) -> str | None:
         if value is not None and not Path(value).is_absolute():
             raise ValueError(f"must be an absolute path, got {value!r}")
+        return value
+
+    @field_validator("save_dir")
+    @classmethod
+    def _save_dir(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        try:
+            value = value.expanduser()
+        except RuntimeError:
+            raise ValueError("cannot expand ~ because the home folder is unknown") from None
+        if not value.is_absolute():
+            raise ValueError(f"must be an absolute path or start with ~, got {str(value)!r}")
         return value
 
     @model_validator(mode="after")

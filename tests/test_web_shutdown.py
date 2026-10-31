@@ -125,7 +125,7 @@ def test_stopping_the_service_mid_image_saves_the_image_as_stopped(
         f"port: {app_port}\n"
         f'ollama: {{ url: "http://127.0.0.1:{nothing_listens}" }}\n'
         f'openrouter: {{ url: "http://127.0.0.1:{nothing_listens}/api/v1" }}\n'
-        f'images: {{ socket: "{socket_path}" }}\n'
+        f'images: {{ socket: "{socket_path}", save_dir: null }}\n'
     )
     log = (tmp_path / "app.log").open("w")
     with serve_engine(engine, socket_path):

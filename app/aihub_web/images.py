@@ -13,6 +13,7 @@ import struct
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx2
 
@@ -444,6 +445,33 @@ class Job:
 _TASKS: set[asyncio.Task[None]] = set()
 
 
+def copy_name(plan: "ImagePlan", when: float) -> str:
+    """`20261031-114211_zimage_seed42.webp`: local time first, so the folder sorts by when images were made."""
+    model = re.sub(r"[^A-Za-z0-9._-]", "_", plan.native)
+    return f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(when))}_{model}_seed{plan.seed}.webp"
+
+
+def write_copy(directory: Path, name: str, data: bytes) -> Path:
+    """Write `data` to a new file in `directory`, creating the folder. Never overwrites: a name that is taken gets
+    `-2`, `-3` and so on before the extension. Raises OSError when the folder cannot be written."""
+    directory.mkdir(parents=True, exist_ok=True)
+    stem, dot, suffix = name.rpartition(".")
+    for attempt in range(1, 100):
+        path = directory / (name if attempt == 1 else f"{stem}-{attempt}{dot}{suffix}")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as file:
+                file.write(data)
+        except BaseException:
+            path.unlink(missing_ok=True)  # a half-written picture is worse than none
+            raise
+        return path
+    raise FileExistsError(f"{name} and its numbered variants all exist in {directory}")
+
+
 class ImageJobs:
     """Image jobs by chat. A job is a task of its own: the request that started it can end, or be cancelled
     by the server when the browser goes away, without touching it. Its listeners only watch.
@@ -460,6 +488,8 @@ class ImageJobs:
         pacing: Pacing = PACING,
         deadline_for: Callable[[float], float] = deadline_for,
         monotonic: Callable[[], float] = time.monotonic,
+        save_dir: Path | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = store
         self._engine = engine
@@ -469,6 +499,8 @@ class ImageJobs:
         self._pacing = pacing
         self._deadline_for = deadline_for
         self._monotonic = monotonic
+        self._save_dir = save_dir
+        self._clock = clock
         self._jobs: dict[str, Job] = {}
 
     @property
@@ -762,6 +794,18 @@ class ImageJobs:
             0,
         )
 
+    def _copy_to_disk(self, plan: ImagePlan, data: bytes) -> None:
+        """Keep a file copy of the picture. The chat's own copy is what the page shows, so a folder that cannot
+        be written costs the file only: it is logged, and the reply still succeeds."""
+        if self._save_dir is None:
+            return
+        try:
+            path = write_copy(self._save_dir, copy_name(plan, self._clock()), data)
+        except OSError as err:
+            log.warning("could not save the image in %s: %s", self._save_dir, err)
+            return
+        log.info("image file chat=%s path=%s", plan.chat_id, path)
+
     def _save(self, job: Job, outcome: Outcome) -> Message:
         plan = job.plan
         status = "error" if outcome.error else outcome.status
@@ -773,6 +817,7 @@ class ImageJobs:
         usage = self._usage(job)
         images = []
         if outcome.image is not None:
+            self._copy_to_disk(plan, outcome.image)
             images = [
                 ImageRow(
                     plan.width,

@@ -18,7 +18,7 @@ uv pip install --python "$ROOT/vendor/.venv-llmcord/bin/python" -r "$ROOT/config
 (cd "$ROOT" && uv sync --frozen --python 3.12)
 "$ROOT/.venv/bin/python" -m compileall -q "$ROOT/app"
 install -d -m 700 "$ROOT/state/web"
-mkdir -p "$HOME/.config/aihub" "$HOME/.config/systemd/user"
+mkdir -p "$HOME/.config/aihub" "$HOME/.config/systemd/user" "$HOME/Pictures/aihubgen"
 [ -e "$HOME/.config/aihub/web.yaml" ] || cp "$ROOT/config/web.example.yaml" "$HOME/.config/aihub/web.yaml"
 ln -sfn "$ROOT/systemd/aihub-web.service" "$HOME/.config/systemd/user/aihub-web.service"
 systemctl --user daemon-reload

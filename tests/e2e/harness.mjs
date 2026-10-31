@@ -72,7 +72,7 @@ export async function startApp({ keys = true, retentionDays = 30, seedTurns = 0,
       `ollama: { url: "${fakeUrl}" }`,
       `openrouter: { url: "${fakeUrl}/api/v1" }`,
       `anthropic: { url: "${fakeUrl}" }`,
-      ...(images ? [`images: { socket: "${join(dir, "engine.sock")}" }`] : []),
+      ...(images ? [`images: { socket: "${join(dir, "engine.sock")}", save_dir: null }`] : []),
     ].join("\n"),
   );
   let seededChat = null;

@@ -13,13 +13,14 @@ EnvironmentFile=-%h/.config/aihub/aihub.env
 ExecStart=%h/work/Dev/aihub/.venv/bin/python -m aihub_web
 Restart=on-failure
 RestartSec=5
-# The chat only needs to write its own state folder and talk to Ollama, OpenRouter and Anthropic.
+# The chat only needs to write its own state folder (and the folder that gets a file copy of each image, images.save_dir
+# in web.yaml; the "-" lets the unit start when that folder does not exist yet) and talk to Ollama, OpenRouter and Anthropic.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/work/Dev/aihub/state
+ReadWritePaths=%h/work/Dev/aihub/state -%h/Pictures/aihubgen
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

@@ -670,6 +670,7 @@ def create_app(
                 client,
                 cfg.ollama,
                 pacing=image_pacing,
+                save_dir=cfg.images.save_dir,
             )
             if cfg.images.socket
             else None

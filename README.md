@@ -235,6 +235,15 @@ chat, when it expires or is deleted. Image storage stops at 2 GiB, after which n
 deleted. Code from before images refuses a database of version 2 or later: see "Upgrading the database" under Storage
 and retention for how to go back.
 
+**Files.** Each finished image is also written to `~/Pictures/aihubgen/` as a `.webp` named by local time, model and seed,
+for example `20261031-114211_zimage_seed42.webp`. These files are yours: deleting a chat, or its expiry, does not remove
+them, and an image whose chat was deleted while it was being made is still written. A folder that cannot be written is
+logged (`journalctl --user -u aihub-web | grep "save the image"`) and costs only the file; the image still appears in the
+chat. Change the folder with `images.save_dir` in `web.yaml` (`null` turns the copies off) and the matching
+`ReadWritePaths` line in `systemd/aihub-web.service`, which is what lets the sandboxed service write there, then
+`systemctl --user daemon-reload` and restart. Create the folder first (`scripts/install.sh` does). Images made before
+this setting existed are not copied.
+
 **Exposure.** The engine is never reachable over the network, but the page's port is: if you put Tailscale in front of
 aihub (see Security), everyone the `allowed_hosts` list admits can make images and keep the GPU busy.
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import calendar
 import contextlib
 import os
 import re
@@ -22,7 +23,9 @@ from aihub_web.images import (
     ImagePlan,
     Job,
     Pacing,
+    copy_name,
     deadline_for,
+    write_copy,
 )
 from aihub_web.providers.images import EngineClient
 from helpers import (
@@ -95,6 +98,8 @@ async def rig(
     deadline: Callable[[float], float] = lambda est_s: 30.0,
     monotonic: Callable[[], float] = time.monotonic,
     lock_directory: Path | None = None,
+    save_dir: Path | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> AsyncIterator[Rig]:
     timeline: list = []
     engine = engine or FakeEngine()
@@ -114,6 +119,8 @@ async def rig(
         pacing=pacing,
         deadline_for=deadline,
         monotonic=monotonic,
+        save_dir=save_dir,
+        clock=clock,
     )
     before = asyncio.all_tasks()
     try:
@@ -1170,3 +1177,148 @@ class TestShutdown:
             await collect(job)
             await asyncio.sleep(0)
             assert job.task not in images._TASKS
+
+
+MADE_AT = calendar.timegm((2026, 10, 31, 11, 42, 11))  # 20261031-114211 in UTC
+
+
+@pytest.mark.anyio
+class TestFileCopies:
+    """Every finished image is also written to a folder as a .webp file; the chat keeps its own copy."""
+
+    async def test_a_finished_image_is_written_with_a_sortable_name_and_the_same_bytes(
+        self, tmp_path: Path, socket_dir: Path, tz
+    ) -> None:
+        tz("UTC")
+        pictures = tmp_path / "Pictures" / "aihubgen"  # created on demand, with its parents
+        async with rig(
+            tmp_path, socket_dir, save_dir=pictures, clock=lambda: MADE_AT
+        ) as r:
+            chat_id = r.chat()
+            events = await collect(r.jobs.start(plan_for(chat_id)))
+            assert events[-1]["t"] == "done"
+            [image] = r.replies(chat_id)[0].images
+            _, stored = r.store.get_image(chat_id, image["id"])
+            assert [p.name for p in pictures.iterdir()] == [
+                "20261031-114211_zimage_seed42.webp"
+            ]
+            assert (pictures / "20261031-114211_zimage_seed42.webp").read_bytes() == stored
+
+    async def test_a_name_that_is_taken_gets_a_number_and_is_never_overwritten(
+        self, tmp_path: Path, socket_dir: Path, tz
+    ) -> None:
+        tz("UTC")
+        pictures = tmp_path / "pics"
+        pictures.mkdir()
+        name = "20261031-114211_zimage_seed42.webp"
+        (pictures / name).write_bytes(b"someone else's picture")
+        outside = tmp_path / "outside.txt"
+        (pictures / name.replace(".webp", "-2.webp")).symlink_to(outside)  # a dangling link
+        async with rig(
+            tmp_path, socket_dir, save_dir=pictures, clock=lambda: MADE_AT
+        ) as r:
+            await collect(r.jobs.start(plan_for(r.chat())))
+        assert (pictures / name).read_bytes() == b"someone else's picture"
+        assert not outside.exists(), "a symlink in the folder must not be written through"
+        assert (pictures / name.replace(".webp", "-3.webp")).read_bytes() == webp("wide")
+
+    async def test_with_no_folder_set_nothing_is_written(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        async with rig(tmp_path, socket_dir) as r:
+            await collect(r.jobs.start(plan_for(r.chat())))
+        assert sorted(p.name for p in tmp_path.iterdir() if p.suffix == ".webp") == []
+        assert not (tmp_path / "pics").exists()
+
+    async def test_a_folder_that_cannot_be_written_costs_the_file_but_not_the_reply(
+        self, tmp_path: Path, socket_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        blocker = tmp_path / "a-file"
+        blocker.write_text("not a folder")
+        async with rig(tmp_path, socket_dir, save_dir=blocker / "pics") as r:
+            chat_id = r.chat()
+            events = await collect(r.jobs.start(plan_for(chat_id)))
+            assert events[-1]["t"] == "done"
+            [stored] = r.replies(chat_id)
+            assert stored.status == "done" and len(stored.images) == 1
+            assert r.store.get_image(chat_id, stored.images[0]["id"]) is not None
+        assert "could not save the image" in caplog.text
+
+    async def test_a_failed_image_writes_no_file(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        engine = FakeEngine(model=None)
+        engine.submit_response = (
+            503,
+            {
+                "code": "engine_failed_to_start",
+                "last_error": engine_errors("gpu_busy_or_unavailable"),
+            },
+        )
+        pictures = tmp_path / "pics"
+        async with rig(tmp_path, socket_dir, engine=engine, save_dir=pictures) as r:
+            events = await collect(r.jobs.start(plan_for(r.chat())))
+            assert events[-1]["t"] == "error"
+        assert not pictures.exists() or list(pictures.iterdir()) == []
+
+    async def test_a_stopped_image_writes_no_file(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        pictures = tmp_path / "pics"
+        async with rig(tmp_path, socket_dir, save_dir=pictures) as r:
+            held = r.lock.try_exclusive()
+            chat_id = r.chat()
+            job = r.jobs.start(plan_for(chat_id))
+            await asyncio.sleep(0.05)
+            assert r.jobs.stop(chat_id) is True
+            events = await collect(job)
+            assert events[-1]["message"]["status"] == "stopped"
+            held.release()
+        assert not pictures.exists() or list(pictures.iterdir()) == []
+
+    async def test_the_file_outlives_a_chat_deleted_while_the_image_was_made(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 4), HOLD, finished])
+        pictures = tmp_path / "pics"
+        async with rig(tmp_path, socket_dir, engine=engine, save_dir=pictures) as r:
+            chat_id = r.chat()
+            job = r.jobs.start(plan_for(chat_id))
+            await until(phase_of(job, "sampling"))
+            r.store.delete_chat(chat_id)
+            engine.release()
+            await collect(job)
+            assert r.store.image_bytes_total() == 0
+        [saved] = pictures.iterdir()
+        assert saved.read_bytes() == webp("wide")
+
+
+class TestCopyNames:
+    def test_the_name_is_local_time_model_and_seed(self, tz) -> None:
+        tz("UTC")
+        assert copy_name(plan_for("c", native="klein4b", seed=7), MADE_AT) == (
+            "20261031-114211_klein4b_seed7.webp"
+        )
+
+    def test_a_model_name_cannot_escape_the_folder(self, tz) -> None:
+        tz("UTC")
+        name = copy_name(plan_for("c", native="../../etc/x y"), MADE_AT)
+        assert "/" not in name and " " not in name and name.endswith("_seed42.webp")
+
+    def test_the_time_zone_is_the_machines(self, tz) -> None:
+        tz("America/Los_Angeles")
+        assert copy_name(plan_for("c"), MADE_AT).startswith("20261031-044211_")
+
+    def test_write_copy_creates_the_folder_and_keeps_the_file_private_to_the_owner(
+        self, tmp_path: Path
+    ) -> None:
+        path = write_copy(tmp_path / "a" / "b", "x.webp", b"data")
+        assert path.read_bytes() == b"data" and path.parent == tmp_path / "a" / "b"
+        assert path.stat().st_mode & 0o022 == 0, "group/other must not get write access"
+
+    def test_write_copy_gives_up_after_many_collisions(self, tmp_path: Path) -> None:
+        for n in range(1, 100):
+            (tmp_path / ("x.webp" if n == 1 else f"x-{n}.webp")).write_bytes(b"")
+        with pytest.raises(FileExistsError):
+            write_copy(tmp_path, "x.webp", b"data")

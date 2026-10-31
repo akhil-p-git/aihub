@@ -10,6 +10,20 @@ from pathlib import Path
 import pytest
 
 ZONEINFO = Path("/usr/share/zoneinfo")
+# Where images.save_dir points unless a config says otherwise. A test that makes an image through a real app or
+# server must set save_dir itself; this guard turns a forgotten one into a failure instead of stray files.
+PICTURES = Path("~/Pictures/aihubgen").expanduser()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_images_in_the_real_pictures_folder() -> Iterator[None]:
+    before = set(PICTURES.iterdir()) if PICTURES.is_dir() else set()
+    yield
+    after = set(PICTURES.iterdir()) if PICTURES.is_dir() else set()
+    assert after == before, (
+        f"tests wrote into {PICTURES}: {sorted(p.name for p in after - before)}. "
+        "Set images.save_dir (null or a tmp_path) in the config that test builds."
+    )
 
 
 @pytest.fixture

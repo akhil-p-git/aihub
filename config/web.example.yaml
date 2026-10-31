@@ -63,6 +63,10 @@ anthropic:
 # group. The first model is the default image model; `id` is also the engine's name for it.
 images:
   socket: null
+  # Every image made is also written here as a .webp file named like 20261031-114211_zimage_seed42.webp. The chat
+  # keeps its own copy, which goes with the chat after retention_days; these files stay. `null` turns the copies off.
+  # The systemd unit may write only this folder (ReadWritePaths in systemd/aihub-web.service): change both together.
+  save_dir: ~/Pictures/aihubgen
   models:
     - id: zimage
       name: Z-Image Turbo

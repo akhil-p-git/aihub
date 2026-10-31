@@ -54,6 +54,9 @@ def build(tmp_path: Path, environ=KEYS, options: dict | None = None, **config):
         "ollama": FakeProvider(Text("Hi"), Finish("stop")),
         "anthropic": FakeProvider(Text("Hey"), Usage(1000, 500), Finish("end_turn")),
     }
+    if "images" in config:
+        # No test may write into the real ~/Pictures/aihubgen (the default); one that wants the copies sets a folder.
+        config["images"] = {"save_dir": None, **config["images"]}
     app = create_app(
         Config(state_dir=tmp_path, **config),
         environ=environ,
@@ -802,7 +805,7 @@ def image_api(tmp_path: Path, socket_dir: Path):
     path = str(socket_dir / "engine.sock")
     engine = FakeEngine()
     with serve_engine(engine, path):
-        app, fakes = build(tmp_path, images={"socket": path})
+        app, fakes = build(tmp_path, images={"socket": path, "save_dir": None})
         with TestClient(app, base_url=BASE) as client:
             client.fakes, client.engine = fakes, engine
             yield client
@@ -885,6 +888,20 @@ class TestImageModelsInTheLists:
 
 
 class TestMakingImagesOverHttp:
+    def test_the_configured_folder_receives_a_copy_of_each_image(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        path = str(socket_dir / "engine.sock")
+        pictures = tmp_path / "Pictures" / "aihubgen"
+        with serve_engine(FakeEngine(), path):
+            app, _ = build(tmp_path, images={"socket": path, "save_dir": str(pictures)})
+            with TestClient(app, base_url=BASE) as client:
+                chat_id, image = make_image(client)
+                served = client.get(f"/api/chats/{chat_id}/images/{image['id']}").content
+        [saved] = pictures.iterdir()
+        assert saved.name.endswith(f"_zimage_seed{image['seed']}.webp")
+        assert saved.read_bytes() == served
+
     def test_a_prompt_streams_progress_and_then_the_finished_reply(
         self, image_api: TestClient
     ) -> None:
