@@ -489,6 +489,7 @@ class TestWhenItGoesWrong:
                 "code": "engine_crashed",
                 "message": "The image engine stopped unexpectedly. Retry starts it again.",
             }
+            assert engine.kills == 0  # it is already gone
 
     @pytest.mark.parametrize("status", [502, 504])
     async def test_a_launcher_that_cannot_get_an_answer_from_the_engine_means_a_crash(
@@ -503,6 +504,8 @@ class TestWhenItGoesWrong:
         )
         async with rig(tmp_path, socket_dir, engine=engine) as r:
             assert (await self.run_to_the_end(r))["code"] == "engine_crashed"
+            # the engine may still be alive and holding the GPU, so it is killed before the lock is freed
+            assert engine.kills == 1
 
     async def test_a_broken_connection_while_polling_is_a_crash_too(
         self, tmp_path: Path, socket_dir: Path
@@ -523,6 +526,29 @@ class TestWhenItGoesWrong:
             tmp_path, socket_dir, engine=engine, transport=httpx2.MockTransport(flaky)
         ) as r:
             assert (await self.run_to_the_end(r))["code"] == "engine_crashed"
+            assert engine.kills == 1
+
+    async def test_a_poll_that_times_out_kills_the_engine_before_the_gpu_is_freed(
+        self, tmp_path: Path, socket_dir: Path
+    ) -> None:
+        engine = FakeEngine()
+        engine.scripts.append([generating(1, 4), generating(2, 4)])
+        inner = engine.transport()
+        polls = 0
+
+        async def slow(request: httpx2.Request) -> httpx2.Response:
+            nonlocal polls
+            if "/jobs/" in request.url.path:
+                polls += 1
+                if polls == 2:
+                    raise httpx2.ReadTimeout("slow", request=request)
+            return await inner.handle_async_request(request)
+
+        async with rig(
+            tmp_path, socket_dir, engine=engine, transport=httpx2.MockTransport(slow)
+        ) as r:
+            assert (await self.run_to_the_end(r))["code"] == "engine_crashed"
+            assert engine.kills == 1
 
     async def test_a_socket_directory_that_has_vanished_means_no_engine(
         self, tmp_path: Path, socket_dir: Path

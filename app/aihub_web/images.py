@@ -565,6 +565,13 @@ class ImageJobs:
             except ImageError as err:
                 outcome = Outcome("error", error=err)
             except EngineError as err:
+                # The engine may still be working and holding the GPU, and the lock is freed when this ends. Only
+                # an engine that is known to be gone, or never started, needs no kill.
+                if job.engine_phase is not None and err.code not in (
+                    "engine_gone",
+                    "engine_failed_to_start",
+                ):
+                    await self._kill_engine()
                 outcome = Outcome("error", error=self._explain_engine_error(err, job))
             except Exception:
                 log.exception("image job failed in chat %s", job.plan.chat_id)
@@ -731,13 +738,16 @@ class ImageJobs:
             except EngineError:
                 pass
         if needs_kill:
-            try:
-                await self._engine.kill()
-            except EngineError as err:
-                log.warning("could not kill the image engine: %s", err.code)
+            await self._kill_engine()
         if reason == "timeout":
             return Outcome("error", error=ImageError("timeout", MESSAGES["timeout"]))
         return Outcome("stopped")
+
+    async def _kill_engine(self) -> None:
+        try:
+            await self._engine.kill()
+        except EngineError as err:
+            log.warning("could not kill the image engine: %s", err.code)
 
     def _finish(self, job: Job, outcome: Outcome) -> None:
         """Store the reply, tell the listeners, free the GPU and forget the job. Runs once, and never awaits."""
