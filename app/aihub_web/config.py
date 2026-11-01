@@ -100,9 +100,9 @@ class AnthropicConfig(_Section):
 class ImageEstimates(_Section):
     """Seconds one image takes on a warm engine, per shape: the picker's hint, and (with 3x and a minute) the job's time limit."""
 
-    square: int | float = Field(gt=0)
-    wide: int | float = Field(gt=0)
-    tall: int | float = Field(gt=0)
+    square: int | float = Field(gt=0, allow_inf_nan=False)
+    wide: int | float = Field(gt=0, allow_inf_nan=False)
+    tall: int | float = Field(gt=0, allow_inf_nan=False)
 
 
 class ImageModel(_Section):
@@ -150,6 +150,8 @@ class ImagesConfig(_Section):
     def _absolute(cls, value: str | None) -> str | None:
         if value is not None and not Path(value).is_absolute():
             raise ValueError(f"must be an absolute path, got {value!r}")
+        if value is not None and "\0" in value:
+            raise ValueError("must not contain a NUL byte")
         return value
 
     @field_validator("save_dir")

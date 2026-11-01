@@ -199,7 +199,8 @@ class TestImages:
         assert model.est_s.wide == 2.5
 
     @pytest.mark.parametrize(
-        "socket", ["engine.sock", "~/engine.sock", "./run/engine.sock", ""]
+        "socket",
+        ["engine.sock", "~/engine.sock", "./run/engine.sock", "", "/run/a\0b"],
     )
     def test_the_socket_must_be_an_absolute_path(
         self, tmp_path: Path, socket: str
@@ -239,6 +240,8 @@ class TestImages:
             {"square": 1, "wide": 1},
             {"square": 1, "wide": 1, "tall": 1, "huge": 1},
             {"square": 0, "wide": 1, "tall": 1},
+            {"square": float("inf"), "wide": 1, "tall": 1},
+            {"square": float("nan"), "wide": 1, "tall": 1},
         ],
     )
     def test_every_shape_needs_a_positive_estimate(
