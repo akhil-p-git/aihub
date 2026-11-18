@@ -85,6 +85,18 @@ DEFAULT_CLAUDE = (
         input_per_mtok=Decimal(4),
         output_per_mtok=Decimal(20),
     ),
+    ClaudeModel(
+        id="claude-fable-5-1",
+        name="Fable 5.1",
+        input_per_mtok=Decimal(10),
+        output_per_mtok=Decimal(50),
+    ),
+    ClaudeModel(
+        id="claude-fable-5-2",
+        name="Fable 5.2",
+        input_per_mtok=Decimal(8),
+        output_per_mtok=Decimal(40),
+    ),
 )
 
 

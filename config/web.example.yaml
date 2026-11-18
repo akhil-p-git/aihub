@@ -40,8 +40,8 @@ anthropic:
   max_tokens_deep: 64000    # used at xhigh and max effort
   # Prices are USD per million tokens (https://platform.claude.com/docs/en/about-claude/pricing), used
   # for the cost shown under each reply. thinking_off is how "Off" is sent for that model: Haiku 5.5
-  # accepts `disabled`, Sonnet 5.5 accepts `between_tools`, and Opus 5.5 and Fable 5.1 cannot turn
-  # thinking off (omit the field). Add claude-fable-5-1 ($10 / $50) here if you want it in the picker.
+  # accepts `disabled`, Sonnet 5.5 accepts `between_tools`, and Opus 5.5 and the Fable models cannot
+  # turn thinking off (omit the field).
   models:
     - id: claude-haiku-5-5
       name: Haiku 5.5
@@ -57,6 +57,14 @@ anthropic:
       name: Opus 5.5
       input_per_mtok: "4"
       output_per_mtok: "20"
+    - id: claude-fable-5-1
+      name: Fable 5.1
+      input_per_mtok: "10"
+      output_per_mtok: "50"
+    - id: claude-fable-5-2
+      name: Fable 5.2
+      input_per_mtok: "8"
+      output_per_mtok: "40"
 
 # Image generation on this PC. Leave `socket` unset and nothing about it shows up. Set it to the image engine's
 # Unix socket (for example /run/user/1000/aihub-images/engine.sock) and the model picker gains a "Makes images"
