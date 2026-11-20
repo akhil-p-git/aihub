@@ -65,12 +65,11 @@ so restart it after every change. The spend limit on the key, not this app, is t
 models and the Claude models are chosen in `~/.config/aihub/web.yaml` (`paid_models`, `anthropic.models`). `default_models`
 must stay free or local, so a forgotten chat cannot spend your credits. The desktop app reads the same keys file.
 
-**Images** need an NVIDIA GPU, and more: `sd-server` built from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
-with CUDA (this repo was tested with commit `0518b34`) at `~/work/aihub-images/bin/sd-server`, and the model files named in
-`systemd/images/models.json` under `~/work/aihub-images/models/`: `z-image-turbo/` (`z_image_turbo-Q5_0.gguf`,
-`Qwen3-4B-Q4_K_M.gguf`, `ae.safetensors`) and `flux2-klein-4b/` (`flux-2-klein-4b-Q8_0.gguf`, `Qwen3-4B-Q4_K_M.gguf`,
-`flux2-vae.safetensors`). stable-diffusion.cpp's `docs/z_image.md` and `docs/flux2.md` say where to download the weights. There is no
-script for this yet; the steps to turn it on are under Images below.
+**Images** need an NVIDIA GPU, a CUDA toolkit in `/opt/cuda`, `bubblewrap` and `ninja`, and about 12 GB of disk for the
+models. Two scripts set it up: `scripts/images/build-engine.sh` builds `sd-server` from the commit pinned in
+`config/image-engine.lock` (stable-diffusion.cpp, with CUDA) into `~/work/aihub-images/bin/`, and
+`scripts/images/fetch-models.sh` puts the model files named in `config/image-models.lock` under
+`~/work/aihub-images/models/` and checks each with `sha256sum`. The steps to turn it on are under Images below.
 
 ## Layout
 - `app/aihub_web/` the web chat: a small Starlette backend, and `static/` the browser UI (plain ES modules, no build step)
@@ -207,8 +206,8 @@ Optional, and free: the images are made on this PC's GPU by stable-diffusion.cpp
 sandboxed user unit with no network (`systemd/aihub-images.service`, `docs/adr/0001-image-engine.md`). Nothing is sent
 anywhere and nothing is billed. While `images.socket` in `web.yaml` is unset, the page shows nothing about it.
 
-**Turn it on.** Put the engine in `~/work/aihub-images/` (`bin/sd-server` and, under `models/`, the files that
-`systemd/images/models.json` names; there is no build or fetch script yet), link the two units
+**Turn it on.** Run `bash scripts/images/build-engine.sh` (about 10 minutes; the compile runs in bubblewrap with no network) and
+`bash scripts/images/fetch-models.sh` (about 12 GB; run it again to verify), link the two units
 from the checkout (`systemctl --user link "$PWD/systemd/aihub-images.socket" "$PWD/systemd/aihub-images.service"`, which wants
 absolute paths, then `systemctl --user enable --now aihub-images.socket`), set `images: {socket: /run/user/1000/aihub-images/engine.sock}` in
 `~/.config/aihub/web.yaml`, and restart the service. `scripts/images/isolation_probe.sh` checks the unit's cage. The

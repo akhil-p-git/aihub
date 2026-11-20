@@ -227,6 +227,14 @@ def test_models_json_listens_on_loopback_only_and_names_models_by_a_short_id():
         assert "--listen-ip" not in args and "--listen-port" not in args
 
 
+def test_models_json_pins_the_engine_to_a_cuda_device_so_that_it_never_falls_back_to_the_cpu():
+    # Measured 2026-11-20: with the GPU hidden (CUDA_VISIBLE_DEVICES empty) and no --backend, sd-server started,
+    # listened and ran the job on all 8 cores with 6.4 GB resident, silently. With --backend cuda0 it exits
+    # at start ("backend 'cuda0' was not found") and the launcher answers 503 within a second.
+    common = _models()["common_args"]
+    assert common[common.index("--backend") + 1] == "cuda0"
+
+
 def test_models_json_names_the_binary_and_model_files_relative_to_the_models_directory():
     # WorkingDirectory is %h/work/aihub-images/models, so ../bin/sd-server is %h/work/aihub-images/bin/sd-server.
     config = _models()

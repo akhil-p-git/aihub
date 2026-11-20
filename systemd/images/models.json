@@ -4,7 +4,8 @@
     "--listen-ip", "127.0.0.1",
     "--listen-port", "18234",
     "--offload-to-cpu",
-    "--max-vram", "3"
+    "--max-vram", "3",
+    "--backend", "cuda0"
   ],
   "models": {
     "zimage": [
