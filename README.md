@@ -147,7 +147,7 @@ run code or send the chat to a URL. The unit is sandboxed (`systemd-analyze --us
 To reach it from a phone or Mac, put Tailscale in front (not installed yet): follow `tailscale serve --help` for the
 current syntax, point it at `http://127.0.0.1:8787`, and add the machine's tailnet name to `allowed_hosts`.
 
-**Not built:** image or file attachments, editing a sent message, editing an image, branching, tools or MCP, and
+**Not built:** image or file attachments, editing a sent message, branching, tools or MCP, and
 Anthropic prompt caching. Leaving a chat while a text reply streams stops that reply (the part so far is kept);
 an image being made carries on (see Images). It has been checked in Chromium; Firefox, Safari and iOS have not.
 
@@ -221,8 +221,17 @@ mode: the box is an "Image prompt", Send becomes "Create image", and a Shape chi
 Tall 576 by 1024) takes the intensity chip's place and names the usual time for each shape. A box of signal bars shows
 the steps while the image is made. Stop ends the image (and the engine, which starts again for the next one); moving to
 another chat does not stop it, and coming back shows the progress and then the image. Under a finished image: Download (a `.webp`), New seed and "Redo with" the other
-model (both make the same prompt again as a new turn), Reuse prompt (the words go back in the box) and Full size.
-Choosing a text model leaves image mode. Editing an image is not built.
+model (both make the same prompt again as a new turn), Edit, Reuse prompt (the words go back in the box) and Full size.
+Choosing a text model leaves image mode.
+
+**Editing an image.** After an image reply the composer is set to change that image: a chip above Send shows it and
+says "Editing the last image with FLUX.2 klein 4B", and the next prompt ("make the fox blue") goes to that model with the
+stored image, whichever model the picker shows. The result has the same size as the image it changes, so the Shape chip
+is hidden, and its footer says "Edited from the image above". The x on the chip makes the next prompt a new image (choosing a text
+model leaves image mode, as before); Edit under an older image moves the chip to that one. New seed and Retry on an edit change the same
+image again (Retry of an edit that failed is sent with that image's id again, since a failed reply stored none), and
+Redo with another model is not offered, because only an edit model takes an image to change. A reply to an edit whose
+source image has since been deleted cannot be retried. Only FLUX.2 klein 4B edits; Z-Image Turbo does not.
 
 **What it costs and what it blocks.** One image at a time uses the whole GPU, so while one is made local chat models
 answer "paused" and cloud models keep working; a second image waits up to two minutes for its turn. Each image has a time

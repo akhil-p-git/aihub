@@ -21,6 +21,7 @@ import {
   levelLabel,
   routeFor,
   shapeNote,
+  shapeOfImage,
   shortName,
   taskNext,
   taskStatus,
@@ -53,6 +54,10 @@ const els = {
   input: $("composer-input"),
   send: $("send"),
   label: $("composer-label"),
+  editChip: $("edit-chip"),
+  editThumb: $("edit-thumb"),
+  editName: $("edit-name"),
+  editClear: $("edit-clear"),
   shapeChip: $("shape-chip"),
   shapeName: $("shape-name"),
   modelChip: $("model-chip"),
@@ -88,6 +93,7 @@ const state = {
   chat: null, // the open chat, or null for a new one
   messages: [],
   draft: { model: null, effort: null, shape: "square" }, // what the next message will use
+  edit: null, // the image the next image prompt changes ({ id, w, h }), or null for a new image
   drafts: new Map(), // unsent text per chat
   run: null, // the reply in progress
   stick: true, // follow the bottom while a reply streams
@@ -116,6 +122,18 @@ const store = {
 
 const currentModel = () => state.byId.get(state.draft.model);
 const isImage = (model) => model?.output === "image";
+/** The model that changes an image, when there is one: an image prompt after an image reply goes to it. */
+const editModel = () => state.models.find((m) => isImage(m) && m.edits && m.available);
+const newestImage = () => {
+  const last = state.messages.at(-1);
+  return last?.role === "assistant" && last.status === "done" ? (last.images?.[0] ?? null) : null;
+};
+/** After an image reply, the composer edits that image until its x is pressed. */
+function syncEdit() {
+  const image = newestImage();
+  state.edit = image && editModel() ? { id: image.id, w: image.w, h: image.h } : null;
+}
+const isEditing = () => Boolean(state.edit && state.chat && isImage(currentModel()) && editModel());
 const chatById = (id) => state.chats.find((chat) => chat.id === id);
 const projectById = (id) => state.projects.find((project) => project.id === id);
 const taskById = (id) => state.tasks.find((task) => task.id === id);
@@ -229,14 +247,23 @@ function renderChips() {
     els.modelChip.setAttribute("aria-label", `${TIER_LABELS[model.tier]} ${shortName(model.name)}. Change model`);
   }
   const image = isImage(model);
-  els.shapeChip.hidden = !image;
-  if (image) {
+  const editing = isEditing();
+  els.editChip.hidden = !editing;
+  if (editing) {
+    const [thumb, name] = [els.editThumb, els.editName];
+    thumb.src = `/api/chats/${state.chat.id}/images/${state.edit.id}`;
+    const which = state.edit.id === newestImage()?.id ? "the last image" : "an earlier image";
+    name.textContent = `Editing ${which} with ${shortName(editModel().name)}`;
+  }
+  // An edit comes out the size of its image, so there is no shape to choose.
+  els.shapeChip.hidden = !image || editing;
+  if (image && !editing) {
     const { shape } = state.draft;
     els.shapeName.textContent = SHAPES[shape];
     els.shapeChip.setAttribute("aria-label", `Shape: ${shapeNote(model, shape)}. Change shape`);
   }
   els.label.textContent = image ? "Image prompt" : "Message";
-  els.input.placeholder = image ? "Describe an image…" : "Message…";
+  els.input.placeholder = editing ? "Describe a change, or × for a new image" : image ? "Describe an image…" : "Message…";
   const efforts = model?.efforts;
   els.effortChip.hidden = !efforts;
   if (efforts) {
@@ -287,6 +314,7 @@ function renderMessages(messages) {
 }
 
 function renderChat() {
+  syncEdit();
   els.route.hidden = state.messages.length > 0;
   renderTitle();
   renderRoute();
@@ -524,15 +552,34 @@ function dropRetryButtons() {
   });
 }
 
+/**
+ * The image this send changes, or null for a new image or a text reply: `{ id, w, h }`. A retry of an edit that
+ * worked has no id, because the server finds that edit's source itself; one that failed names the source again,
+ * since a reply that failed stored no image to remember it by.
+ */
+function edited({ regenerateFor, replaced }) {
+  if (!editModel() || !isImage(currentModel())) return null;
+  if (!regenerateFor) return isEditing() ? state.edit : null;
+  const prior = replaced?.messages?.at(-1);
+  const made = prior?.images?.[0];
+  if (made?.ref) return { w: made.w, h: made.h };
+  return !made && prior?.status !== "done" && isEditing() ? state.edit : null;
+}
+
 /** Sends a message, or with `regenerateFor` (the id of the user message) answers it again. */
 async function startRun({ text = "", regenerateFor = null, replaced = null } = {}) {
-  const model = currentModel();
+  // An image prompt that is an edit goes to the edit model, whatever the picker shows: the chip says so.
+  const edit = edited({ regenerateFor, replaced });
+  const model = edit ? editModel() : currentModel();
   if (state.run || !model?.available) return;
+  if (edit) state.draft = { ...state.draft, model: model.id, effort: null };
   const image = isImage(model);
-  const { shape } = state.draft;
+  // An edit has the size of its image, so the shape is that image's, not the chip's.
+  const shape = edit ? shapeOfImage(edit) : state.draft.shape;
   const effort = image ? null : state.draft.effort;
   const body = { chat_id: state.chat?.id ?? null, model: model.id, effort };
-  if (image) body.shape = shape;
+  if (image && !edit) body.shape = shape;
+  if (edit?.id) body.reference = edit.id;
   if (regenerateFor) body.regenerate_for = regenerateFor;
   else body.text = text;
   if (!state.chat && state.draftProject) body.project_id = state.draftProject;
@@ -543,7 +590,7 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
     waiting: model.tier === "local" ? `Starting ${shortName(model.name)}…` : `Waiting for ${shortName(model.name)}…`,
     model: model.id,
     effort,
-    image: image ? { shape, est: model.est_s?.[shape] } : null,
+    image: image ? { shape, est: edit ? null : model.est_s?.[shape] } : null,
     onFrame: keepPinned,
   });
   const userEl = regenerateFor ? null : userMessage({ id: "", content: text });
@@ -568,7 +615,8 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
   scrollToBottom();
   renderSend();
   if (image) {
-    const est = model.est_s?.[shape];
+    // The estimates are for a new image: a warm edit took 17.7 s where a new klein image took 7.8 s.
+    const est = edit ? null : model.est_s?.[shape];
     announce(est ? `Creating image, about ${est} seconds` : "Creating image");
     run.still = setTimeout(() => announce("Still working"), 15000);
   } else announce("Reply started");
@@ -632,6 +680,9 @@ function onEvent(run, event) {
     case "error":
       run.view.finish(event.message, { last: true, prompt: run.prompt });
       state.messages.push(event.message);
+      // A reply that failed leaves the edit where it was, so that Retry or a reworded prompt tries it again.
+      if (run.image && event.t === "done") syncEdit();
+      renderChips();
       if (state.chat) upsertChat({ ...state.chat, updated_at: event.message.created_at || Date.now() });
       if (run.image) announce(imageOutcome(event.message));
       else announce(event.t === "done" ? "Reply finished" : `Reply failed. ${event.message.error?.message ?? ""}`);
@@ -763,14 +814,27 @@ function chooseShape() {
 }
 
 /** "New seed" and "Redo with": the same prompt as a new turn, on the model and in the shape named. */
-function makeAgain({ prompt, model, shape }) {
+function makeAgain({ prompt, model, shape, source = null }) {
   if (state.run) return toast("Wait for the current reply to finish.");
   const next = state.byId.get(model);
   if (!next?.available) return toast(next?.reason ?? "That model isn't available.");
   state.draft = { model: next.id, effort: coerceEffort(next, null), shape };
+  // Another seed of an edit changes the same image again; of anything else, it makes a new image.
+  state.edit = source;
   renderChips();
   renderRoute();
   startRun({ text: prompt });
+}
+
+/** "Edit" on an image: the next prompt changes that one. */
+function editImage(image) {
+  const model = editModel();
+  if (!model) return toast("No image model here can change an image.");
+  state.edit = { id: image.id, w: image.w, h: image.h };
+  if (!isImage(currentModel())) state.draft = { ...state.draft, model: model.id, effort: null };
+  renderChips();
+  renderRoute();
+  els.input.focus();
 }
 
 /** "Reuse prompt": the words go back in the box to edit. */
@@ -1248,6 +1312,13 @@ function wire() {
   els.modelChip.addEventListener("click", () => chooseModel());
   els.effortChip.addEventListener("click", chooseEffort);
   els.shapeChip.addEventListener("click", chooseShape);
+  els.editClear.append(icon("x"));
+  els.editClear.addEventListener("click", () => {
+    state.edit = null;
+    renderChips();
+    announce("Making a new image");
+    els.input.focus();
+  });
 
   els.form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1381,6 +1452,7 @@ function applyBootstrap(data) {
     onChoose: () => chooseModel(retryLast),
     imageModels: () => state.models.filter((m) => isImage(m) && m.available),
     onAgain: makeAgain,
+    onEdit: editImage,
     onReuse: reusePrompt,
   });
 }

@@ -226,7 +226,7 @@
 
 @layer components {
   /* Buttons */
-  .icon-btn, .foot-btn, .new-chat, .chip, .send, .btn, .menu-btn {
+  .icon-btn, .foot-btn, .new-chat, .chip, .send, .btn, .menu-btn, .edit-clear {
     display: inline-flex; align-items: center; justify-content: center; gap: var(--s-2);
     min-block-size: var(--hit); border-radius: var(--r-md);
     cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
@@ -491,10 +491,17 @@
   @media (hover: hover) { .chip:hover:not(:disabled) { background: var(--press); } }
   #model-chip { flex: 0 1 auto; }
   #effort-chip, #shape-chip { flex: none; }
+  /* The image the next prompt changes: a thumbnail, what is happening, and the way out. */
+  .edit-chip { flex: 0 1 auto; gap: var(--s-2); padding-inline-end: 0; cursor: default; &::after { display: none; } &:active { transform: none; } }
+  .edit-chip img { flex: none; inline-size: 1.5rem; block-size: 1.5rem; border-radius: var(--r-sm); object-fit: cover; background: var(--slate); }
+  /* Long enough to need two lines on a phone: the model's name is the part that must not be cut off. */
+  .edit-chip .chip-name { white-space: normal; line-height: 1.25; padding-block: var(--s-1); }
+  .edit-clear { flex: none; min-inline-size: var(--hit); color: var(--muted); }
+  @media (hover: hover) { .edit-clear:hover { color: var(--ink); } }
   @media (max-width: 26rem) {
-    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) { flex-wrap: wrap; }
-    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) #model-chip { flex: 1 0 100%; justify-content: flex-start; }
-    .composer-bar:has(:is(#effort-chip, #shape-chip):not([hidden])) #model-chip::after { margin-inline-start: auto; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip, #edit-chip):not([hidden])) { flex-wrap: wrap; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip, #edit-chip):not([hidden])) #model-chip { flex: 1 0 100%; justify-content: flex-start; }
+    .composer-bar:has(:is(#effort-chip, #shape-chip, #edit-chip):not([hidden])) #model-chip::after { margin-inline-start: auto; }
   }
   .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip-bars { display: inline-flex; }
