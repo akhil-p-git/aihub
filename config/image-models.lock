@@ -1,0 +1,11 @@
+# The image model files that scripts/images/fetch-models.sh puts under ~/work/aihub-images/models.
+# One file per line, tab-separated: destination (relative to the models directory), bytes, sha256, Hugging Face
+# repository, revision (commit), path in the repository, licence. All five repositories were checked on 2026-11-20:
+# the size and sha256 equal the repository's own LFS record at that revision. A repository that is renamed keeps
+# working under the old name through a redirect, as Comfy-Org/z_image_turbo and Comfy-Org/flux2-klein-4B do.
+z-image-turbo/z_image_turbo-Q5_0.gguf	4542547904	12b4a5c064cf8a0fa45d665c5b399d43effbcbeb37748d028d0d0d0fc34c2255	leejet/Z-Image-Turbo-GGUF	c61c0e422dc8b541b7548cf33a4ef8302b0f8085	z_image_turbo-Q5_0.gguf	Apache-2.0
+z-image-turbo/Qwen3-4B-Q4_K_M.gguf	2497281312	f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a	unsloth/Qwen3-4B-GGUF	22c9fc8a8c7700b76a1789366280a6a5a1ad1120	Qwen3-4B-Q4_K_M.gguf	Apache-2.0
+z-image-turbo/ae.safetensors	335304388	afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38	Comfy-Org/z_image_turbo	6fc90a3b1b653e935a0d175e260736de25b84df5	split_files/vae/ae.safetensors	Apache-2.0
+flux2-klein-4b/flux-2-klein-4b-Q8_0.gguf	4300629440	0bba6951258ec8f92d51114a8fa13e66828297bfff58a738f52729b3ef66fa28	leejet/FLUX.2-klein-4B-GGUF	3b1f5a9dc3abb32238b053aeb3d823c30afdacbd	flux-2-klein-4b-Q8_0.gguf	Apache-2.0
+flux2-klein-4b/Qwen3-4B-Q4_K_M.gguf	2497281312	f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a	unsloth/Qwen3-4B-GGUF	22c9fc8a8c7700b76a1789366280a6a5a1ad1120	Qwen3-4B-Q4_K_M.gguf	Apache-2.0
+flux2-klein-4b/flux2-vae.safetensors	336211292	868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3	Comfy-Org/flux2-klein-4B	5b3abca5c0dc1ecd4eaf3340868d09063fc1c965	split_files/vae/flux2-vae.safetensors	Apache-2.0
