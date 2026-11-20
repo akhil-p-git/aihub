@@ -781,7 +781,11 @@ class ImageJobs:
         }
         if job.load_ms is not None:
             usage["load_ms"] = job.load_ms
-        return usage | {"steps": job.plan.steps, "shape": job.plan.shape}
+        usage |= {"steps": job.plan.steps, "shape": job.plan.shape}
+        # The image an edit changes, kept even when no image comes out, so that Retry repeats the edit.
+        if job.plan.ref:
+            usage["ref"] = job.plan.ref
+        return usage
 
     def _unsaved(
         self,
