@@ -5,9 +5,11 @@
 #   bash scripts/images/build-engine.sh
 #
 # The source is fetched with network access (one shallow fetch of the pinned commit and its submodules, each
-# checked against the commit recorded in the lock). The compile then runs inside bubblewrap with no network, an
-# empty home, and write access to the build directory only, so the build scripts of the engine and its
-# submodules can neither reach the network nor read your files. /opt/cuda is only read.
+# checked against the commit recorded in the lock). The compile then runs inside bubblewrap with no network and
+# a filesystem that holds only /usr, /etc, /opt/cuda, an empty /tmp, the source (read-only, so the build cannot
+# plant a git hook in it that runs on your next fetch) and the build directory. There is no home, no /run (the
+# Docker API and your session's sockets are there), no /var (journals, core dumps) and no /mnt. The build
+# scripts of the engine and its submodules can neither reach the network nor read your files.
 #
 # Nothing here needs sudo, and nothing here touches the running engine unit: the new binary replaces the old one
 # by rename, so an engine that is running keeps the old file until the launcher's 5-minute idle exit.
@@ -25,6 +27,9 @@ cuda=/opt/cuda
 src=$build_root/src
 build=$build_root/build
 
+# The source directory is only ever written by this script, but a git hook or fsmonitor setting that got in there
+# would run as you, so the host-side git calls switch those off.
+git() { command git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.file.allow=never "$@"; }
 die() {
     printf 'build-engine: %s\n' "$*" >&2
     exit 1
@@ -66,11 +71,14 @@ done
 # --- 2. compile, with no network ------------------------------------------------------------------------------------
 rm -rf "$build"
 mkdir -p "$build"
-# The user's own gcc, newer than nvcc supports, would fail host_config.h: this prints the real error and stops.
+# What the compile needs, and nothing else. /bin, /lib, /lib64 and /sbin are symlinks into /usr on this system.
+# If a build step fails for want of a path, add that path here: it prints the real error.
 sandbox() {
     bwrap --die-with-parent --unshare-all --unshare-net \
-        --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$HOME" \
-        --bind "$src" "$src" --bind "$build" "$build" \
+        --ro-bind /usr /usr --ro-bind /etc /etc --ro-bind "$cuda" "$cuda" \
+        --symlink usr/bin /bin --symlink usr/bin /sbin --symlink usr/lib /lib --symlink usr/lib /lib64 \
+        --proc /proc --dev /dev --tmpfs /tmp \
+        --ro-bind "$src" "$src" --bind "$build" "$build" \
         --setenv HOME "$build" --setenv TMPDIR /tmp --setenv PATH "$cuda/bin:/usr/local/bin:/usr/bin:/bin" \
         "$@"
 }

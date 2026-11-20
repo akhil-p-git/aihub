@@ -7,5 +7,5 @@ SUBMODULE_ggml=d25b121ce1d6ae0c7e62ad080460d9fc1e46dd93
 SUBMODULE_libwebp=0c9546f7efc61eac7f79ae115c3f99c91c21c443
 # RTX 4060 (Ada, compute capability 8.9). Another GPU needs another value here.
 CUDA_ARCH=89-real
-BINARY_SHA256=48793133efef13d3298c092db665f48051aa8c40ec05e7d688e527d28b3b0963
-BUILT_WITH=sd-server built 2026-11-20T20:36:05Z;commit 1d0a58a35050d285b1d6fb1bc68a92924d35825e (ggml d25b121ce1d6ae0c7e62ad080460d9fc1e46dd93, libwebp 0c9546f7efc61eac7f79ae115c3f99c91c21c443);sha256 48793133efef13d3298c092db665f48051aa8c40ec05e7d688e527d28b3b0963;nvcc 13.5 cuda_13.5.r13.5/compiler.39125733_0;gcc 16.2.1;cmake 4.5.1;runpath /opt/cuda/targets/x86_64-linux/lib:
+BINARY_SHA256=c112ed51fbd73a7b3be45d7ca1b87db7d65a84143acf77fca95a6120020b1ed8
+BUILT_WITH=sd-server built 2026-11-20T21:10:01Z;commit 1d0a58a35050d285b1d6fb1bc68a92924d35825e (ggml d25b121ce1d6ae0c7e62ad080460d9fc1e46dd93, libwebp 0c9546f7efc61eac7f79ae115c3f99c91c21c443);sha256 c112ed51fbd73a7b3be45d7ca1b87db7d65a84143acf77fca95a6120020b1ed8;nvcc 13.5 cuda_13.5.r13.5/compiler.39125733_0;gcc 16.2.1;cmake 4.5.1;runpath /opt/cuda/targets/x86_64-linux/lib:
