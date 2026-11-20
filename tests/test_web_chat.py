@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import gc
 from decimal import Decimal
 from pathlib import Path
@@ -27,6 +28,7 @@ from helpers import (
     Clock,
     FakeEngine,
     FakeOllama,
+    failed,
     finished,
     generating,
     handler_for,
@@ -826,6 +828,180 @@ class TestImageTurns:
         assert [b["prompt"] for b in engine.submitted] == ["a red fox"] * 2
         await service.images.shutdown()
 
+    async def test_an_edit_sends_the_stored_image_and_keeps_its_shape(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE, shape="wide")
+        chat_id = first[0]["chat"]["id"]
+        source = final(first)["images"][0]["id"]
+        edited = await run(
+            service,
+            chat_id=chat_id,
+            text="make the fox blue",
+            model=FAST_IMAGE,
+            reference=source,
+        )
+        _, stored_bytes = store.get_image(chat_id, source)
+        sent = engine.submitted[-1]
+        assert base64.b64decode(sent["ref_images"][0]) == stored_bytes
+        assert (sent["width"], sent["height"]) == (1024, 576)
+        assert sent["prompt"] == "make the fox blue"
+        image = final(edited)["images"][0]
+        assert (image["w"], image["h"], image["ref"]) == (1024, 576, source)
+        assert "ref_images" not in engine.submitted[0]
+        await service.images.shutdown()
+
+    async def test_only_a_model_that_edits_takes_a_reference(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        before = [m.id for m in store.messages(chat_id)]
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(
+                    chat_id=chat_id,
+                    text="blue",
+                    model=IMAGE,
+                    reference=final(first)["images"][0]["id"],
+                )
+            )
+        assert (err.value.status, err.value.code) == (422, "no_edit_model")
+        assert err.value.message == (
+            "Z-Image Turbo can't change an image. Choose FLUX.2 klein 4B to edit one."
+        )
+        assert [m.id for m in store.messages(chat_id)] == before
+        await service.images.shutdown()
+
+    async def test_an_image_of_another_chat_is_not_there_to_edit(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        mine = await run(service, text="a red fox", model=FAST_IMAGE)
+        other = await run(service, text="a lake", model=FAST_IMAGE)
+        other_chat = other[0]["chat"]["id"]
+        before = [m.id for m in store.messages(other_chat)]
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(
+                    chat_id=other_chat,
+                    text="blue",
+                    model=FAST_IMAGE,
+                    reference=final(mine)["images"][0]["id"],
+                )
+            )
+        assert (err.value.status, err.value.code) == (404, "no_image")
+        assert [m.id for m in store.messages(other_chat)] == before
+        await service.images.shutdown()
+
+    async def test_a_text_model_takes_no_reference(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, _, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE)
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(
+                    chat_id=first[0]["chat"]["id"],
+                    text="hi",
+                    model=FREE,
+                    reference=final(first)["images"][0]["id"],
+                )
+            )
+        assert err.value.message == "shape/reference only apply to image models"
+        await service.images.shutdown()
+
+    async def test_regenerating_an_edit_edits_the_same_image_again(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE, shape="tall")
+        chat_id = first[0]["chat"]["id"]
+        source = final(first)["images"][0]["id"]
+        edit = await run(
+            service,
+            chat_id=chat_id,
+            text="blue",
+            model=FAST_IMAGE,
+            reference=source,
+        )
+        again = await run(
+            service, chat_id=chat_id, regenerate_for=edit[0]["user"]["id"]
+        )
+        image = final(again)["images"][0]
+        assert image["ref"] == source and (image["w"], image["h"]) == (576, 1024)
+        _, stored_bytes = store.get_image(chat_id, source)
+        assert base64.b64decode(engine.submitted[-1]["ref_images"][0]) == stored_bytes
+        assert engine.submitted[-1]["prompt"] == "blue"
+        await service.images.shutdown()
+
+    async def test_retrying_an_edit_that_failed_edits_the_image_the_page_names(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, _, _ = await make_service(tmp_path, images=engine, socket=bound_socket)
+        first = await run(service, text="a red fox", model=FAST_IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        source = final(first)["images"][0]["id"]
+        engine.scripts.append([failed()])
+        broken = await run(
+            service,
+            chat_id=chat_id,
+            text="blue",
+            model=FAST_IMAGE,
+            reference=source,
+        )
+        assert final(broken)["status"] == "error" and not final(broken).get("images")
+        again = await run(
+            service,
+            chat_id=chat_id,
+            regenerate_for=broken[0]["user"]["id"],
+            reference=source,
+            model=FAST_IMAGE,
+        )
+        assert final(again)["images"][0]["ref"] == source
+        assert "ref_images" in engine.submitted[-1]
+        await service.images.shutdown()
+
+    async def test_an_edit_cannot_be_regenerated_once_its_source_is_gone(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        service, store, _ = await make_service(
+            tmp_path, images=FakeEngine(), socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        edit = await run(
+            service,
+            chat_id=chat_id,
+            text="blue",
+            model=FAST_IMAGE,
+            reference=final(first)["images"][0]["id"],
+        )
+        store.delete_message(final(first)["id"])
+        before = [m.id for m in store.messages(chat_id)]
+        with pytest.raises(ApiError) as err:
+            service.prepare(
+                ChatRequest(chat_id=chat_id, regenerate_for=edit[0]["user"]["id"])
+            )
+        assert (err.value.status, err.value.code) == (409, "edit_source_gone")
+        assert [m.id for m in store.messages(chat_id)] == before
+        await service.images.shutdown()
+
     async def test_a_regenerate_that_is_turned_away_keeps_the_reply_it_would_replace(
         self, tmp_path: Path, bound_socket: str
     ) -> None:
@@ -990,6 +1166,31 @@ class TestImageRequestShape:
     def test_nothing_else_is_a_shape(self, shape) -> None:
         with pytest.raises(ValidationError):
             ChatRequest(text="x", shape=shape)
+
+
+class TestImageReference:
+    def test_a_reference_names_an_image_in_a_chat_that_exists(self) -> None:
+        request = ChatRequest(chat_id="0" * 16, text="x", reference="a" * 16)
+        assert request.reference == "a" * 16
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"reference": "a" * 16},  # no chat
+            {"chat_id": "0" * 16, "reference": "short"},
+            {"chat_id": "0" * 16, "reference": "A" * 16},
+            {"chat_id": "0" * 16, "reference": "a" * 16, "shape": "wide"},
+        ],
+    )
+    def test_nothing_else_is_a_reference(self, fields) -> None:
+        with pytest.raises(ValidationError):
+            ChatRequest(**({"text": "x"} | fields))
+
+    def test_a_retry_may_name_the_image_again(self) -> None:
+        request = ChatRequest(
+            chat_id="0" * 16, regenerate_for="b" * 16, reference="a" * 16
+        )
+        assert request.reference == "a" * 16
 
 
 def stored(role: str, content: str = "", status: str = "done", images=None) -> Message:

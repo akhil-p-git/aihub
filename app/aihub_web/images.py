@@ -341,6 +341,8 @@ class ImagePlan:
     steps: int
     sample_method: str | None
     est_s: float  # warm seconds for this shape, which sets the time limit
+    reference: bytes | None = None  # the stored WebP an edit changes; width and height are then its own
+    ref: str | None = None  # that image's id, kept on the new one
 
 
 class Interrupted(Exception):
@@ -637,6 +639,7 @@ class ImageJobs:
             plan.seed,
             plan.steps,
             plan.sample_method,
+            plan.reference,
         )
         job.engine_phase = "submitting"
         asked = self._monotonic()
@@ -836,6 +839,7 @@ class ImageJobs:
                     plan.steps,
                     plan.model_id,
                     outcome.image,
+                    plan.ref,
                 )
             ]
         try:

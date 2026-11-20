@@ -70,6 +70,8 @@ class ChatRequest(BaseModel):
     regenerate_for: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
     # The shape of an image; image models only. None means square.
     shape: Literal["square", "wide", "tall"] | None = None
+    # The image of this chat to change, by id; edit-capable image models only. The edit keeps its shape.
+    reference: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
     # The project a new chat goes in. A chat that exists is moved with PATCH /api/chats/{id}, not here.
     project_id: str | None = Field(None, pattern=r"^[0-9a-f]{16}$")
 
@@ -82,6 +84,15 @@ class ChatRequest(BaseModel):
                 raise ValueError("regenerate_for takes no text")
         elif not (self.text or "").strip():
             raise ValueError("text is empty")
+        return self
+
+    @model_validator(mode="after")
+    def _an_edit_is_of_an_image_in_a_chat(self) -> Self:
+        if self.reference:
+            if not self.chat_id:
+                raise ValueError("reference needs a chat_id")
+            if self.shape:
+                raise ValueError("an edit keeps the shape of its image")
         return self
 
     @model_validator(mode="after")
@@ -122,6 +133,16 @@ class ImageTurn:
     user: Message | None
     model: ModelInfo
     job: Job
+
+
+@dataclass(frozen=True, slots=True)
+class EditSource:
+    """The stored image that an edit changes."""
+
+    id: str
+    data: bytes
+    width: int
+    height: int
 
 
 def runs_tasks(model: ModelInfo) -> bool:
@@ -285,7 +306,7 @@ class ChatService:
             raise ApiError(422, "task_model", TASK_MODEL_MESSAGE)
         if model.output == "image":
             return self._prepare_image(body, chat, model)
-        if body.shape:
+        if body.shape or body.reference:
             raise ApiError(422, "invalid", "shape/reference only apply to image models")
         lease = self._share_the_gpu(model)
         try:
@@ -435,6 +456,7 @@ class ChatService:
             prompt = newest.content.strip()
         else:
             prompt = (body.text or "").strip()
+        source = self._edit_source(body, chat, model)
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ApiError(
                 413,
@@ -466,21 +488,66 @@ class ChatService:
                 self._store.update_chat(chat.id, {"model": model.id, "effort": None})
                 or chat
             )
-        shape = body.shape or "square"
         config = next(m for m in self._cfg.images.models if m.id == model.native)
+        if source:
+            data, width, height = source.data, source.width, source.height
+            # An edit comes out the size of its image, so it has the shape of one of ours or is called square.
+            shape = next(
+                (name for name, size in SHAPES.items() if size == (width, height)),
+                "square",
+            )
+        else:
+            data = None
+            shape = body.shape or "square"
+            width, height = SHAPES[shape]
         plan = ImagePlan(
             chat.id,
             model.id,
             model.native,
             prompt,
             shape,
-            *SHAPES[shape],
+            width,
+            height,
             secrets.randbelow(2**31),
             config.steps,
             config.sample_method,
             getattr(config.est_s, shape),
+            data,
+            source.id if source else None,
         )
         return ImageTurn(chat, user, model, jobs.start(plan))
+
+    def _edit_source(
+        self, body: ChatRequest, chat: Chat | None, model: ModelInfo
+    ) -> EditSource | None:
+        """The image an edit starts from, or None for a new image. It is the one the request names. A regenerate
+        that names none repeats the edit of the reply it replaces, which keeps its source; a reply that failed has
+        no image to remember it by, so the page names the source again."""
+        ref = body.reference
+        if body.regenerate_for and chat and not ref:
+            replaced = next(iter(reversed(self._store.messages(chat.id))), None)
+            if replaced and replaced.role == "assistant" and replaced.images:
+                ref = replaced.images[0].get("ref")
+        if not ref:
+            return None
+        if not model.edits:
+            other = next((m.name for m in self._cfg.images.models if m.edits), None)
+            raise ApiError(
+                422,
+                "no_edit_model",
+                f"{model.name} can't change an image."
+                + (f" Choose {other} to edit one." if other else ""),
+            )
+        found = self._store.image_to_edit(chat.id, ref) if chat else None
+        if found is None:
+            if body.regenerate_for:
+                raise ApiError(
+                    409,
+                    "edit_source_gone",
+                    "The image this edit started from is gone, so it can't be made again.",
+                )
+            raise ApiError(404, "no_image", "That image isn't in this chat any more.")
+        return EditSource(ref, *found)
 
     def _budget(self, model: ModelInfo) -> int:
         usable = int((model.ctx or 8192) * CONTEXT_SHARE)

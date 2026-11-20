@@ -869,6 +869,17 @@ class Store:
             ).fetchone()
         return (row["mime"], row["data"]) if row else None
 
+    def image_to_edit(
+        self, chat_id: str, image_id: str
+    ) -> tuple[bytes, int, int] | None:
+        """(bytes, width, height) of an image, only when it belongs to that chat."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT data, width, height FROM images WHERE id = ? AND chat_id = ?",
+                (image_id, chat_id),
+            ).fetchone()
+        return (row["data"], row["width"], row["height"]) if row else None
+
     def image_bytes_total(self) -> int:
         with self._lock:
             return self._db.execute(
