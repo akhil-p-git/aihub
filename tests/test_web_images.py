@@ -244,6 +244,16 @@ class TestClassify:
             "The GPU didn't respond. If this keeps happening, restart the PC.",
         )
 
+    def test_a_missing_cuda_device_is_unavailable_not_a_start_failure_with_a_log_line(
+        self,
+    ) -> None:
+        assert classify(
+            engine_errors("backend_cuda0_missing"), default="engine_failed_to_start"
+        ) == (
+            "cuda_unavailable",
+            "The GPU didn't respond. If this keeps happening, restart the PC.",
+        )
+
     def test_cuda_running_out_of_memory_is_vram_without_a_figure(self) -> None:
         code, message = classify(engine_errors("vae_out_of_memory_abort"))
         assert code == "vram_busy"

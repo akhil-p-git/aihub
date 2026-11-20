@@ -130,7 +130,7 @@ _FREE_MB = re.compile(
 )
 _NO_GPU = re.compile(
     r"busy or unavailable|no CUDA-capable device|failed to initialize CUDA"
-    r"|CUDA driver version is insufficient",
+    r"|CUDA driver version is insufficient|backend 'cuda\d+' was not found",
     re.IGNORECASE,
 )
 _OUT_OF_MEMORY = re.compile(r"out of memory", re.IGNORECASE)

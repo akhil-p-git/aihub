@@ -92,5 +92,14 @@
     "lines": [
       "[W] VAE decode ran out of memory; retrying with spatial tiling --- backend_fit.cpp:518"
     ]
+  },
+  "backend_cuda0_missing": {
+    "what": "The GPU hidden from the engine (CUDA_VISIBLE_DEVICES set empty) with --backend cuda0: the engine refuses to start, where without the flag it ran the job on the CPU",
+    "source": "launcher status of a klein4b start on 2026-11-20 with a drop-in Environment=CUDA_VISIBLE_DEVICES=",
+    "lines": [
+      "[E] backend config failed: backend 'cuda0' was not found --- diffusion_engine.cpp:643",
+      "[E] new_sd_ctx_t failed --- main.cpp:95",
+      "[E] launcher: the engine exited with status 1 before it listened"
+    ]
   }
 }
