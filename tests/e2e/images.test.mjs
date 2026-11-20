@@ -543,3 +543,120 @@ describe("phones", () => {
     });
   }
 });
+
+describe("editing the last image", () => {
+  const editChip = (page) => page.locator("#edit-chip");
+  const stopEditing = (page) => page.getByRole("button", { name: "Stop editing this image" });
+  const imgCalls = async () => (await app.engine.calls()).filter(([, path]) => path.endsWith("/sdcpp/v1/img_gen"));
+
+  /** The bytes of the nth image on the page, as base64: what an edit of it must send to the engine. */
+  const imageBase64 = (page, n) =>
+    page.evaluate(async (at) => {
+      const src = document.querySelectorAll(".msg.assistant .img-out")[at].src;
+      const bytes = new Uint8Array(await (await fetch(src)).arrayBuffer());
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary);
+    }, n);
+
+  it("offers to change the image that was just made, and says how to stop", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context, problems } = await open(browser, app, { hash: `#/c/${chat}`, bypassCSP: true });
+    await editChip(page).waitFor();
+    assert.match(await editChip(page).textContent(), /Editing the last image with FLUX\.2 klein 4B/);
+    assert.equal(await imagePrompt(page).getAttribute("placeholder"), "Describe a change, or × for a new image");
+    assert.equal(await shapeChip(page).isHidden(), true, "an edit keeps its image's shape");
+    assert.equal(await editChip(page).locator("img").getAttribute("alt"), "");
+    assert.deepEqual(await axe(page), []);
+    await stopEditing(page).click();
+    assert.equal(await editChip(page).isHidden(), true);
+    assert.equal(await shapeChip(page).isVisible(), true);
+    assert.equal(await imagePrompt(page).getAttribute("placeholder"), "Describe an image…");
+    assert.deepEqual(await problems(), []);
+    await context.close();
+  });
+
+  it("sends the image to the edit model, labels the result, and offers the new image next", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context, problems } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await imageShown(page, 1);
+    const first = await imageBase64(page, 0);
+    const before = (await app.engine.submitted()).length;
+    await make(page, "make the fox blue");
+    await imageShown(page, 2);
+    const submitted = await app.engine.submitted();
+    assert.equal(submitted.length, before + 1);
+    const sent = submitted.at(-1);
+    assert.equal(sent.prompt, "make the fox blue");
+    assert.equal(sent.ref_images[0], first, "the engine got the stored image, byte for byte");
+    assert.deepEqual([sent.width, sent.height], [1024, 1024], "an edit keeps the size of its image");
+    assert.match((await imgCalls()).at(-1)[1], /^\/e\/klein4b\//, "the edit model, not the one in the picker");
+    const reply = page.locator(".msg.assistant").last();
+    assert.match(await reply.textContent(), /Edited from the image above/);
+    assert.match(await reply.textContent(), /FLUX\.2 klein 4B/);
+    assert.match(await editChip(page).textContent(), /Editing the last image/);
+    assert.deepEqual(await problems(), []);
+    await context.close();
+  });
+
+  it("makes a new image after the x, and leaves the next one to edit again", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await stopEditing(page).click();
+    await make(page, "a mountain lake");
+    await imageShown(page, 2);
+    const sent = (await app.engine.submitted()).at(-1);
+    assert.equal(sent.prompt, "a mountain lake");
+    assert.equal(sent.ref_images, undefined);
+    assert.doesNotMatch(await page.locator(".msg.assistant").last().textContent(), /Edited from/);
+    await editChip(page).waitFor();
+    await context.close();
+  });
+
+  it("moves to an older image with Edit", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await stopEditing(page).click();
+    await make(page, "a mountain lake");
+    await imageShown(page, 2);
+    assert.match(await editChip(page).textContent(), /Editing the last image/);
+    const older = await imageBase64(page, 0);
+    await page.locator(".msg.assistant").first().getByRole("button", { name: "Edit" }).click();
+    assert.match(await editChip(page).textContent(), /Editing an earlier image/);
+    await make(page, "add a hat");
+    await imageShown(page, 3);
+    assert.equal((await app.engine.submitted()).at(-1).ref_images[0], older);
+    await context.close();
+  });
+
+  it("repeats an edit on the same image with New seed", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await imageShown(page, 1);
+    const source = await imageBase64(page, 0);
+    await make(page, "make the fox blue");
+    await imageShown(page, 2);
+    await page.locator(".msg.assistant").last().getByRole("button", { name: "New seed" }).click();
+    await imageShown(page, 3);
+    const sent = (await app.engine.submitted()).at(-1);
+    assert.equal(sent.prompt, "make the fox blue");
+    assert.equal(sent.ref_images[0], source, "the same source, not the first edit");
+    await context.close();
+  });
+
+  it("does not offer Redo with another model on an edit, which only the edit model can repeat", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await make(page, "make the fox blue");
+    await imageShown(page, 2);
+    const actions = page.locator(".msg.assistant").last();
+    assert.equal(await actions.getByRole("button", { name: /^Redo with/ }).count(), 0);
+    assert.equal(await actions.getByRole("button", { name: "Edit" }).count(), 1);
+    await context.close();
+  });
+});

@@ -11,7 +11,8 @@ let hooks = {
   onChoose() {},
   onCopy() {},
   imageModels: () => [],
-  onAgain() {}, // make the prompt again as a new turn: ({ prompt, model, shape })
+  onAgain() {}, // make the prompt again as a new turn: ({ prompt, model, shape, source })
+  onEdit() {}, // change this image with the next prompt: ({ id, w, h })
   onReuse() {}, // put the prompt back in the box
 };
 
@@ -87,11 +88,15 @@ function imageMeta(message, prompt, figure) {
   if (usage.total_ms) parts.push(item(`${Math.round(usage.total_ms / 1000)} s`, "Total time"));
   parts.push(item(`${image.steps} steps`), item(`seed ${image.seed}`, "Same seed and prompt give the same image"));
   parts.push(item(`${image.w} by ${image.h}`));
+  if (image.ref) parts.push(item("Edited from the image above", "The prompt changed an earlier image of this chat"));
   if (usage.load_ms > 2000)
     parts.push(item(`loaded in ${Math.round(usage.load_ms / 1000)} s`, "Time to load the model"));
   parts.push(item("Free, on this PC"));
   const shape = usage.shape ?? "square";
-  const other = hooks.imageModels().find((m) => m.id !== message.model);
+  const models = hooks.imageModels();
+  // Another model cannot repeat an edit: only an edit model takes the image to change.
+  const other = image.ref ? null : models.find((m) => m.id !== message.model);
+  const source = image.ref ? { id: image.ref, w: image.w, h: image.h } : null;
   const full = h(
     "button",
     { class: "btn", type: "button", "aria-pressed": "false", "data-full-size": true },
@@ -117,7 +122,8 @@ function imageMeta(message, prompt, figure) {
       icon("down"),
       h("span", {}, "Download"),
     ),
-    button("New seed", () => hooks.onAgain({ prompt, model: message.model, shape })),
+    button("New seed", () => hooks.onAgain({ prompt, model: message.model, shape, source })),
+    models.some((m) => m.edits) ? button("Edit", () => hooks.onEdit(image)) : null,
     button("Reuse prompt", () => hooks.onReuse(prompt)),
     other ? button(`Redo with ${other.name}`, () => hooks.onAgain({ prompt, model: other.id, shape })) : null,
     full,

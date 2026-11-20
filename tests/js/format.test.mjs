@@ -18,6 +18,7 @@ import {
   levelLabel,
   routeFor,
   shapeNote,
+  shapeOfImage,
   shortName,
   taskStatus,
   taskNext,
@@ -202,6 +203,14 @@ describe("routeFor: where the next prompt goes", () => {
       routeFor(undefined).text,
       "Start Ollama, or set an OpenRouter key in ~/.config/aihub/aihub.env, then restart aihub.",
     );
+  });
+});
+
+describe("shapeOfImage: an edit keeps the shape of its image", () => {
+  it("names a shape by which side is longer", () => {
+    assert.equal(shapeOfImage({ w: 1024, h: 1024 }), "square");
+    assert.equal(shapeOfImage({ w: 1024, h: 576 }), "wide");
+    assert.equal(shapeOfImage({ w: 576, h: 1024 }), "tall");
   });
 });
 

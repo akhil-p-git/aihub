@@ -115,6 +115,9 @@ export function shapeNote(model, shape) {
   return seconds ? `${SHAPES[shape]}, about ${seconds} s` : SHAPES[shape];
 }
 
+/** The shape an image has, from its size: an edit comes out the size of the image it changes. */
+export const shapeOfImage = ({ w, h }) => (w > h ? "wide" : h > w ? "tall" : "square");
+
 /** The sentence that says where the next prompt goes. */
 export function routeFor(model) {
   if (!model) {
