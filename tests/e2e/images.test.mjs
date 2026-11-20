@@ -648,6 +648,28 @@ describe("editing the last image", () => {
     await context.close();
   });
 
+  it("retries a failed edit as an edit, even after the page was reloaded", async () => {
+    const chat = await imageChat("a red fox in the snow");
+    const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });
+    await editChip(page).waitFor();
+    await imageShown(page, 1);
+    const source = await imageBase64(page, 0);
+    const before = (await app.engine.submitted()).length;
+    await make(page, "failimage make the fox blue");
+    await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    // The page's own memory of what was being edited goes with the reload; the server's record of it does not.
+    await page.reload();
+    await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    assert.equal(await editChip(page).isHidden(), true, "the newest reply made no image, so there is no chip");
+    await page.getByRole("button", { name: "Retry", exact: true }).click();
+    await page.waitForFunction(() => document.querySelectorAll(".msg.assistant").length === 2);
+    await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    const submitted = (await app.engine.submitted()).slice(before);
+    assert.equal(submitted.length, 2, "the edit and its retry");
+    for (const body of submitted) assert.equal(body.ref_images?.[0], source, "both are edits of the same image");
+    await context.close();
+  });
+
   it("does not offer Redo with another model on an edit, which only the edit model can repeat", async () => {
     const chat = await imageChat("a red fox in the snow");
     const { page, context } = await open(browser, app, { hash: `#/c/${chat}` });

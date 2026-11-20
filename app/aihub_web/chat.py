@@ -93,6 +93,8 @@ class ChatRequest(BaseModel):
                 raise ValueError("reference needs a chat_id")
             if self.shape:
                 raise ValueError("an edit keeps the shape of its image")
+            if self.regenerate_for:
+                raise ValueError("a retry repeats the edit it replaces")
         return self
 
     @model_validator(mode="after")
@@ -521,13 +523,13 @@ class ChatService:
         self, body: ChatRequest, chat: Chat | None, model: ModelInfo
     ) -> EditSource | None:
         """The image an edit starts from, or None for a new image. It is the one the request names. A regenerate
-        that names none repeats the edit of the reply it replaces, which keeps its source; a reply that failed has
-        no image to remember it by, so the page names the source again."""
+        repeats the edit of the reply it replaces: every image reply records its source, whether or not it made an
+        image, so a failed or stopped edit is repeated as an edit too."""
         ref = body.reference
-        if body.regenerate_for and chat and not ref:
+        if body.regenerate_for and chat:
             replaced = next(iter(reversed(self._store.messages(chat.id))), None)
-            if replaced and replaced.role == "assistant" and replaced.images:
-                ref = replaced.images[0].get("ref")
+            if replaced and replaced.role == "assistant":
+                ref = (replaced.usage or {}).get("ref")
         if not ref:
             return None
         if not model.edits:

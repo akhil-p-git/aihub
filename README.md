@@ -229,8 +229,8 @@ says "Editing the last image with FLUX.2 klein 4B", and the next prompt ("make t
 stored image, whichever model the picker shows. The result has the same size as the image it changes, so the Shape chip
 is hidden, and its footer says "Edited from the image above". The x on the chip makes the next prompt a new image (choosing a text
 model leaves image mode, as before); Edit under an older image moves the chip to that one. New seed and Retry on an edit change the same
-image again (Retry of an edit that failed is sent with that image's id again, since a failed reply stored none), and
-Redo with another model is not offered, because only an edit model takes an image to change. A reply to an edit whose
+image again (every image reply records the image it started from, whether or not it made one, so this also holds after
+Stop, a failure or a reload), and Redo with another model is not offered, because only an edit model takes an image to change. A reply to an edit whose
 source image has since been deleted cannot be retried. Only FLUX.2 klein 4B edits; Z-Image Turbo does not.
 
 **What it costs and what it blocks.** One image at a time uses the whole GPU, so while one is made local chat models

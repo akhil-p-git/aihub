@@ -553,17 +553,15 @@ function dropRetryButtons() {
 }
 
 /**
- * The image this send changes, or null for a new image or a text reply: `{ id, w, h }`. A retry of an edit that
- * worked has no id, because the server finds that edit's source itself; one that failed names the source again,
- * since a reply that failed stored no image to remember it by.
+ * The image this send changes, or null for a new image or a text reply: `{ id, shape }`. A retry has no id: the
+ * server repeats the edit its reply recorded (`usage.ref`, kept whether or not an image came out), so it works
+ * after a stop, a failure or a reload, when the page remembers nothing.
  */
 function edited({ regenerateFor, replaced }) {
   if (!editModel() || !isImage(currentModel())) return null;
-  if (!regenerateFor) return isEditing() ? state.edit : null;
-  const prior = replaced?.messages?.at(-1);
-  const made = prior?.images?.[0];
-  if (made?.ref) return { w: made.w, h: made.h };
-  return !made && prior?.status !== "done" && isEditing() ? state.edit : null;
+  if (!regenerateFor) return isEditing() ? { id: state.edit.id, shape: shapeOfImage(state.edit) } : null;
+  const usage = replaced?.messages?.at(-1)?.usage;
+  return usage?.ref ? { shape: usage.shape ?? "square" } : null;
 }
 
 /** Sends a message, or with `regenerateFor` (the id of the user message) answers it again. */
@@ -575,7 +573,7 @@ async function startRun({ text = "", regenerateFor = null, replaced = null } = {
   if (edit) state.draft = { ...state.draft, model: model.id, effort: null };
   const image = isImage(model);
   // An edit has the size of its image, so the shape is that image's, not the chip's.
-  const shape = edit ? shapeOfImage(edit) : state.draft.shape;
+  const shape = edit ? edit.shape : state.draft.shape;
   const effort = image ? null : state.draft.effort;
   const body = { chat_id: state.chat?.id ?? null, model: model.id, effort };
   if (image && !edit) body.shape = shape;
@@ -680,8 +678,8 @@ function onEvent(run, event) {
     case "error":
       run.view.finish(event.message, { last: true, prompt: run.prompt });
       state.messages.push(event.message);
-      // A reply that failed leaves the edit where it was, so that Retry or a reworded prompt tries it again.
-      if (run.image && event.t === "done") syncEdit();
+      // A reply that stopped or failed leaves the edit where it was, so that a reworded prompt tries it again.
+      if (run.image && event.message.status === "done") syncEdit();
       renderChips();
       if (state.chat) upsertChat({ ...state.chat, updated_at: event.message.created_at || Date.now() });
       if (run.image) announce(imageOutcome(event.message));

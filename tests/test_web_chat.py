@@ -53,6 +53,15 @@ def final(events: list[dict]) -> dict:
     return events[-1]["message"]
 
 
+async def _stop_when_sampling(service: ChatService, chat_id: str) -> None:
+    """Presses Stop once the engine has started the job."""
+    for _ in range(200):
+        if service.images.stop(chat_id):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the image never started")
+
+
 @pytest.mark.anyio
 class TestReply:
     async def test_a_new_chat_stores_both_sides(self, tmp_path: Path) -> None:
@@ -949,7 +958,7 @@ class TestImageTurns:
         assert engine.submitted[-1]["prompt"] == "blue"
         await service.images.shutdown()
 
-    async def test_retrying_an_edit_that_failed_edits_the_image_the_page_names(
+    async def test_a_reply_remembers_the_image_it_edited_whether_or_not_it_made_one(
         self, tmp_path: Path, bound_socket: str
     ) -> None:
         engine = FakeEngine()
@@ -957,24 +966,69 @@ class TestImageTurns:
         first = await run(service, text="a red fox", model=FAST_IMAGE)
         chat_id = first[0]["chat"]["id"]
         source = final(first)["images"][0]["id"]
+        assert "ref" not in final(first)["usage"]
         engine.scripts.append([failed()])
         broken = await run(
-            service,
-            chat_id=chat_id,
-            text="blue",
-            model=FAST_IMAGE,
-            reference=source,
+            service, chat_id=chat_id, text="blue", model=FAST_IMAGE, reference=source
         )
         assert final(broken)["status"] == "error" and not final(broken).get("images")
-        again = await run(
-            service,
-            chat_id=chat_id,
-            regenerate_for=broken[0]["user"]["id"],
-            reference=source,
-            model=FAST_IMAGE,
+        assert final(broken)["usage"]["ref"] == source
+        done = await run(
+            service, chat_id=chat_id, text="red", model=FAST_IMAGE, reference=source
         )
-        assert final(again)["images"][0]["ref"] == source
+        assert final(done)["usage"]["ref"] == source
+        await service.images.shutdown()
+
+    async def test_retrying_an_edit_that_failed_edits_the_same_image_again(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        """The page keeps nothing about it: a reload, or a chat opened again, retries just the same."""
+        engine = FakeEngine()
+        service, _, _ = await make_service(tmp_path, images=engine, socket=bound_socket)
+        first = await run(service, text="a red fox", model=FAST_IMAGE, shape="wide")
+        chat_id = first[0]["chat"]["id"]
+        source = final(first)["images"][0]["id"]
+        engine.scripts.append([failed()])
+        broken = await run(
+            service, chat_id=chat_id, text="blue", model=FAST_IMAGE, reference=source
+        )
+        again = await run(
+            service, chat_id=chat_id, regenerate_for=broken[0]["user"]["id"]
+        )
+        image = final(again)["images"][0]
+        assert image["ref"] == source and (image["w"], image["h"]) == (1024, 576)
         assert "ref_images" in engine.submitted[-1]
+        assert engine.submitted[-1]["prompt"] == "blue"
+        await service.images.shutdown()
+
+    async def test_retrying_an_edit_that_was_stopped_edits_the_same_image_again(
+        self, tmp_path: Path, bound_socket: str
+    ) -> None:
+        engine = FakeEngine()
+        service, store, _ = await make_service(
+            tmp_path, images=engine, socket=bound_socket
+        )
+        first = await run(service, text="a red fox", model=FAST_IMAGE)
+        chat_id = first[0]["chat"]["id"]
+        source = final(first)["images"][0]["id"]
+        engine.scripts.append([generating(1, 4), HOLD, finished])
+        turn = service.prepare(
+            ChatRequest(
+                chat_id=chat_id, text="blue", model=FAST_IMAGE, reference=source
+            )
+        )
+        stopping = asyncio.create_task(_stop_when_sampling(service, chat_id))
+        events = [event async for event in service.stream(turn)]
+        await stopping
+        assert final(events)["status"] == "stopped"
+        assert final(events)["usage"]["ref"] == source
+        # What the retry would send: the plan, which is what the engine's request is built from. (Waiting for the
+        # fake engine to finish a job after a kill is not what this checks; the real engine was checked by hand.)
+        retry = service.prepare(
+            ChatRequest(chat_id=chat_id, regenerate_for=events[0]["user"]["id"])
+        )
+        assert retry.job.plan.ref == source
+        assert retry.job.plan.reference == store.image_to_edit(chat_id, source)[0]
         await service.images.shutdown()
 
     async def test_an_edit_cannot_be_regenerated_once_its_source_is_gone(
@@ -1186,11 +1240,11 @@ class TestImageReference:
         with pytest.raises(ValidationError):
             ChatRequest(**({"text": "x"} | fields))
 
-    def test_a_retry_may_name_the_image_again(self) -> None:
-        request = ChatRequest(
-            chat_id="0" * 16, regenerate_for="b" * 16, reference="a" * 16
-        )
-        assert request.reference == "a" * 16
+    def test_a_retry_takes_its_image_from_the_reply_it_replaces_not_from_the_request(
+        self,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            ChatRequest(chat_id="0" * 16, regenerate_for="b" * 16, reference="a" * 16)
 
 
 def stored(role: str, content: str = "", status: str = "done", images=None) -> Message:
