@@ -290,8 +290,11 @@ refuses to open one.
 - Every launch picks a new random token. The backend refuses `/api/` requests that lack the `aihub_t` cookie, which only the
   app's own window holds, so another program on this machine cannot use the app's port (it gets 401). The service sets no
   token and stays open to the local user, as before.
-- One window. Closing it quits the app and stops the backend; if the app is killed, the backend stops within a second.
-  A second launch focuses the first window.
+- One window. Closing it hides it to the tray instead of quitting, as Claude desktop and Antigravity do; quit from the
+  tray icon's menu or the app menu. Either way stops the backend; if the app is killed, the backend stops within a second.
+  A second launch focuses the window.
+- Its own icon (the web chat's signal-bars mark) on the window, in the tray, and in the About panel, instead of
+  Electron's.
 - A link to another site opens in the default browser, and nothing else opens in the window. There are no developer tools.
 - It renders in software. On this machine Chromium's GPU process crashes at times with the NVIDIA driver (the comment in
   `desktop/src/main.js` has the details), so the app holds no GPU memory and no `/dev/nvidia*` file.
@@ -308,14 +311,14 @@ exit status 3 means it never started and 1 a bad setting.
 **Installing it and a menu entry** are optional. To keep the app you run apart from the checkout, so that a rebuild or a
 branch change cannot touch it, copy it out: `rsync -a --delete desktop/dist/linux-unpacked/ ~/.local/opt/aihub-desktop/`
 (close the app first; the same command updates it after a rebuild). Then save this as
-`~/.local/share/applications/dev.akhil-p.aihub.desktop`. The path in `Exec` must be absolute, and there is no custom
-icon, so Electron's is used:
+`~/.local/share/applications/dev.akhil-p.aihub.desktop`. Both paths must be absolute:
 
     [Desktop Entry]
     Type=Application
     Name=aihub
     Comment=Chat with local, free and paid models
     Exec=/home/akhil/.local/opt/aihub-desktop/aihub-desktop
+    Icon=/home/akhil/.local/opt/aihub-desktop/resources/app/src/assets/icon-512.png
     Terminal=false
     Categories=Network;Chat;
     StartupWMClass=dev.akhil-p.aihub

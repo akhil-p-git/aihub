@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, clipboard, dialog, Menu, nativeTheme, session, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, Menu, nativeImage, nativeTheme, session, shell, Tray } from "electron";
 import { Backend } from "./backend.js";
 import { Lifecycle } from "./lifecycle.js";
 import { externalTarget, HOST_RESOLVER_RULES, isBackendUrl, menuTemplate } from "./policy.js";
@@ -17,6 +17,17 @@ import { lockDownSession } from "./session.js";
 const SRC = fileURLToPath(new URL(".", import.meta.url));
 // The colour the window opens with and the page has behind its first paint (theme-color in the app's index.html).
 const PAPER = { light: "#f8fafd", dark: "#0c151d" };
+// Same mark as the web chat's favicon (app/aihub_web/static/icon.svg), rasterized for the window and the tray.
+const ICON = join(SRC, "assets", "icon-512.png");
+const TRAY_ICON = join(SRC, "assets", "icon-32.png");
+
+const { desktopName, version, aihubCommit } = JSON.parse(
+  readFileSync(join(app.getAppPath(), "package.json"), "utf8"),
+);
+// Must be called before `ready`, and must match the installed .desktop file's name (see README, "Installing it and
+// a menu entry") or the window manager cannot tell this window apart from an app with no icon of its own: it falls
+// back to a generic, ungrouped entry with no custom icon, which is what sent us looking for this in the first place.
+app.setDesktopName(desktopName);
 
 // A development run keeps its own data directory (and with it its own single-instance lock and port).
 app.setPath("userData", join(app.getPath("appData"), app.isPackaged ? "aihub-desktop" : "aihub-desktop-dev"));
@@ -37,7 +48,11 @@ app.commandLine.appendSwitch("host-resolver-rules", HOST_RESOLVER_RULES);
 let backend = null;
 let lifecycle = null;
 let win = null;
+let tray = null;
 let backendStopped = false;
+// Set as soon as a real quit begins (the tray's Quit item, the OS ending the session, app.quit() from anywhere), so
+// the window's "close" handler below can tell a real quit from the user just clicking the window's close button.
+let isQuitting = false;
 
 // The origin of the backend the window may talk to, or null while there is none.
 const currentOrigin = () => lifecycle?.origin ?? null;
@@ -46,7 +61,8 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", showWindow);
-  // Closing the last window quits: a backend without a window has no use.
+  // The window close button hides to the tray instead (see createWindow), so this now only fires if something
+  // destroys the window outright; a backend without a window has no use.
   app.on("window-all-closed", () => app.quit());
   app.on("before-quit", stopBackendThenQuit);
   app.whenReady().then(main).catch(fatal);
@@ -56,13 +72,13 @@ async function main() {
   const ses = session.defaultSession;
   lockDownSession(ses, { allows: (url) => lifecycle?.allows(url) === true });
 
-  const { version, aihubCommit } = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8"));
   app.setAboutPanelOptions({
     applicationName: "aihub",
     applicationVersion: `${version} (${aihubCommit || "dev"})`,
     copyright: `Electron ${process.versions.electron}, Chromium ${process.versions.chrome}`,
   });
   Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate(app.isPackaged)));
+  tray = createTray();
 
   backend = new Backend({
     userData: app.getPath("userData"),
@@ -91,6 +107,7 @@ function fatal(error) {
 function createWindow() {
   const window = new BrowserWindow({
     title: "aihub",
+    icon: ICON,
     width: 1180,
     height: 800,
     minWidth: 360,
@@ -106,7 +123,30 @@ function createWindow() {
     },
   });
   lockDown(window.webContents);
+  // The close button leaves the app running in the tray, as Claude desktop and Antigravity do; only the tray's
+  // Quit item, the menu's Quit, or the OS ending the session goes through to a real close.
+  window.on("close", (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    window.hide();
+  });
   return window;
+}
+
+/** The tray icon: click to show the window, or quit from its menu. Kept at module scope so it is never garbage
+ * collected out from under its own icon. */
+function createTray() {
+  const t = new Tray(nativeImage.createFromPath(TRAY_ICON));
+  t.setToolTip("aihub");
+  t.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "Show aihub", click: showWindow },
+      { type: "separator" },
+      { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
+    ]),
+  );
+  t.on("click", showWindow);
+  return t;
 }
 
 /** Keeps the window on the backend: nothing opens in it, or beside it, except the backend's own pages. */
@@ -156,6 +196,7 @@ function showWindow() {
 
 /** Holds the quit until the backend has stopped, so that a reply that is streaming is stored as stopped. */
 function stopBackendThenQuit(event) {
+  isQuitting = true;
   lifecycle?.beginQuit();
   if (backendStopped || backend === null) return;
   event.preventDefault();
