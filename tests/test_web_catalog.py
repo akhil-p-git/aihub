@@ -242,6 +242,17 @@ class TestCatalog:
         } <= ids
         assert not any("embed" in i or "bge" in i or "content-safety" in i for i in ids)
 
+    async def test_the_first_refresh_reads_everything_soon_after_boot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # time.monotonic() counts from boot, so a fresh catalog must not look recently refreshed.
+        monkeypatch.setattr("aihub_web.catalog.time.monotonic", lambda: 60.0)
+        catalog = make_catalog(tmp_path, handler_for())
+        await catalog.refresh()
+        ids = {m.id for m in catalog.models()}
+        assert "openrouter/google/gemma-4-31b-it:free" in ids
+        assert "ollama/qwen3:8b" in ids
+
     async def test_show_runs_once_per_model_while_digests_hold(
         self, tmp_path: Path
     ) -> None:
