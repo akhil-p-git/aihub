@@ -289,8 +289,8 @@ class Catalog:
         self._cache_path = cfg.state_dir / "openrouter-models.json"
         self._shows: dict[str, tuple[str, ModelInfo | None]] = {}
         self._openrouter_raw: list[dict[str, object]] = []
-        self._ollama_at = 0.0
-        self._openrouter_at = 0.0
+        self._ollama_at = float("-inf")
+        self._openrouter_at = float("-inf")
         self._claude = [claude_model(m) for m in cfg.anthropic.models]
         self._status: dict[str, dict[str, object]] = {
             name: {"ok": None, "error": None}

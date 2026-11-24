@@ -6,8 +6,8 @@ requires-python = ">=3.12"
 dependencies = [
     "starlette==1.10.0",
     "uvicorn==0.54.0",
-    "httpx2==2.13.1",
-    "pydantic==2.13.5",
+    "httpx2==2.16.0",
+    "pydantic==2.14.3",
     "pyyaml==6.0.3",
 ]
 
@@ -19,5 +19,5 @@ dev = [
 [tool.uv]
 # The app is run from source (PYTHONPATH=app), not installed as a package.
 package = false
-# Resolve only releases that were at least two weeks old on 2026-11-18.
-exclude-newer = "2026-11-04T00:00:00Z"
+# Resolve only releases that were at least two weeks old on 2026-11-22.
+exclude-newer = "2026-11-08T00:00:00Z"
